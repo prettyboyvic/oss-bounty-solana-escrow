@@ -121,15 +121,19 @@ The local runner:
 
 ## Anchor / Ubuntu workflow
 
-CI creates two public, deterministic localnet fixtures:
+CI creates one public, deterministic localnet payer identity represented by:
 
-- a system account with valueless localnet lamports for transaction fees;
-- an ignored Anchor provider signer file under `.tmp/`;
-- a program keypair under ignored `target/deploy/` so Anchor can deploy the
-  program during localnet tests.
+- a system account fixture with valueless localnet lamports;
+- an ignored Anchor provider signer file under `.tmp/`.
 
-Both seeds are public and must never be reused for devnet assets with value,
-mainnet, custody, or any production deployment.
+The canonical program secret is never provided to CI. `anchor build` produces
+the `.so` and generated IDL, CI verifies the IDL address, and Anchor
+`test.genesis` preloads the binary at the canonical public program ID before
+running tests with deployment skipped.
+
+The local payer seed is public and must never be reused for devnet assets with
+value, mainnet, custody, or any production deployment. Random devnet-only
+signers live under ignored `.devnet/` and are never committed.
 
 ## Dependency compatibility
 

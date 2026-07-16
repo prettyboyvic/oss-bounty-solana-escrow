@@ -10,7 +10,7 @@ use rules::{
     EscrowError, EscrowStatus,
 };
 
-declare_id!("DhTtpYXCdVweT5oD9wnu6eiVZMScBc3nmuNixrwVs9X2");
+declare_id!("6UoYT4jtiS23rCU1zARqnn181BxwuJ9waS1sv35gRg1Z");
 
 #[program]
 pub mod oss_bounty_escrow {

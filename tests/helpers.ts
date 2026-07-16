@@ -10,7 +10,7 @@ import {
 } from "@solana/web3.js";
 
 export const PROGRAM_ID = new PublicKey(
-  "DhTtpYXCdVweT5oD9wnu6eiVZMScBc3nmuNixrwVs9X2",
+  "6UoYT4jtiS23rCU1zARqnn181BxwuJ9waS1sv35gRg1Z",
 );
 
 export function externalRefHash(reference: string): number[] {

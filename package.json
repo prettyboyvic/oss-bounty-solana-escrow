@@ -6,6 +6,7 @@
   "scripts": {
     "build": "anchor build",
     "test": "npm run test:integration",
+    "test:devnet:unit": "node --test tests/devnet/*.test.mjs",
     "test:integration": "node --import tsx ./node_modules/mocha/bin/mocha -t 1000000 tests/**/*.ts",
     "typecheck": "tsc --noEmit"
   },

@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OSS Bounty Escrow Public Devnet Configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "cluster", "programId", "token"],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "cluster": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "rpcUrl", "genesisHash"],
+      "properties": {
+        "name": {
+          "const": "devnet"
+        },
+        "rpcUrl": {
+          "const": "https://api.devnet.solana.com"
+        },
+        "genesisHash": {
+          "const": "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"
+        }
+      }
+    },
+    "programId": {
+      "type": "string",
+      "minLength": 32,
+      "maxLength": 44
+    },
+    "token": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["programId", "displayLabel", "decimals"],
+      "properties": {
+        "programId": {
+          "const": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        "displayLabel": {
+          "const": "DEVTEST"
+        },
+        "decimals": {
+          "const": 6
+        }
+      }
+    }
+  }
+}

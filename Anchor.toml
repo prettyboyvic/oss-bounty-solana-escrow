@@ -3,7 +3,10 @@ seeds = false
 skip-lint = false
 
 [programs.localnet]
-oss_bounty_escrow = "DhTtpYXCdVweT5oD9wnu6eiVZMScBc3nmuNixrwVs9X2"
+oss_bounty_escrow = "6UoYT4jtiS23rCU1zARqnn181BxwuJ9waS1sv35gRg1Z"
+
+[programs.devnet]
+oss_bounty_escrow = "6UoYT4jtiS23rCU1zARqnn181BxwuJ9waS1sv35gRg1Z"
 
 [registry]
 url = "https://api.apr.dev"
@@ -14,6 +17,11 @@ wallet = ".tmp/anchor-test-wallet.json"
 
 [scripts]
 test = "npm run test:integration"
+
+[[test.genesis]]
+address = "6UoYT4jtiS23rCU1zARqnn181BxwuJ9waS1sv35gRg1Z"
+program = "target/deploy/oss_bounty_escrow.so"
+upgradeable = false
 
 [[test.validator.account]]
 address = "9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj"

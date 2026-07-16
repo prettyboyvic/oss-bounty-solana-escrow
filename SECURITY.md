@@ -41,10 +41,14 @@ scope.
 
 ## Test-only keys
 
-Scripts may create deterministic, public localnet-only signer material inside
-ignored `.tmp/` and `target/deploy/` directories so Anchor can run local
-validator tests. These keys are intentionally non-secret and must never be used
-on devnet with valuable assets, mainnet, or production infrastructure.
+Scripts create one deterministic, public localnet-only payer inside ignored
+`.tmp/` so Anchor can run local-validator tests. Localnet and CI preload the
+program binary at its public program ID and do not receive the canonical
+devnet program secret.
+
+Random devnet-only program and actor signers live only under ignored
+`.devnet/`. They must never be committed, uploaded to CI, reused on mainnet, or
+used with assets that carry value.
 
 ## JavaScript dependency advisories
 

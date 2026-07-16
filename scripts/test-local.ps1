@@ -4,7 +4,7 @@ $repo = Split-Path -Parent $PSScriptRoot
 $program = Join-Path $repo "target\sbf-solana-solana\release\oss_bounty_escrow.so"
 $ledger = Join-Path $repo "test-ledger"
 $payerAccount = Join-Path $repo ".tmp\test-payer-account.json"
-$programId = "DhTtpYXCdVweT5oD9wnu6eiVZMScBc3nmuNixrwVs9X2"
+$programId = "6UoYT4jtiS23rCU1zARqnn181BxwuJ9waS1sv35gRg1Z"
 
 if (-not (Test-Path -LiteralPath $program)) {
     throw "Missing SBF artifact: $program"
