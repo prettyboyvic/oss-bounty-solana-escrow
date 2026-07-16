@@ -59,6 +59,10 @@ reference hash is stored in the escrow account.
 
 ## Current verification
 
+Phase 2 devnet work is currently
+[blocked by public faucet availability](docs/PHASE_2_DEVNET_BLOCKED_2026-07-16.md);
+the program has not been deployed to devnet.
+
 Verified locally on Windows:
 
 - `cargo test --workspace`: 11 passed, 0 failed.
