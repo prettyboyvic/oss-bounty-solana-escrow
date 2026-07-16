@@ -12,8 +12,6 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      ANCHOR_WALLET: ${{ github.workspace }}/.tmp/anchor-test-wallet.json
 
     steps:
       - uses: actions/checkout@v4
@@ -65,7 +63,7 @@ jobs:
       - name: Create localnet-only test fixtures
         run: |
           node scripts/create-test-account.mjs
-          test -f "$ANCHOR_WALLET"
+          test -f ".tmp/anchor-test-wallet.json"
           test "$(node scripts/create-test-program-keypair.mjs)" = \
             "DhTtpYXCdVweT5oD9wnu6eiVZMScBc3nmuNixrwVs9X2"
 

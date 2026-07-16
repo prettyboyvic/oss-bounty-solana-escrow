@@ -10,7 +10,7 @@ url = "https://api.apr.dev"
 
 [provider]
 cluster = "Localnet"
-wallet = "~/.config/solana/id.json"
+wallet = ".tmp/anchor-test-wallet.json"
 
 [scripts]
 test = "npm run test:integration"
