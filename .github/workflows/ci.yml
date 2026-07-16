@@ -90,4 +90,5 @@ jobs:
           '
 
       - name: Anchor localnet integration tests
-        run: anchor test --skip-build --skip-deploy
+        # Anchor 0.31.1 omits all validator preload flags with --skip-deploy.
+        run: anchor test --skip-build

@@ -216,7 +216,8 @@ test("repository layout uses the canonical ID without a deterministic program fi
   );
   assert.doesNotMatch(workflow, /create-test-program-keypair/);
   assert.match(workflow, /target\/idl\/oss_bounty_escrow\.json/);
-  assert.match(workflow, /anchor test --skip-build --skip-deploy/);
+  assert.match(workflow, /anchor test --skip-build(?:\s|$)/);
+  assert.doesNotMatch(workflow, /anchor test[^\r\n]*--skip-deploy/);
   assert.equal(
     existsSync(join(repoRoot, "scripts", "create-test-program-keypair.mjs")),
     false,
