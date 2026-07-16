@@ -1,0 +1,10 @@
+.anchor/
+.tmp/
+.idea/
+.vscode/
+node_modules/
+target/
+test-ledger/
+*.log
+*.so
+*.keypair.json

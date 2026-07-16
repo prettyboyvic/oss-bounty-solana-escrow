@@ -1,0 +1,22 @@
+{
+  "name": "oss-bounty-solana-escrow",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "anchor build",
+    "test": "npm run test:integration",
+    "test:integration": "node --import tsx ./node_modules/mocha/bin/mocha -t 1000000 tests/**/*.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@coral-xyz/anchor": "0.31.1",
+    "@solana/spl-token": "0.4.13",
+    "@solana/web3.js": "1.98.4",
+    "@types/mocha": "10.0.10",
+    "@types/node": "24.0.15",
+    "mocha": "11.7.1",
+    "tsx": "4.20.3",
+    "typescript": "5.8.3"
+  }
+}

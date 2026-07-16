@@ -1,0 +1,20 @@
+[features]
+seeds = false
+skip-lint = false
+
+[programs.localnet]
+oss_bounty_escrow = "DhTtpYXCdVweT5oD9wnu6eiVZMScBc3nmuNixrwVs9X2"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "Localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "npm run test:integration"
+
+[[test.validator.account]]
+address = "9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj"
+filename = ".tmp/test-payer-account.json"

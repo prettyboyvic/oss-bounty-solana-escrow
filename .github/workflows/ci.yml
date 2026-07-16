@@ -1,0 +1,85 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANCHOR_WALLET: ${{ github.workspace }}/.tmp/anchor-test-wallet.json
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install Solana CLI
+        shell: bash
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/v2.2.20/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Install Anchor 0.31.1
+        shell: bash
+        run: |
+          cargo install \
+            --git https://github.com/solana-foundation/anchor \
+            --tag v0.31.1 \
+            avm \
+            --locked \
+            --force
+          avm install 0.31.1
+          avm use 0.31.1
+          echo "$HOME/.avm/bin" >> "$GITHUB_PATH"
+
+      - name: Verify active toolchain versions
+        shell: bash
+        run: |
+          solana_version="$(solana --version)"
+          anchor_version="$(anchor --version)"
+          rust_version="$(rustc --version)"
+          node_version="$(node --version)"
+
+          echo "solana: $solana_version"
+          echo "anchor: $anchor_version"
+          echo "rustc: $rust_version"
+          echo "node: $node_version"
+
+          test "$(awk '{print $2}' <<< "$solana_version")" = "2.2.20"
+          test "$(awk '{print $2}' <<< "$anchor_version")" = "0.31.1"
+          [[ "$node_version" == v22.* ]]
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Create localnet-only test fixtures
+        run: |
+          node scripts/create-test-account.mjs
+          test -f "$ANCHOR_WALLET"
+          test "$(node scripts/create-test-program-keypair.mjs)" = \
+            "DhTtpYXCdVweT5oD9wnu6eiVZMScBc3nmuNixrwVs9X2"
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Rust tests
+        run: cargo test --workspace
+
+      - name: Type-check integration tests
+        run: npm run typecheck
+
+      - name: Anchor build
+        run: anchor build
+
+      - name: Anchor localnet integration tests
+        run: anchor test --skip-build

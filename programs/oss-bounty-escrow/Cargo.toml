@@ -1,0 +1,22 @@
+[package]
+name = "oss-bounty-escrow"
+version = "0.1.0"
+description = "Pre-funded classic SPL-token escrow for open-source bounties."
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "oss_bounty_escrow"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = { workspace = true }
+anchor-spl = { workspace = true, features = ["token"] }
