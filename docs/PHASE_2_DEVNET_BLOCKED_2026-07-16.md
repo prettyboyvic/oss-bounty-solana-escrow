@@ -279,3 +279,44 @@ public RPC throttled the upload.
 No canonical deployment, ProgramData account, DEVTEST mint, token account,
 escrow flow, or devnet deployment claim exists at this checkpoint. Raw process
 output and ignored runtime state remain outside Git.
+
+## Phase 2-R3C1 addendum — second bounded resume window
+
+Verdict: `BLOCKED_WITH_RESUMABLE_BUFFER`.
+
+R3C opened a new approved execution window against the same explicit buffer
+and used exactly three write/resume attempts. All three aggregate CLI attempts
+ended with `RPC_MAX_RETRIES`; no fourth attempt, buffer replacement, close, or
+regeneration occurred.
+
+The finalized buffer-address history increased to 120 successful transactions
+and zero failed transactions. The latest confirmed transaction was observed at
+slot `476895163`. An aggregate CLI attempt still has no single transaction
+signature, so the per-attempt aggregate signature remains `null`; no signature
+or Explorer URL is invented.
+
+The final read-only reconciliation observed:
+
+```text
+Canonical program:               absent
+Buffer:                          CT1DGjkt9t926L6SoFxiYJmzc18nMowpdw1WcZgWwbbW
+Buffer state:                    BUFFER_WRITING
+Buffer owner:                    BPFLoaderUpgradeab1e11111111111111111111111
+Buffer authority:                Avfvs1k6ttrBtqh83tFw5g3dhWncrjP5hj4D52kGNZGk
+Buffer allocation:               395181 bytes
+Full executable-byte match:      false
+Equal byte positions:            248399 of 395144 (NOT_AN_UPLOAD_OFFSET)
+Authority balance:               3,247,883,680 lamports
+Remaining requirement + reserve: 3,002,547,760 lamports
+Funding headroom:                 245,335,920 lamports
+```
+
+The equal-byte-position count is not an upload offset or confirmed progress;
+`lastConfirmedProgress` remains `null`. No finalize, canonical deployment,
+ProgramData account, DEVTEST mint, token account, or escrow-flow transaction
+occurred in R3C.
+
+Any later resume must preserve and re-query this exact buffer and its existing
+repository-managed signer after fresh cluster, identity, binary, funding, and
+single-writer checks. Do not close or regenerate the buffer because the public
+devnet RPC throttled this bounded window.
