@@ -8,8 +8,10 @@ import {
   classifyCliError,
   executeWriteAttempt,
   inspectUpgradeableBuffer,
+  openWriteWindow,
   recordWriteAttempt,
   runCapturedCommand,
+  summarizeSignatureHistory,
 } from "../../scripts/devnet/live-deployment.mjs";
 
 const LOADER = "BPFLoaderUpgradeab1e11111111111111111111111";
@@ -318,4 +320,196 @@ test("write execution requires exactly the recorded buffer argument", async () =
     /exactly one --buffer/,
   );
   assert.equal(runs, 0);
+});
+
+test("opens a new window without losing prior attempts or changing buffer", () => {
+  const priorAttempts = [1, 2, 3].map((number) => ({
+    number,
+    outcome: "RPC_MAX_RETRIES",
+  }));
+  const state = {
+    deployment: {
+      verdict: "BLOCKED_WITH_RESUMABLE_BUFFER",
+      buffer: {
+        publicKey: BUFFER,
+        status: "BUFFER_WRITING",
+        creationSignature: "creation-signature",
+        writeAttempts: priorAttempts,
+        retryEligible: false,
+        lastRpcError: "RPC_MAX_RETRIES",
+      },
+    },
+  };
+
+  const next = openWriteWindow(state, {
+    id: "R3C",
+    openedAt: "2026-07-17T12:00:00Z",
+    expectedBufferPublicKey: BUFFER,
+    previousWindowId: "R3B",
+    baselineSignatureCount: 60,
+    baselineNewestSignature: "newest-signature",
+  });
+
+  assert.equal(next.deployment.buffer.publicKey, BUFFER);
+  assert.equal(next.deployment.buffer.creationSignature, "creation-signature");
+  assert.deepEqual(next.deployment.buffer.writeAttempts, []);
+  assert.equal(next.deployment.buffer.retryEligible, true);
+  assert.equal(next.deployment.buffer.lastRpcError, null);
+  assert.equal(next.deployment.verdict, "IN_PROGRESS");
+  assert.deepEqual(next.deployment.buffer.writeWindows, [
+    {
+      id: "R3B",
+      status: "BLOCKED_WITH_RESUMABLE_BUFFER",
+      attempts: priorAttempts,
+    },
+  ]);
+  assert.deepEqual(next.deployment.buffer.activeWindow, {
+    id: "R3C",
+    openedAt: "2026-07-17T12:00:00Z",
+    maxAttempts: 3,
+    attemptsUsed: 0,
+    status: "OPEN",
+    baselineSignatureCount: 60,
+    baselineNewestSignature: "newest-signature",
+  });
+});
+
+test("new window rejects buffer mismatch and an already open window", () => {
+  const base = {
+    deployment: {
+      buffer: {
+        publicKey: BUFFER,
+        status: "BUFFER_WRITING",
+        writeAttempts: [],
+      },
+    },
+  };
+  assert.throws(
+    () =>
+      openWriteWindow(base, {
+        id: "R3C",
+        openedAt: "time",
+        expectedBufferPublicKey: PublicKey.default.toBase58(),
+      }),
+    /buffer identity mismatch/,
+  );
+  const active = structuredClone(base);
+  active.deployment.buffer.activeWindow = { id: "other", status: "OPEN" };
+  assert.throws(
+    () =>
+      openWriteWindow(active, {
+        id: "R3C",
+        openedAt: "time",
+        expectedBufferPublicKey: BUFFER,
+      }),
+    /write window is already open/,
+  );
+});
+
+test("attempt recording updates and closes the active window", () => {
+  const base = {
+    deployment: {
+      buffer: {
+        status: "BUFFER_WRITING",
+        writeAttempts: [],
+        lastConfirmedProgress: null,
+        lastRpcError: null,
+        retryEligible: true,
+        activeWindow: {
+          id: "R3C",
+          status: "OPEN",
+          maxAttempts: 3,
+          attemptsUsed: 0,
+        },
+      },
+    },
+  };
+  let next = recordWriteAttempt(base, {
+    outcome: "RPC_MAX_RETRIES",
+    observed: { status: "BUFFER_WRITING", matchingBytes: 1, totalBytes: 4 },
+  });
+  assert.equal(next.deployment.buffer.activeWindow.attemptsUsed, 1);
+  assert.equal(next.deployment.buffer.activeWindow.status, "OPEN");
+  next = recordWriteAttempt(next, {
+    outcome: "RPC_MAX_RETRIES",
+    observed: { status: "BUFFER_WRITING", matchingBytes: 2, totalBytes: 4 },
+  });
+  next = recordWriteAttempt(next, {
+    outcome: "RPC_MAX_RETRIES",
+    observed: { status: "BUFFER_WRITING", matchingBytes: 3, totalBytes: 4 },
+  });
+  assert.equal(next.deployment.buffer.activeWindow.attemptsUsed, 3);
+  assert.equal(next.deployment.buffer.activeWindow.status, "EXHAUSTED");
+  assert.equal(next.deployment.buffer.retryEligible, false);
+
+  const complete = recordWriteAttempt(base, {
+    outcome: "SUCCESS",
+    observed: { status: "BUFFER_COMPLETE", matchingBytes: 4, totalBytes: 4 },
+  });
+  assert.equal(complete.deployment.buffer.activeWindow.status, "COMPLETE");
+});
+
+test("summarizes signature history without inventing an aggregate signature", () => {
+  const summary = summarizeSignatureHistory(
+    [
+      {
+        signature: "newest-signature",
+        slot: 12,
+        err: null,
+        memo: "must not be retained",
+        blockTime: 123,
+      },
+      { signature: "failed-signature", slot: 11, err: { Custom: 1 } },
+      { signature: "older-signature", slot: 10, err: null },
+    ],
+    { baselineCount: 1 },
+  );
+
+  assert.deepEqual(summary, {
+    total: 3,
+    successful: 2,
+    failed: 1,
+    newSinceWindow: 2,
+    newest: {
+      signature: "newest-signature",
+      slot: 12,
+      err: null,
+    },
+  });
+  assert.equal(Object.hasOwn(summary, "signature"), false);
+  assert.equal(JSON.stringify(summary).includes("must not be retained"), false);
+});
+
+test("attempt capture stores only the sanitized signature-history summary", () => {
+  const state = {
+    deployment: {
+      buffer: {
+        status: "BUFFER_WRITING",
+        writeAttempts: [],
+        lastConfirmedProgress: null,
+        lastRpcError: null,
+        retryEligible: true,
+      },
+    },
+  };
+  const signatureHistoryAfter = summarizeSignatureHistory([
+    { signature: "confirmed-signature", slot: 20, err: null },
+  ]);
+
+  const next = recordWriteAttempt(state, {
+    outcome: "RPC_MAX_RETRIES",
+    observed: { status: "BUFFER_WRITING", matchingBytes: 1, totalBytes: 4 },
+    signatureHistoryAfter: {
+      ...signatureHistoryAfter,
+      rawOutput: "must not be retained",
+    },
+    rawOutput: "must not be retained",
+  });
+
+  assert.deepEqual(
+    next.deployment.buffer.writeAttempts[0].signatureHistoryAfter,
+    signatureHistoryAfter,
+  );
+  assert.equal(next.deployment.buffer.writeAttempts[0].signature, null);
+  assert.equal(JSON.stringify(next).includes("must not be retained"), false);
 });

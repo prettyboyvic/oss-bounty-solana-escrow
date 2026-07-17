@@ -105,11 +105,85 @@ export function inspectUpgradeableBuffer(account, expected) {
   };
 }
 
+export function summarizeSignatureHistory(
+  signatures,
+  { baselineCount = 0 } = {},
+) {
+  if (!Array.isArray(signatures)) {
+    throw new Error("signature history must be an array");
+  }
+  if (!Number.isInteger(baselineCount) || baselineCount < 0) {
+    throw new Error("signature history baseline must be a nonnegative integer");
+  }
+  const sanitized = signatures.map((entry) => {
+    if (
+      typeof entry?.signature !== "string" ||
+      !Number.isInteger(entry.slot)
+    ) {
+      throw new Error("signature history entry is invalid");
+    }
+    return {
+      signature: entry.signature,
+      slot: entry.slot,
+      err: structuredClone(entry.err ?? null),
+    };
+  });
+  const successful = sanitized.filter((entry) => entry.err === null).length;
+  return {
+    total: sanitized.length,
+    successful,
+    failed: sanitized.length - successful,
+    newSinceWindow: Math.max(0, sanitized.length - baselineCount),
+    newest: sanitized[0] ?? null,
+  };
+}
+
+function sanitizeSignatureHistorySummary(summary) {
+  const counts = [
+    summary?.total,
+    summary?.successful,
+    summary?.failed,
+    summary?.newSinceWindow,
+  ];
+  if (counts.some((value) => !Number.isInteger(value) || value < 0)) {
+    throw new Error("signature history summary counts are invalid");
+  }
+  if (
+    summary.successful + summary.failed !== summary.total ||
+    summary.newSinceWindow > summary.total
+  ) {
+    throw new Error("signature history summary is inconsistent");
+  }
+  const newest = summary.newest;
+  if (
+    newest !== null &&
+    (typeof newest?.signature !== "string" || !Number.isInteger(newest.slot))
+  ) {
+    throw new Error("signature history newest entry is invalid");
+  }
+  return {
+    total: summary.total,
+    successful: summary.successful,
+    failed: summary.failed,
+    newSinceWindow: summary.newSinceWindow,
+    newest: newest
+      ? {
+          signature: newest.signature,
+          slot: newest.slot,
+          err: structuredClone(newest.err ?? null),
+        }
+      : null,
+  };
+}
+
 export function recordWriteAttempt(state, attempt) {
   const next = structuredClone(state);
   const buffer = next.deployment?.buffer;
   if (!buffer || !Array.isArray(buffer.writeAttempts)) {
     throw new Error("deployment buffer state is required");
+  }
+  if (buffer.activeWindow && buffer.activeWindow.status !== "OPEN") {
+    throw new Error("active write window is not open");
   }
   if (buffer.writeAttempts.length >= MAX_WRITE_ATTEMPTS) {
     throw new Error("three live write attempts are already recorded");
@@ -121,6 +195,13 @@ export function recordWriteAttempt(state, attempt) {
     completedAt: attempt.completedAt ?? null,
     outcome: attempt.outcome,
     signature: attempt.signature ?? null,
+    ...(attempt.signatureHistoryAfter
+      ? {
+          signatureHistoryAfter: sanitizeSignatureHistorySummary(
+            attempt.signatureHistoryAfter,
+          ),
+        }
+      : {}),
   });
   const observed = attempt.observed ?? null;
   buffer.lastObservedComparison = observed
@@ -146,6 +227,61 @@ export function recordWriteAttempt(state, attempt) {
   if (buffer.status === "BUFFER_COMPLETE") {
     buffer.retryEligible = false;
   }
+  if (buffer.activeWindow) {
+    buffer.activeWindow.attemptsUsed = number;
+    buffer.activeWindow.status =
+      buffer.status === "BUFFER_COMPLETE"
+        ? "COMPLETE"
+        : number >= buffer.activeWindow.maxAttempts
+          ? "EXHAUSTED"
+          : "OPEN";
+  }
+  return next;
+}
+
+export function openWriteWindow(state, input) {
+  const next = structuredClone(state);
+  const deployment = next.deployment;
+  const buffer = deployment?.buffer;
+  if (!buffer || buffer.publicKey !== input.expectedBufferPublicKey) {
+    throw new Error("buffer identity mismatch while opening write window");
+  }
+  if (buffer.status !== "BUFFER_WRITING") {
+    throw new Error(`cannot open write window from ${buffer.status}`);
+  }
+  if (buffer.activeWindow?.status === "OPEN") {
+    throw new Error("a write window is already open");
+  }
+  if (!input.id || !input.openedAt) {
+    throw new Error("write window id and openedAt are required");
+  }
+
+  buffer.writeWindows = Array.isArray(buffer.writeWindows)
+    ? buffer.writeWindows
+    : [];
+  const priorAttempts = Array.isArray(buffer.writeAttempts)
+    ? buffer.writeAttempts
+    : [];
+  if (priorAttempts.length > 0) {
+    buffer.writeWindows.push({
+      id: input.previousWindowId ?? "previous",
+      status: deployment.verdict ?? "UNKNOWN",
+      attempts: priorAttempts,
+    });
+  }
+  buffer.writeAttempts = [];
+  buffer.retryEligible = true;
+  buffer.lastRpcError = null;
+  buffer.activeWindow = {
+    id: input.id,
+    openedAt: input.openedAt,
+    maxAttempts: MAX_WRITE_ATTEMPTS,
+    attemptsUsed: 0,
+    status: "OPEN",
+    baselineSignatureCount: input.baselineSignatureCount ?? null,
+    baselineNewestSignature: input.baselineNewestSignature ?? null,
+  };
+  deployment.verdict = "IN_PROGRESS";
   return next;
 }
 
