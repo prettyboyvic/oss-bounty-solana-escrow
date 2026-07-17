@@ -184,7 +184,7 @@ test("records no more than three public write attempts", () => {
   state.deployment.buffer.writeAttempts.push({ number: 3 });
   assert.throws(
     () => recordWriteAttempt(state, { outcome: "SUCCESS" }),
-    /three live write attempts/,
+    /attempt limit/,
   );
 });
 
@@ -404,6 +404,64 @@ test("new window rejects buffer mismatch and an already open window", () => {
       }),
     /write window is already open/,
   );
+});
+
+test("one-attempt window exhausts after its only recorded attempt", () => {
+  const state = {
+    deployment: {
+      verdict: "BLOCKED_WITH_RESUMABLE_BUFFER",
+      buffer: {
+        publicKey: BUFFER,
+        status: "BUFFER_WRITING",
+        writeAttempts: [{ number: 1 }, { number: 2 }, { number: 3 }],
+        retryEligible: false,
+      },
+    },
+  };
+  let next = openWriteWindow(state, {
+    id: "R3E",
+    openedAt: "2026-07-17T12:00:00Z",
+    expectedBufferPublicKey: BUFFER,
+    previousWindowId: "R3D",
+    maxAttempts: 1,
+  });
+
+  assert.equal(next.deployment.buffer.activeWindow.maxAttempts, 1);
+  next = recordWriteAttempt(next, {
+    outcome: "RPC_MAX_RETRIES",
+    observed: { status: "BUFFER_WRITING", matchingBytes: 1, totalBytes: 4 },
+  });
+  assert.equal(next.deployment.buffer.activeWindow.attemptsUsed, 1);
+  assert.equal(next.deployment.buffer.activeWindow.status, "EXHAUSTED");
+  assert.equal(next.deployment.buffer.retryEligible, false);
+  assert.throws(
+    () => recordWriteAttempt(next, { outcome: "RPC_MAX_RETRIES" }),
+    /not open/,
+  );
+});
+
+test("write window rejects attempt limits outside one through three", () => {
+  const state = {
+    deployment: {
+      buffer: {
+        publicKey: BUFFER,
+        status: "BUFFER_WRITING",
+        writeAttempts: [],
+      },
+    },
+  };
+  for (const maxAttempts of [0, 4]) {
+    assert.throws(
+      () =>
+        openWriteWindow(state, {
+          id: "R3E",
+          openedAt: "time",
+          expectedBufferPublicKey: BUFFER,
+          maxAttempts,
+        }),
+      /attempt limit/,
+    );
+  }
 });
 
 test("attempt recording updates and closes the active window", () => {

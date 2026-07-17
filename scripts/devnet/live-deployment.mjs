@@ -7,6 +7,14 @@ const BUFFER_METADATA_LENGTH = 37;
 const MAX_WRITE_ATTEMPTS = 3;
 const KEYPAIR_ARRAY = /\[(?:\s*(?:25[0-5]|2[0-4]\d|1?\d?\d)\s*,){63}\s*(?:25[0-5]|2[0-4]\d|1?\d?\d)\s*\]/;
 
+function writeAttemptLimit(buffer) {
+  const limit = buffer.activeWindow?.maxAttempts ?? MAX_WRITE_ATTEMPTS;
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_WRITE_ATTEMPTS) {
+    throw new Error("write attempt limit must be between one and three");
+  }
+  return limit;
+}
+
 export function assertSafeCapturedOutput(output) {
   const value = String(output ?? "");
   if (
@@ -185,8 +193,9 @@ export function recordWriteAttempt(state, attempt) {
   if (buffer.activeWindow && buffer.activeWindow.status !== "OPEN") {
     throw new Error("active write window is not open");
   }
-  if (buffer.writeAttempts.length >= MAX_WRITE_ATTEMPTS) {
-    throw new Error("three live write attempts are already recorded");
+  const attemptLimit = writeAttemptLimit(buffer);
+  if (buffer.writeAttempts.length >= attemptLimit) {
+    throw new Error("live write attempt limit is already reached");
   }
   const number = buffer.writeAttempts.length + 1;
   buffer.writeAttempts.push({
@@ -223,7 +232,7 @@ export function recordWriteAttempt(state, attempt) {
   buffer.lastRpcError =
     attempt.outcome === "SUCCESS" ? null : attempt.outcome;
   buffer.retryEligible =
-    buffer.status === "BUFFER_WRITING" && number < MAX_WRITE_ATTEMPTS;
+    buffer.status === "BUFFER_WRITING" && number < attemptLimit;
   if (buffer.status === "BUFFER_COMPLETE") {
     buffer.retryEligible = false;
   }
@@ -255,6 +264,14 @@ export function openWriteWindow(state, input) {
   if (!input.id || !input.openedAt) {
     throw new Error("write window id and openedAt are required");
   }
+  const maxAttempts = input.maxAttempts ?? MAX_WRITE_ATTEMPTS;
+  if (
+    !Number.isInteger(maxAttempts) ||
+    maxAttempts < 1 ||
+    maxAttempts > MAX_WRITE_ATTEMPTS
+  ) {
+    throw new Error("write attempt limit must be between one and three");
+  }
 
   buffer.writeWindows = Array.isArray(buffer.writeWindows)
     ? buffer.writeWindows
@@ -275,7 +292,7 @@ export function openWriteWindow(state, input) {
   buffer.activeWindow = {
     id: input.id,
     openedAt: input.openedAt,
-    maxAttempts: MAX_WRITE_ATTEMPTS,
+    maxAttempts,
     attemptsUsed: 0,
     status: "OPEN",
     baselineSignatureCount: input.baselineSignatureCount ?? null,
@@ -301,8 +318,8 @@ export async function executeWriteAttempt({
   if (!buffer) {
     throw new Error("deployment buffer state is required");
   }
-  if (buffer.writeAttempts.length >= MAX_WRITE_ATTEMPTS) {
-    throw new Error("three live write attempts are already recorded");
+  if (buffer.writeAttempts.length >= writeAttemptLimit(buffer)) {
+    throw new Error("live write attempt limit is already reached");
   }
   if (!Array.isArray(argv)) {
     throw new Error("write command argv is required");
