@@ -174,3 +174,56 @@ cooldown:
 
 Raw runtime evidence must remain ignored. Only sanitized, independently
 verifiable evidence may be committed.
+
+## Phase 2-R3A addendum — safe recovery from throttled deployment
+
+The verdict above is the historical R1 checkpoint. Manual funding later made
+the dedicated deployment authority sufficiently funded, but the first program
+upload attempt was throttled by the public devnet RPC with HTTP/RPC `429`.
+Phase 2 remains blocked pending a corrected, explicit resumable-buffer retry.
+This is still not a Phase 2 PASS.
+
+The Solana CLI invocation used for that first attempt omitted an explicit
+buffer signer. Solana CLI 2.2.20 therefore created a temporary buffer signer
+internally and entered its recovery-output branch after the interrupted
+upload. Recovery material appeared only in ephemeral process output. It was
+not saved, copied into state, committed, or repeated. The temporary buffer was
+closed using its documented recovery path, its rent was returned, and the
+close transaction finalized successfully with `meta.err = null` at slot
+`476878150`.
+
+Read-only reconciliation at finalized slot `476880497` observed:
+
+```text
+RPC URL:                 https://api.devnet.solana.com
+Genesis hash:            EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG
+Block time:              1784281393
+Authority balance:       5,999,895,000 lamports
+Canonical program:       absent
+Closed temporary buffer: absent
+Planned explicit buffer: CT1DGjkt9t926L6SoFxiYJmzc18nMowpdw1WcZgWwbbW (absent onchain)
+```
+
+The funding was a manual external event through the Solana Foundation faucet;
+repository tooling did not create or claim that transfer. No new funding
+signature is recorded because this checkpoint did not identify one with
+sufficient certainty. There is no deployment signature or deployment Explorer
+URL, and no mint, token-account, or escrow transaction has occurred.
+
+R3A corrects the deployment boundary locally:
+
+- `.devnet/deploy-buffer.devnet-keypair.json` is a dedicated, ignored,
+  devnet-only signer created silently and never tracked;
+- only its public address is stored in versioned runtime state;
+- write, resume, finalize, and recovery command builders always supply the
+  explicit repository-managed buffer;
+- partial valid buffers resume with the same signer; wrong owner, authority,
+  allocation, address, binary, or uncertain state stops fail-closed;
+- RPC rate limiting preserves resumable state and never regenerates the
+  buffer;
+- closing a buffer requires a separate explicit recovery decision.
+
+The canonical program signer and all actor signers remain intact. No
+canonical or actor key material leaked. The new explicit buffer signer was
+created only after tracked ignore protection passed and has not been used in a
+devnet transaction during R3A.

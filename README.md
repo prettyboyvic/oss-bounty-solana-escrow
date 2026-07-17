@@ -60,7 +60,7 @@ reference hash is stored in the escrow account.
 ## Current verification
 
 Phase 2 devnet work is currently
-[blocked by public faucet availability](docs/PHASE_2_DEVNET_BLOCKED_2026-07-16.md);
+[blocked pending an explicit resumable-buffer retry](docs/PHASE_2_DEVNET_BLOCKED_2026-07-16.md);
 the program has not been deployed to devnet.
 
 Verified locally on Windows:
