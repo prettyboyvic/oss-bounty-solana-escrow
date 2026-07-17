@@ -227,3 +227,55 @@ The canonical program signer and all actor signers remain intact. No
 canonical or actor key material leaked. The new explicit buffer signer was
 created only after tracked ignore protection passed and has not been used in a
 devnet transaction during R3A.
+
+## Phase 2-R3B1 addendum — resumable buffer checkpoint
+
+Verdict: `BLOCKED_WITH_RESUMABLE_BUFFER`.
+
+R3B used the preserved explicit buffer and stopped after the approved three
+write/resume attempts. All three aggregate CLI attempts ended with
+`RPC_MAX_RETRIES`. No fourth attempt was made, and the buffer was not closed,
+regenerated, or replaced.
+
+The buffer creation transaction finalized successfully with `meta.err = null`
+at slot `476885328`:
+
+- buffer: `CT1DGjkt9t926L6SoFxiYJmzc18nMowpdw1WcZgWwbbW`;
+- creation transaction:
+  `4oWuUj3V3GziWVVf4zwG6BVYwRMkja5782cbmmZWyXkdVo2out9NGu8G2EyvssAUrUSecWXy5EM1yTnoRGPDB4pZ`;
+- owner: `BPFLoaderUpgradeab1e11111111111111111111111`;
+- authority: `Avfvs1k6ttrBtqh83tFw5g3dhWncrjP5hj4D52kGNZGk`;
+- allocated data length: `395181` bytes;
+- state: `BUFFER_WRITING`.
+
+A finalized read of the buffer-address history observed 60 successful
+transactions and zero failed transactions. The aggregate CLI attempts did not
+return one signature representing each entire upload attempt, so their
+per-attempt signature fields remain `null`. No synthetic signature or Explorer
+URL is used.
+
+The full account-byte comparison does not match the 395144-byte local binary
+yet. A count of equal byte positions is deliberately not reported as upload
+offset or confirmed progress: unwritten buffer storage is zero-filled, and
+zero bytes in that storage may equal zero bytes in the local SBF artifact.
+Accordingly, `lastConfirmedProgress` remains `null` until the whole executable
+matches exactly.
+
+At the final R3B read-only checkpoint:
+
+```text
+Canonical program:              absent
+Buffer state:                   BUFFER_WRITING
+Authority balance:              3,248,183,680 lamports
+Remaining requirement + reserve: 3,002,547,760 lamports
+Funding status:                 sufficient
+```
+
+Resume must preserve the same buffer address and signer, re-attest the cluster,
+query the buffer directly, and continue only in a separately approved bounded
+execution window. Do not close or regenerate the buffer merely because the
+public RPC throttled the upload.
+
+No canonical deployment, ProgramData account, DEVTEST mint, token account,
+escrow flow, or devnet deployment claim exists at this checkpoint. Raw process
+output and ignored runtime state remain outside Git.
