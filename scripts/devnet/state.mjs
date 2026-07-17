@@ -45,7 +45,7 @@ function assertNoSecretMaterial(value, path = "state") {
 
 export function createInitialState(publicConfig, sourceCommit) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     runId: randomUUID(),
     cluster: structuredClone(publicConfig.cluster),
     source: {
@@ -56,7 +56,7 @@ export function createInitialState(publicConfig, sourceCommit) {
       id: publicConfig.programId,
     },
     identities: {},
-    deployment: {},
+    deployment: { buffer: null },
     mint: {},
     flows: {
       release: {},
@@ -71,16 +71,24 @@ export function migrateState(value) {
   if (!Number.isInteger(value?.schemaVersion)) {
     throw new Error("state schemaVersion is required");
   }
-  if (value.schemaVersion > 1) {
+  if (value.schemaVersion > 2) {
     throw new Error(
       `future state schemaVersion ${value.schemaVersion} is not supported`,
     );
   }
-  if (value.schemaVersion !== 1) {
+  if (value.schemaVersion < 1) {
     throw new Error(`state schemaVersion ${value.schemaVersion} is unsupported`);
   }
   assertNoSecretMaterial(value);
-  return structuredClone(value);
+  const migrated = structuredClone(value);
+  if (migrated.schemaVersion === 1) {
+    migrated.schemaVersion = 2;
+    migrated.deployment = {
+      ...(migrated.deployment ?? {}),
+      buffer: migrated.deployment?.buffer ?? null,
+    };
+  }
+  return migrated;
 }
 
 export function loadState(path) {
@@ -99,14 +107,72 @@ export function backupState(path, historyDir, timestamp) {
   if (!existsSync(path)) {
     throw new Error(`state file does not exist: ${path}`);
   }
-  const state = loadState(path);
+  const state = JSON.parse(readFileSync(path, "utf8"));
+  if (!Number.isInteger(state?.schemaVersion)) {
+    throw new Error("state schemaVersion is required");
+  }
+  assertNoSecretMaterial(state);
   mkdirSync(historyDir, { recursive: true });
-  const backup = join(
+  const preferredBackup = join(
     historyDir,
     `state-v${state.schemaVersion}-${timestamp}.json`,
   );
-  copyFileSync(path, backup);
+  const backup = existsSync(preferredBackup)
+    ? join(
+        historyDir,
+        `state-v${state.schemaVersion}-${timestamp}-${randomUUID()}.json`,
+      )
+    : preferredBackup;
+  const temporary = `${backup}.tmp`;
+  copyFileSync(path, temporary);
+  renameSync(temporary, backup);
   return backup;
+}
+
+export function migrateStateFile(path, historyDir, timestamp) {
+  const raw = JSON.parse(readFileSync(path, "utf8"));
+  const migrated = migrateState(raw);
+  if (raw.schemaVersion === migrated.schemaVersion) {
+    return { state: migrated, backup: null };
+  }
+  const backup = backupState(path, historyDir, timestamp);
+  saveStateAtomic(path, migrated);
+  return { state: migrated, backup };
+}
+
+export function configureDeploymentBuffer(state, input) {
+  const migrated = migrateState(state);
+  if (
+    !input?.publicKey ||
+    !input.expectedOwner ||
+    !input.expectedAuthority ||
+    !Number.isInteger(input.allocatedLength) ||
+    input.allocatedLength <= 0 ||
+    !Number.isInteger(input.localBinaryLength) ||
+    input.localBinaryLength <= 0 ||
+    !input.localBinarySha256
+  ) {
+    throw new Error("complete public deployment buffer metadata is required");
+  }
+  migrated.deployment = migrated.deployment ?? {};
+  migrated.deployment.buffer = {
+    publicKey: input.publicKey,
+    expectedOwner: input.expectedOwner,
+    expectedAuthority: input.expectedAuthority,
+    allocatedLength: input.allocatedLength,
+    localBinary: {
+      length: input.localBinaryLength,
+      sha256: input.localBinarySha256,
+    },
+    creationSignature: null,
+    writeAttempts: [],
+    lastConfirmedProgress: null,
+    status: "PLANNED",
+    lastRpcError: null,
+    retryEligible: true,
+  };
+  assertNoSecretMaterial(migrated);
+  return migrated;
 }
 
 export function decideNextStep(observed) {

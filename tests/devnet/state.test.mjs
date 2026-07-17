@@ -14,13 +14,16 @@ import { Keypair } from "@solana/web3.js";
 
 import {
   assertSupportedCommand,
+  initializeDeploymentBuffer,
   initializeIdentities,
 } from "../../scripts/devnet/run.mjs";
 import {
   backupState,
+  configureDeploymentBuffer,
   createInitialState,
   decideNextStep,
   loadState,
+  migrateStateFile,
   migrateState,
   saveStateAtomic,
 } from "../../scripts/devnet/state.mjs";
@@ -40,15 +43,15 @@ const CONFIG = {
   },
 };
 
-test("creates schemaVersion 1 without secret paths", () => {
+test("creates schemaVersion 2 without secret paths", () => {
   const state = createInitialState(CONFIG, "abc123");
-  assert.equal(state.schemaVersion, 1);
+  assert.equal(state.schemaVersion, 2);
   assert.equal(state.source.commit, "abc123");
   assert.deepEqual(state.flows, { release: {}, refund: {} });
   assert.equal(JSON.stringify(state).includes("keypair"), false);
 });
 
-test("loads version 1 without mutation", () => {
+test("loads version 2 without mutation", () => {
   const root = mkdtempSync(join(tmpdir(), "state-load-"));
   const path = join(root, "state.json");
   const state = createInitialState(CONFIG, "abc123");
@@ -59,7 +62,64 @@ test("loads version 1 without mutation", () => {
 
 test("rejects missing and future schema versions", () => {
   assert.throws(() => migrateState({}), /schemaVersion/);
-  assert.throws(() => migrateState({ schemaVersion: 2 }), /future state/);
+  assert.throws(() => migrateState({ schemaVersion: 3 }), /future state/);
+});
+
+test("migrates version 1 while preserving existing public evidence", () => {
+  const legacy = createInitialState(CONFIG, "abc123");
+  legacy.schemaVersion = 1;
+  legacy.deployment = { priorAttempt: "preserved" };
+
+  const migrated = migrateState(legacy);
+
+  assert.equal(migrated.schemaVersion, 2);
+  assert.equal(migrated.deployment.priorAttempt, "preserved");
+  assert.equal(migrated.deployment.buffer, null);
+});
+
+test("file migration backs up version 1 before atomic replacement", () => {
+  const root = mkdtempSync(join(tmpdir(), "state-migrate-file-"));
+  const path = join(root, "state.json");
+  const history = join(root, "history");
+  const legacy = createInitialState(CONFIG, "abc123");
+  legacy.schemaVersion = 1;
+  writeFileSync(path, JSON.stringify(legacy));
+
+  const result = migrateStateFile(
+    path,
+    history,
+    "2026-07-17T00-00-00Z",
+  );
+
+  assert.equal(result.state.schemaVersion, 2);
+  assert.equal(existsSync(result.backup), true);
+  assert.equal(JSON.parse(readFileSync(path, "utf8")).schemaVersion, 2);
+});
+
+test("records only public resumable buffer fields", () => {
+  const state = configureDeploymentBuffer(createInitialState(CONFIG, "abc123"), {
+    publicKey: "11111111111111111111111111111111",
+    expectedOwner: "BPFLoaderUpgradeab1e11111111111111111111111",
+    expectedAuthority: "authority",
+    allocatedLength: 395181,
+    localBinaryLength: 395144,
+    localBinarySha256: "ABC123",
+  });
+
+  assert.deepEqual(state.deployment.buffer, {
+    publicKey: "11111111111111111111111111111111",
+    expectedOwner: "BPFLoaderUpgradeab1e11111111111111111111111",
+    expectedAuthority: "authority",
+    allocatedLength: 395181,
+    localBinary: { length: 395144, sha256: "ABC123" },
+    creationSignature: null,
+    writeAttempts: [],
+    lastConfirmedProgress: null,
+    status: "PLANNED",
+    lastRpcError: null,
+    retryEligible: true,
+  });
+  assert.equal(JSON.stringify(state).includes("keypair"), false);
 });
 
 test("writes atomically and leaves no temporary file", () => {
@@ -83,7 +143,21 @@ test("backs up existing state without deleting it", () => {
 
   assert.equal(existsSync(path), true);
   assert.equal(existsSync(backup), true);
-  assert.match(backup, /state-v1-2026-07-16T00-00-00Z\.json$/);
+  assert.match(backup, /state-v2-2026-07-16T00-00-00Z\.json$/);
+});
+
+test("same-timestamp backups preserve both snapshots", () => {
+  const root = mkdtempSync(join(tmpdir(), "state-backup-collision-"));
+  const path = join(root, "state.json");
+  const history = join(root, "history");
+  writeFileSync(path, JSON.stringify(createInitialState(CONFIG, "abc123")));
+
+  const first = backupState(path, history, "2026-07-16T00-00-00Z");
+  const second = backupState(path, history, "2026-07-16T00-00-00Z");
+
+  assert.notEqual(first, second);
+  assert.equal(existsSync(first), true);
+  assert.equal(existsSync(second), true);
 });
 
 for (const [status, expected] of [
@@ -191,6 +265,84 @@ test("identity initialization stops without tracked ignore protection", () => {
         logger: () => {},
       }),
     /tracked .gitignore protection/,
+  );
+});
+
+test("deployment buffer preparation creates once and records public state only", () => {
+  const root = mkdtempSync(join(tmpdir(), "buffer-init-"));
+  const devnet = join(root, ".devnet");
+  const buffer = Keypair.generate();
+  const created = [];
+  mkdirSync(devnet);
+  const keygen = {
+    create(path) {
+      writeFileSync(path, JSON.stringify([...buffer.secretKey]));
+      created.push(path);
+      return buffer.publicKey.toBase58();
+    },
+    publicKey() {
+      return buffer.publicKey.toBase58();
+    },
+  };
+  const input = {
+    repoRoot: root,
+    devnetDir: devnet,
+    state: createInitialState(CONFIG, "abc123"),
+    authorityPublicKey: "authority",
+    binaryLength: 395144,
+    binarySha256: "ABC123",
+    keygen,
+    isTrackedIgnored: () => true,
+    logger: () => {},
+  };
+
+  const first = initializeDeploymentBuffer(input);
+  const second = initializeDeploymentBuffer({ ...input, state: first });
+
+  assert.equal(created.length, 1);
+  assert.equal(first.deployment.buffer.publicKey, buffer.publicKey.toBase58());
+  assert.equal(first.deployment.buffer.allocatedLength, 395181);
+  assert.deepEqual(second.deployment.buffer, first.deployment.buffer);
+  assert.equal(JSON.stringify(second).includes("deploy-buffer.devnet-keypair"), false);
+  assert.equal(JSON.stringify(second).includes("secretKey"), false);
+});
+
+test("deployment buffer preparation rejects ignore and recorded-address mismatch", () => {
+  const root = mkdtempSync(join(tmpdir(), "buffer-init-reject-"));
+  const devnet = join(root, ".devnet");
+  const buffer = Keypair.generate();
+  mkdirSync(devnet);
+  const signerPath = join(devnet, "deploy-buffer.devnet-keypair.json");
+  writeFileSync(signerPath, JSON.stringify([...buffer.secretKey]));
+  const keygen = {
+    create() {
+      throw new Error("must not regenerate");
+    },
+    publicKey() {
+      return buffer.publicKey.toBase58();
+    },
+  };
+  const base = {
+    repoRoot: root,
+    devnetDir: devnet,
+    state: createInitialState(CONFIG, "abc123"),
+    authorityPublicKey: "authority",
+    binaryLength: 395144,
+    binarySha256: "ABC123",
+    keygen,
+    logger: () => {},
+  };
+
+  assert.throws(
+    () => initializeDeploymentBuffer({ ...base, isTrackedIgnored: () => false }),
+    /tracked .gitignore protection/,
+  );
+
+  const state = structuredClone(base.state);
+  state.deployment.buffer = { publicKey: Keypair.generate().publicKey.toBase58() };
+  assert.throws(
+    () => initializeDeploymentBuffer({ ...base, state, isTrackedIgnored: () => true }),
+    /buffer public key mismatch/,
   );
 });
 

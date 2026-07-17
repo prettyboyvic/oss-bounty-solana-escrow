@@ -1,16 +1,19 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
   readFileSync,
+  statSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
   backupState,
+  configureDeploymentBuffer,
   createInitialState,
-  loadState,
+  migrateStateFile,
   saveStateAtomic,
 } from "./state.mjs";
 import {
@@ -28,7 +31,8 @@ const ACTOR_FILES = {
   mintAuthority: "mint-authority.devnet-keypair.json",
 };
 
-const SUPPORTED_COMMANDS = new Set(["init-identities"]);
+const SUPPORTED_COMMANDS = new Set(["init-identities", "prepare-buffer"]);
+const BUFFER_METADATA_LENGTH = 37;
 
 export function assertSupportedCommand(command) {
   if (!SUPPORTED_COMMANDS.has(command)) {
@@ -123,6 +127,67 @@ export function initializeIdentities({
   return next;
 }
 
+export function initializeDeploymentBuffer({
+  repoRoot,
+  devnetDir,
+  state,
+  authorityPublicKey,
+  binaryLength,
+  binarySha256,
+  keygen = defaultKeygen(),
+  isTrackedIgnored = trackedIgnoreCheck,
+  logger = console.log,
+}) {
+  const signerPath = assertSignerPathContained(
+    repoRoot,
+    join(devnetDir, "deploy-buffer.devnet-keypair.json"),
+  );
+  if (!isTrackedIgnored(repoRoot, signerPath)) {
+    throw new Error(
+      "tracked .gitignore protection is required before buffer key creation",
+    );
+  }
+  if (!authorityPublicKey) {
+    throw new Error("public deployment authority is required");
+  }
+  if (!Number.isInteger(binaryLength) || binaryLength <= 0 || !binarySha256) {
+    throw new Error("verified local binary evidence is required");
+  }
+
+  const publicKey = existsSync(signerPath)
+    ? keygen.publicKey(signerPath)
+    : keygen.create(signerPath);
+  const allocatedLength = binaryLength + BUFFER_METADATA_LENGTH;
+  const recorded = state.deployment?.buffer;
+  if (recorded) {
+    if (recorded.publicKey !== publicKey) {
+      throw new Error("buffer public key mismatch with preserved state");
+    }
+    if (
+      recorded.expectedOwner !== "BPFLoaderUpgradeab1e11111111111111111111111" ||
+      recorded.expectedAuthority !== authorityPublicKey ||
+      recorded.allocatedLength !== allocatedLength ||
+      recorded.localBinary?.length !== binaryLength ||
+      recorded.localBinary?.sha256 !== binarySha256
+    ) {
+      throw new Error("preserved buffer metadata mismatch");
+    }
+    logger({ buffer: { publicKey, status: recorded.status } });
+    return structuredClone(state);
+  }
+
+  const next = configureDeploymentBuffer(state, {
+    publicKey,
+    expectedOwner: "BPFLoaderUpgradeab1e11111111111111111111111",
+    expectedAuthority: authorityPublicKey,
+    allocatedLength,
+    localBinaryLength: binaryLength,
+    localBinarySha256: binarySha256,
+  });
+  logger({ buffer: { publicKey, status: next.deployment.buffer.status } });
+  return next;
+}
+
 function parseArgs(argv) {
   const values = { command: argv[0] };
   for (let index = 1; index < argv.length; index += 1) {
@@ -152,7 +217,11 @@ function main() {
   const devnetDir = join(repoRoot, ".devnet");
   const statePath = join(devnetDir, "state.json");
   const state = existsSync(statePath)
-    ? loadState(statePath)
+    ? migrateStateFile(
+        statePath,
+        join(devnetDir, "history"),
+        timestampForPath(),
+      ).state
     : createInitialState(
         config,
         execFileSync("git", ["rev-parse", "HEAD"], {
@@ -161,12 +230,35 @@ function main() {
         }).trim(),
       );
 
-  const next = initializeIdentities({
-    repoRoot,
-    devnetDir,
-    state,
-    programId: config.programId,
-  });
+  let next;
+  if (args.command === "init-identities") {
+    next = initializeIdentities({
+      repoRoot,
+      devnetDir,
+      state,
+      programId: config.programId,
+    });
+  } else {
+    const binaryPath = join(
+      repoRoot,
+      "target",
+      "sbf-solana-solana",
+      "release",
+      "oss_bounty_escrow.so",
+    );
+    if (!existsSync(binaryPath)) {
+      throw new Error("optimized SBF binary is required before buffer preparation");
+    }
+    const binary = readFileSync(binaryPath);
+    next = initializeDeploymentBuffer({
+      repoRoot,
+      devnetDir,
+      state,
+      authorityPublicKey: state.identities.deploymentAuthority,
+      binaryLength: statSync(binaryPath).size,
+      binarySha256: createHash("sha256").update(binary).digest("hex"),
+    });
+  }
   if (existsSync(statePath)) {
     backupState(
       statePath,

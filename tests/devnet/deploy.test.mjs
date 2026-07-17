@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -7,12 +10,15 @@ import {
   recoverDeployment,
 } from "../../scripts/devnet/deploy.mjs";
 
+const REPO_ROOT = mkdtempSync(join(tmpdir(), "deploy-command-"));
 const INPUT = {
+  repoRoot: REPO_ROOT,
   rpcUrl: "https://api.devnet.solana.com",
-  binaryPath: "target/program.so",
+  binaryPath: join(REPO_ROOT, "target", "program.so"),
   binaryLength: 395144,
-  authorityPath: ".devnet/deployment-authority.devnet-keypair.json",
-  programKeypairPath: ".devnet/program.devnet-keypair.json",
+  authorityPath: join(REPO_ROOT, ".devnet", "deployment-authority.devnet-keypair.json"),
+  programKeypairPath: join(REPO_ROOT, ".devnet", "program.devnet-keypair.json"),
+  bufferSignerPath: join(REPO_ROOT, ".devnet", "deploy-buffer.devnet-keypair.json"),
 };
 
 test("deploy command uses explicit devnet identities and exact max length", () => {
@@ -29,6 +35,8 @@ test("deploy command uses explicit devnet identities and exact max length", () =
     INPUT.authorityPath,
     "--program-id",
     INPUT.programKeypairPath,
+    "--buffer",
+    INPUT.bufferSignerPath,
     "--upgrade-authority",
     INPUT.authorityPath,
     "--max-len",
@@ -48,6 +56,10 @@ test("deploy command rejects mainnet and missing explicit paths", () => {
   assert.throws(
     () => buildDeployCommand({ ...INPUT, authorityPath: "" }),
     /authority path/,
+  );
+  assert.throws(
+    () => buildDeployCommand({ ...INPUT, bufferSignerPath: "" }),
+    /buffer signer/,
   );
 });
 
