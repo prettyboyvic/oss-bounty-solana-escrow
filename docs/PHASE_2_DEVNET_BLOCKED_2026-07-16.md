@@ -320,3 +320,64 @@ Any later resume must preserve and re-query this exact buffer and its existing
 repository-managed signer after fresh cluster, identity, binary, funding, and
 single-writer checks. Do not close or regenerate the buffer because the public
 devnet RPC throttled this bounded window.
+
+## Phase 2-R3D addendum — read-only planning and local resume validation
+
+Publication checkpoint verdicts: `PLAN_UPLOAD_PASS` and `LOCAL_RESUME_PASS`.
+These verdicts validate planning and local recovery behavior only. Phase 2 is
+not `PASS`, the live uploader remains hard-disabled, and no devnet write was
+sent during either checkpoint.
+
+The read-only plan re-attested Agave/Solana devnet, required the canonical
+program account to remain absent, inspected the preserved buffer, read the
+optimized SBF, and used transaction serialization compatible with Agave
+v2.2.20. The pinned `solana-loader-v3-interface = 5.0.0` Rust vectors match the
+JavaScript loader-v3 `Write` codec exactly. A maximum payload of 1011 bytes
+serializes to 1231 bytes under the 1232-byte packet ceiling; the one-byte-larger
+payload is rejected by the planner's safety margin.
+
+The sanitized read-only capture reported:
+
+```text
+Canonical program:              absent
+Total planned chunks:           391
+Exact full matching chunks:     219
+Remaining nonmatching chunks:   172
+Equal byte positions:           NOT_AN_UPLOAD_OFFSET
+Live uploader enabled:          false
+State mutation:                 false
+```
+
+Only exact full-chunk equality is upload progress. Equal-position counts or
+ranges are diagnostic data and must never be interpreted as an offset.
+
+The corrected captured funding snapshot is:
+
+```text
+Remaining chunk fees:           1,720,000 lamports
+Finalize fee:                      10,000 lamports
+ProgramData rent:            2,751,406,320 lamports
+Program account rent:            1,141,440 lamports
+Operational reserve:           250,000,000 lamports
+Required remaining:          3,004,277,760 lamports
+Captured authority balance:  3,247,383,680 lamports
+Headroom after reserve:        243,105,920 lamports
+```
+
+The balance is a captured value, not a live-execution authorization. Balance,
+rent, fees, buffer bytes, program absence, signature history, and single-writer
+conditions must all be refreshed before any separately approved execution
+window.
+
+The local-validator interruption test used only test-owned identities, ledger,
+state, and genesis funding. It sent chunks sequentially with maximum in-flight
+concurrency one, destroyed the first in-memory uploader instance, reloaded the
+checkpoint and test key material from disk, skipped the two exact confirmed
+chunks, resumed the same buffer, and finished with exact binary equality. It
+did not close, regenerate, or replace the buffer and did not reference the real
+`.devnet` directory.
+
+The real ignored `.devnet/state.json` remains schema v2 and was not migrated or
+mutated. The canonical program remains undeployed, so there is still no
+DEVTEST mint, token-account, escrow release/refund, or other devnet escrow-flow
+evidence. No Explorer link or live-readiness claim is added at this checkpoint.

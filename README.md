@@ -59,9 +59,10 @@ reference hash is stored in the escrow account.
 
 ## Current verification
 
-Phase 2 devnet work is currently
-[blocked pending an explicit resumable-buffer retry](docs/PHASE_2_DEVNET_BLOCKED_2026-07-16.md);
-the program has not been deployed to devnet.
+Phase 2 devnet work remains
+[blocked pending a separately approved live execution window](docs/PHASE_2_DEVNET_BLOCKED_2026-07-16.md).
+Read-only planning and local interruption/resume are validated, but the live
+uploader is hard-disabled and the program has not been deployed to devnet.
 
 Verified locally on Windows:
 
