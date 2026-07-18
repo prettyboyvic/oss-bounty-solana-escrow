@@ -12,6 +12,29 @@ import { dirname, join } from "node:path";
 const SECRET_FIELD =
   /^(secret|secretkey|privatekey|mnemonic|seed|seedphrase|passphrase|credential)$/i;
 
+const CHUNK_STATUS = new Set(["PLANNED", "SENT", "CONFIRMED", "FAILED", "UNKNOWN"]);
+
+export function validateChunkRecords(chunks) {
+  if (!Array.isArray(chunks)) throw new Error("chunk records must be an array");
+  let expectedOffset = 0;
+  const indices = new Set();
+  const signatures = new Set();
+  for (const chunk of chunks) {
+    if (!Number.isInteger(chunk?.index) || indices.has(chunk.index)) throw new Error("duplicate index in chunk records");
+    if (chunk.index !== indices.size) throw new Error("chunk index order is invalid");
+    if (!Number.isInteger(chunk.offset) || chunk.offset !== expectedOffset || !Number.isInteger(chunk.length) || chunk.length < 1) throw new Error("chunk offset gap or overlap");
+    if (!/^[a-f0-9]{64}$/i.test(chunk.sha256 ?? "")) throw new Error("chunk sha256 is invalid");
+    if (!CHUNK_STATUS.has(chunk.status)) throw new Error("chunk status is invalid");
+    const signature = chunk.signature ?? null;
+    if (signature !== null && (typeof signature !== "string" || signature.length === 0)) throw new Error("chunk signature is invalid");
+    if (["SENT", "FAILED", "UNKNOWN"].includes(chunk.status) && signature === null) throw new Error("chunk signature is required for sent state");
+    if (chunk.status === "PLANNED" && signature !== null) throw new Error("planned chunk signature is forbidden");
+    if (signature !== null && signatures.has(signature)) throw new Error("duplicate signature in chunk records");
+    indices.add(chunk.index); if (signature !== null) signatures.add(signature); expectedOffset += chunk.length;
+  }
+  return true;
+}
+
 function assertNoSecretMaterial(value, path = "state") {
   if (Array.isArray(value)) {
     if (
@@ -45,7 +68,7 @@ function assertNoSecretMaterial(value, path = "state") {
 
 export function createInitialState(publicConfig, sourceCommit) {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     runId: randomUUID(),
     cluster: structuredClone(publicConfig.cluster),
     source: {
@@ -71,7 +94,7 @@ export function migrateState(value) {
   if (!Number.isInteger(value?.schemaVersion)) {
     throw new Error("state schemaVersion is required");
   }
-  if (value.schemaVersion > 2) {
+  if (value.schemaVersion > 3) {
     throw new Error(
       `future state schemaVersion ${value.schemaVersion} is not supported`,
     );
@@ -87,6 +110,16 @@ export function migrateState(value) {
       ...(migrated.deployment ?? {}),
       buffer: migrated.deployment?.buffer ?? null,
     };
+  }
+  if (migrated.schemaVersion === 2) {
+    migrated.schemaVersion = 3;
+    if (migrated.deployment?.buffer) {
+      migrated.deployment.buffer = {
+        ...migrated.deployment.buffer,
+        chunks: migrated.deployment.buffer.chunks ?? [],
+        planFingerprint: migrated.deployment.buffer.planFingerprint ?? null,
+      };
+    }
   }
   return migrated;
 }
@@ -170,6 +203,8 @@ export function configureDeploymentBuffer(state, input) {
     status: "PLANNED",
     lastRpcError: null,
     retryEligible: true,
+    chunks: [],
+    planFingerprint: null,
   };
   assertNoSecretMaterial(migrated);
   return migrated;

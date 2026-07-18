@@ -1,0 +1,12 @@
+[package]
+name = "loader-v3-vectors"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+serde_json = "1.0"
+solana-loader-v3-interface = { version = "=5.0.0", features = ["bincode"] }
+solana-pubkey = "=2.2.1"

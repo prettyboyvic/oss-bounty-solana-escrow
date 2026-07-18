@@ -1,0 +1,97 @@
+{
+  "provenance": {
+    "agaveCommit": "df1f50cc0045157e099dcb047b853f611b6050d9",
+    "agaveTag": "v2.2.20",
+    "agaveWorkspaceDependency": "solana-loader-v3-interface = 5.0.0",
+    "enumDiscriminant": 1,
+    "enumVariant": "UpgradeableLoaderInstruction::Write",
+    "generator": "tools/loader-v3-vectors",
+    "interfaceChecksum": "6f7162a05b8b0773156b443bccd674ea78bb9aa406325b467ea78c06c99a63a2",
+    "interfaceCrate": "solana-loader-v3-interface",
+    "interfaceVersion": "5.0.0",
+    "serialization": "bincode-1.3.3"
+  },
+  "vectors": [
+    {
+      "accounts": [
+        {
+          "isSigner": false,
+          "isWritable": true,
+          "pubkey": "CT1DGjkt9t926L6SoFxiYJmzc18nMowpdw1WcZgWwbbW"
+        },
+        {
+          "isSigner": true,
+          "isWritable": false,
+          "pubkey": "Avfvs1k6ttrBtqh83tFw5g3dhWncrjP5hj4D52kGNZGk"
+        }
+      ],
+      "coverage": "offset-zero",
+      "instructionDataHex": "01000000000000000300000000000000010203",
+      "offset": 0,
+      "payloadHex": "010203",
+      "programId": "BPFLoaderUpgradeab1e11111111111111111111111"
+    },
+    {
+      "accounts": [
+        {
+          "isSigner": false,
+          "isWritable": true,
+          "pubkey": "CT1DGjkt9t926L6SoFxiYJmzc18nMowpdw1WcZgWwbbW"
+        },
+        {
+          "isSigner": true,
+          "isWritable": false,
+          "pubkey": "Avfvs1k6ttrBtqh83tFw5g3dhWncrjP5hj4D52kGNZGk"
+        }
+      ],
+      "coverage": "non-zero-offset",
+      "instructionDataHex": "0100000007000000010000000000000009",
+      "offset": 7,
+      "payloadHex": "09",
+      "programId": "BPFLoaderUpgradeab1e11111111111111111111111"
+    },
+    {
+      "accounts": [
+        {
+          "isSigner": false,
+          "isWritable": true,
+          "pubkey": "CT1DGjkt9t926L6SoFxiYJmzc18nMowpdw1WcZgWwbbW"
+        },
+        {
+          "isSigner": true,
+          "isWritable": false,
+          "pubkey": "Avfvs1k6ttrBtqh83tFw5g3dhWncrjP5hj4D52kGNZGk"
+        }
+      ],
+      "coverage": "multi-byte-offset-boundary",
+      "instructionDataHex": "01000000000100000200000000000000aabb",
+      "offset": 256,
+      "payloadHex": "aabb",
+      "programId": "BPFLoaderUpgradeab1e11111111111111111111111"
+    },
+    {
+      "accounts": [
+        {
+          "isSigner": false,
+          "isWritable": true,
+          "pubkey": "CT1DGjkt9t926L6SoFxiYJmzc18nMowpdw1WcZgWwbbW"
+        },
+        {
+          "isSigner": true,
+          "isWritable": false,
+          "pubkey": "Avfvs1k6ttrBtqh83tFw5g3dhWncrjP5hj4D52kGNZGk"
+        }
+      ],
+      "coverage": "near-maximum-planned-payload",
+      "instructionHeaderHex": "0100000000040600f303000000000000",
+      "instructionLength": 1027,
+      "offset": 394240,
+      "payloadPattern": {
+        "kind": "incrementing-modulo",
+        "length": 1011,
+        "modulo": 251
+      },
+      "programId": "BPFLoaderUpgradeab1e11111111111111111111111"
+    }
+  ]
+}

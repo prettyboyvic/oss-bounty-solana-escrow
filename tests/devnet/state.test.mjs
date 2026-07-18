@@ -26,7 +26,25 @@ import {
   migrateStateFile,
   migrateState,
   saveStateAtomic,
+  validateChunkRecords,
 } from "../../scripts/devnet/state.mjs";
+
+test("rejects malformed chunk records and invalid transitions", () => {
+  assert.throws(() => validateChunkRecords([{ index: 0, offset: 0, length: 2, sha256: "a".repeat(64), status: "PLANNED" }, { index: 0, offset: 2, length: 1, sha256: "b".repeat(64), status: "PLANNED" }]), /duplicate index/);
+  assert.throws(() => validateChunkRecords([{ index: 0, offset: 1, length: 2, sha256: "a".repeat(64), status: "PLANNED" }]), /gap/);
+  assert.throws(() => validateChunkRecords([{ index: 0, offset: 0, length: 2, sha256: "not-a-hash", status: "SENT" }]), /sha256/);
+  assert.throws(() => validateChunkRecords([{ index: 1, offset: 0, length: 2, sha256: "a".repeat(64), status: "PLANNED" }]), /index order/);
+  assert.throws(() => validateChunkRecords([{ index: 0, offset: 0, length: 2, sha256: "a".repeat(64), status: "SENT", signature: null }]), /signature/);
+  assert.throws(() => validateChunkRecords([{ index: 0, offset: 0, length: 2, sha256: "a".repeat(64), status: "SENT", signature: "" }]), /signature/);
+});
+
+test("migrates synthetic v2 deployment state to v3 without secrets", () => {
+  const migrated = migrateState({ schemaVersion: 2, runId: "test", cluster: {}, source: {}, program: {}, identities: {}, deployment: { buffer: { publicKey: "buffer", expectedOwner: "owner", expectedAuthority: "authority", allocatedLength: 41, localBinary: { length: 4, sha256: "hash" } } }, mint: {}, flows: {}, transactions: {}, captures: [] });
+  assert.equal(migrated.schemaVersion, 3);
+  assert.deepEqual(migrated.deployment.buffer.chunks, []);
+  assert.equal(migrated.deployment.buffer.planFingerprint, null);
+  assert.deepEqual(migrateState(migrated), migrated);
+});
 
 const CONFIG = {
   schemaVersion: 1,
@@ -43,9 +61,9 @@ const CONFIG = {
   },
 };
 
-test("creates schemaVersion 2 without secret paths", () => {
+test("creates schemaVersion 3 without secret paths", () => {
   const state = createInitialState(CONFIG, "abc123");
-  assert.equal(state.schemaVersion, 2);
+  assert.equal(state.schemaVersion, 3);
   assert.equal(state.source.commit, "abc123");
   assert.deepEqual(state.flows, { release: {}, refund: {} });
   assert.equal(JSON.stringify(state).includes("keypair"), false);
@@ -62,7 +80,7 @@ test("loads version 2 without mutation", () => {
 
 test("rejects missing and future schema versions", () => {
   assert.throws(() => migrateState({}), /schemaVersion/);
-  assert.throws(() => migrateState({ schemaVersion: 3 }), /future state/);
+  assert.throws(() => migrateState({ schemaVersion: 4 }), /future state/);
 });
 
 test("migrates version 1 while preserving existing public evidence", () => {
@@ -72,7 +90,7 @@ test("migrates version 1 while preserving existing public evidence", () => {
 
   const migrated = migrateState(legacy);
 
-  assert.equal(migrated.schemaVersion, 2);
+  assert.equal(migrated.schemaVersion, 3);
   assert.equal(migrated.deployment.priorAttempt, "preserved");
   assert.equal(migrated.deployment.buffer, null);
 });
@@ -91,9 +109,9 @@ test("file migration backs up version 1 before atomic replacement", () => {
     "2026-07-17T00-00-00Z",
   );
 
-  assert.equal(result.state.schemaVersion, 2);
+  assert.equal(result.state.schemaVersion, 3);
   assert.equal(existsSync(result.backup), true);
-  assert.equal(JSON.parse(readFileSync(path, "utf8")).schemaVersion, 2);
+  assert.equal(JSON.parse(readFileSync(path, "utf8")).schemaVersion, 3);
 });
 
 test("records only public resumable buffer fields", () => {
@@ -118,6 +136,8 @@ test("records only public resumable buffer fields", () => {
     status: "PLANNED",
     lastRpcError: null,
     retryEligible: true,
+    chunks: [],
+    planFingerprint: null,
   });
   assert.equal(JSON.stringify(state).includes("keypair"), false);
 });
@@ -143,7 +163,7 @@ test("backs up existing state without deleting it", () => {
 
   assert.equal(existsSync(path), true);
   assert.equal(existsSync(backup), true);
-  assert.match(backup, /state-v2-2026-07-16T00-00-00Z\.json$/);
+  assert.match(backup, /state-v3-2026-07-16T00-00-00Z\.json$/);
 });
 
 test("same-timestamp backups preserve both snapshots", () => {
