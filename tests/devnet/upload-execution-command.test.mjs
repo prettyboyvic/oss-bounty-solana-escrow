@@ -1,26 +1,33 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { PublicKey } from "@solana/web3.js";
+import { PublicKey, Transaction } from "@solana/web3.js";
 
+import { makeLoaderV3WriteInstruction } from "../../scripts/devnet/loader-v3-codec.mjs";
 import { PLAN_UPLOAD_IDENTITIES } from "../../scripts/devnet/plan-upload-command.mjs";
 import { createPlanFingerprint } from "../../scripts/devnet/throttled-uploader.mjs";
 import { planBufferUpload } from "../../scripts/devnet/upload-plan.mjs";
 import {
   encodeBase58,
+  collectLeaseReconciliationInput,
   executeUploadWindow,
   preflightUploadExecution,
 } from "../../scripts/devnet/upload-execution-command.mjs";
-import { leasePaths } from "../../scripts/devnet/upload-execution-lease.mjs";
+import {
+  acquireUploadLease,
+  leasePaths,
+  reconcileUploadLease,
+} from "../../scripts/devnet/upload-execution-lease.mjs";
 
 const RPC = "https://api.devnet.solana.com";
 const GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
 const OWNER = "BPFLoaderUpgradeab1e11111111111111111111111";
 const METADATA_LENGTH = 37;
+const PUBLIC_SIGNATURE = "1".repeat(64);
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -71,7 +78,7 @@ function fixture({ chunks = 2, status = "PLANNED", balance } = {}) {
     length,
     sha256: chunkSha256,
     status,
-    signature: status === "PLANNED" ? null : `existing-signature-${index}`,
+    signature: status === "PLANNED" ? null : PUBLIC_SIGNATURE,
   }));
   const state = {
     schemaVersion: 3,
@@ -135,6 +142,199 @@ test("preflight validates ordered read-only invariants without signer, blockhash
   assert.equal(result.funding.operationalReserveLamports, 250_000_000);
   assert.equal(result.liveWriteExecuted, false);
   assert.equal(existsSync(leasePaths(input.statePath).activeDirectory), false);
+});
+
+test("reconciliation collector proves finalized canonical Write and exact bytes using read methods only", async () => {
+  const input = fixture({ chunks: 1, status: "SENT" });
+  const executionId = "execution-reconciliation-proof";
+  const state = JSON.parse(readFileSync(input.statePath, "utf8"));
+  state.deployment.buffer.uploadWindows.push({ executionId, status: "RPC_OUTCOME_UNKNOWN", terminal: true });
+  writeFileSync(input.statePath, `${JSON.stringify(state, null, 2)}\n`);
+  input.localBytes.copy(input.account.data, METADATA_LENGTH);
+
+  const message = new Transaction({
+    feePayer: new PublicKey(PLAN_UPLOAD_IDENTITIES.authority),
+    recentBlockhash: "11111111111111111111111111111111",
+  }).add(makeLoaderV3WriteInstruction({
+    buffer: new PublicKey(PLAN_UPLOAD_IDENTITIES.buffer),
+    authority: new PublicKey(PLAN_UPLOAD_IDENTITIES.authority),
+    offset: 0,
+    bytes: input.localBytes,
+  })).compileMessage();
+  const readCalls = [];
+  const rpc = {
+    rpcEndpoint: RPC,
+    getGenesisHash: async () => { readCalls.push("genesis"); return GENESIS; },
+    getSignatureStatuses: async (signatures, options) => {
+      readCalls.push(["signature-status", signatures, options]);
+      return { context: { slot: 55 }, value: [{ slot: 55, confirmations: null, err: null, confirmationStatus: "finalized" }] };
+    },
+    getTransaction: async (signature, options) => {
+      readCalls.push(["transaction", signature, options]);
+      return {
+        slot: 55,
+        meta: { err: null, fee: 5000, innerInstructions: [] },
+        transaction: { signatures: [PUBLIC_SIGNATURE], message },
+      };
+    },
+    getMultipleAccountsInfoAndContext: async (keys, options) => {
+      readCalls.push(["program-buffer-snapshot", options]);
+      assert.deepEqual(keys.map((key) => key.toBase58()), [PLAN_UPLOAD_IDENTITIES.program, PLAN_UPLOAD_IDENTITIES.buffer]);
+      return { context: { slot: 56 }, value: [null, input.account] };
+    },
+  };
+  const forbidden = [];
+  const before = { state: readFileSync(input.statePath), mtime: statSync(input.statePath).mtimeMs };
+  const result = await collectLeaseReconciliationInput({
+    ...input.request,
+    executionId,
+  }, {
+    rpc,
+    loadAuthorityKeypair: () => forbidden.push("signer"),
+    getLatestBlockhash: () => forbidden.push("blockhash"),
+    sendRawTransaction: () => forbidden.push("send"),
+    simulateTransaction: () => forbidden.push("simulate"),
+  });
+
+  assert.deepEqual(forbidden, []);
+  assert.deepEqual(readCalls.map((call) => Array.isArray(call) ? call[0] : call), [
+    "genesis", "signature-status", "transaction", "program-buffer-snapshot",
+  ]);
+  assert.equal(result.expected.binaryLength, input.localBytes.length);
+  assert.equal(result.expected.binarySha256, sha256(input.localBytes));
+  assert.equal(result.expected.genesis, GENESIS);
+  assert.equal(result.observations.verifiedGenesis, GENESIS);
+  assert.equal(result.observations.bufferContextSlot, 56);
+  assert.deepEqual(result.observations.transactions, [{
+    chunkIndex: 0,
+    recordedStatus: "SENT",
+    signature: PUBLIC_SIGNATURE,
+    signatureStatusFound: true,
+    confirmationStatus: "finalized",
+    statusSlot: 55,
+    statusErr: false,
+    transactionFound: true,
+    transactionSignature: PUBLIC_SIGNATURE,
+    signatureCount: 1,
+    slot: 55,
+    feeLamports: 5000,
+    metaErr: false,
+    legacyMessage: true,
+    instructionCount: 1,
+    innerInstructionCount: 0,
+    instructionDecoded: true,
+    program: OWNER,
+    accountCount: 2,
+    buffer: PLAN_UPLOAD_IDENTITIES.buffer,
+    authority: PLAN_UPLOAD_IDENTITIES.authority,
+    bufferWritable: true,
+    authoritySigner: true,
+    offset: 0,
+    payloadLength: input.localBytes.length,
+    payloadSha256: sha256(input.localBytes),
+    payloadExactMatch: true,
+    onchainLength: input.localBytes.length,
+    onchainSha256: sha256(input.localBytes),
+    onchainExactMatch: true,
+    snapshotSlot: 56,
+  }]);
+  acquireUploadLease({
+    statePath: input.statePath,
+    executionId,
+    pid: 5151,
+    hostname: "test-host",
+    startedAt: "2026-07-19T00:00:00.000Z",
+    program: PLAN_UPLOAD_IDENTITIES.program,
+    buffer: PLAN_UPLOAD_IDENTITIES.buffer,
+    planFingerprint: input.fingerprint,
+    stateSha256: result.expected.stateSha256,
+  });
+  const reconciled = reconcileUploadLease(result, { processIsActive: () => false });
+  assert.equal(reconciled.result, "SAFE_TO_RELEASE");
+  assert.equal(reconciled.releaseReady, false);
+  assert.deepEqual(reconciled.proposedTransitions.map(({ chunkIndex, from, to }) => ({ chunkIndex, from, to })), [
+    { chunkIndex: 0, from: "SENT", to: "CONFIRMED" },
+  ]);
+  assert.deepEqual({ state: readFileSync(input.statePath), mtime: statSync(input.statePath).mtimeMs }, before);
+});
+
+test("reconciliation collector normalizes missing transaction proof instead of throwing", async () => {
+  const input = fixture({ chunks: 1, status: "UNKNOWN" });
+  const rpc = {
+    rpcEndpoint: RPC,
+    getGenesisHash: async () => GENESIS,
+    getSignatureStatuses: async () => ({ context: { slot: 1 }, value: [null] }),
+    getTransaction: async () => null,
+    getMultipleAccountsInfoAndContext: async () => ({
+      context: { slot: 1 },
+      value: [null, input.account],
+    }),
+  };
+
+  const result = await collectLeaseReconciliationInput({
+    ...input.request,
+    executionId: "execution-missing-proof",
+  }, { rpc });
+  const [evidence] = result.observations.transactions;
+  assert.equal(evidence.signatureStatusFound, false);
+  assert.equal(evidence.confirmationStatus, null);
+  assert.equal(evidence.transactionFound, false);
+  assert.equal(evidence.transactionSignature, null);
+  assert.equal(evidence.signatureCount, 0);
+  assert.equal(evidence.legacyMessage, false);
+  assert.equal(evidence.instructionDecoded, false);
+  assert.equal(evidence.payloadExactMatch, false);
+  assert.equal(evidence.onchainExactMatch, false);
+});
+
+test("reconciliation collector normalizes malformed transaction response fields", async () => {
+  const input = fixture({ chunks: 1, status: "SENT" });
+  const rpc = {
+    rpcEndpoint: RPC,
+    getGenesisHash: async () => GENESIS,
+    getSignatureStatuses: async () => ({ value: [{ slot: "not-a-slot" }] }),
+    getTransaction: async () => ({
+      slot: 1,
+      meta: "not-transaction-meta",
+      transaction: { signatures: "not-signatures", message: "not-a-message" },
+      version: "legacy",
+    }),
+    getMultipleAccountsInfoAndContext: async () => ({
+      context: { slot: 1 },
+      value: [null, input.account],
+    }),
+  };
+
+  const result = await collectLeaseReconciliationInput({
+    ...input.request,
+    executionId: "execution-malformed-proof",
+  }, { rpc });
+  const [evidence] = result.observations.transactions;
+  assert.equal(evidence.signatureStatusFound, true);
+  assert.equal(evidence.statusSlot, null);
+  assert.equal(evidence.transactionFound, true);
+  assert.equal(evidence.signatureCount, 0);
+  assert.equal(evidence.metaErr, null);
+  assert.equal(evidence.legacyMessage, false);
+  assert.equal(evidence.instructionDecoded, false);
+});
+
+test("reconciliation collector rejects binary checkpoint drift before RPC access", async () => {
+  const input = fixture({ chunks: 1, status: "SENT" });
+  writeFileSync(input.binaryPath, Buffer.concat([input.localBytes, Buffer.from([1])]));
+  const calls = [];
+  await assert.rejects(collectLeaseReconciliationInput({
+    ...input.request,
+    executionId: "execution-binary-drift",
+  }, {
+    rpc: new Proxy({ rpcEndpoint: RPC }, {
+      get(target, property) {
+        if (property in target) return target[property];
+        return () => { calls.push(property); };
+      },
+    }),
+  }), /allocation|binary length|binary hash/);
+  assert.deepEqual(calls, []);
 });
 
 test("funding exact boundary passes, one lamport short blocks, and malformed rent fails closed", async () => {

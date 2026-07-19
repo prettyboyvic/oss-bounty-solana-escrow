@@ -30,9 +30,54 @@ import { planBufferUpload } from "./upload-plan.mjs";
 const BUFFER_METADATA_LENGTH = 37;
 const PROGRAM_ACCOUNT_LENGTH = 36;
 const PROGRAMDATA_METADATA_LENGTH = 45;
+const APPLY_RECEIPT_VERSION = "UPLOAD_RECONCILIATION_V1";
+const APPLY_RECEIPT_KEYS = ["appliedAt", "evidenceHash", "executionId", "leaseSha256", "onchainEvidenceFingerprint", "stateSha256Before", "transitions", "version"];
+const APPLY_TRANSITION_KEYS = ["chunkIndex", "chunkSha256", "feeLamports", "from", "signature", "slot", "to"];
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+function hasExactKeys(value, expectedKeys) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) &&
+    Object.keys(value).sort().join("\0") === [...expectedKeys].sort().join("\0");
+}
+
+function reconciliationProofRecords(state, executionId) {
+  const chunks = state?.deployment?.buffer?.chunks;
+  if (!Array.isArray(chunks)) return [];
+  const unresolved = chunks
+    .filter(({ status }) => status === "SENT" || status === "UNKNOWN")
+    .map((record) => ({ record, recordedStatus: record.status }));
+  if (unresolved.length > 0) return unresolved;
+
+  const windows = state.deployment.buffer.uploadWindows;
+  if (!Array.isArray(windows)) return [];
+  const outcomes = windows.filter((window) => window?.executionId === executionId && window.terminal === true);
+  const receipts = outcomes.length === 1 ? outcomes[0].reconciliationOutcomes : null;
+  if (!Array.isArray(receipts) || receipts.length !== 1) return [];
+  const [receipt] = receipts;
+  if (!hasExactKeys(receipt, APPLY_RECEIPT_KEYS) || receipt.version !== APPLY_RECEIPT_VERSION ||
+      receipt.executionId !== executionId || !Array.isArray(receipt.transitions) || receipt.transitions.length < 1) {
+    return [];
+  }
+  const indices = new Set();
+  const targets = [];
+  for (const transition of receipt.transitions) {
+    if (!hasExactKeys(transition, APPLY_TRANSITION_KEYS) ||
+        !Number.isInteger(transition.chunkIndex) || indices.has(transition.chunkIndex) ||
+        (transition.from !== "SENT" && transition.from !== "UNKNOWN") || transition.to !== "CONFIRMED") {
+      return [];
+    }
+    const record = chunks[transition.chunkIndex];
+    if (!record || record.index !== transition.chunkIndex || record.status !== "CONFIRMED" ||
+        record.signature !== transition.signature || record.sha256 !== transition.chunkSha256) {
+      return [];
+    }
+    indices.add(transition.chunkIndex);
+    targets.push({ record, recordedStatus: transition.from });
+  }
+  return targets;
 }
 
 function confirmedChunksMatch(state, accountData) {
@@ -174,35 +219,168 @@ export async function collectLeaseReconciliationInput(request, adapters) {
   }
   const rpc = adapters.rpc;
   if (!rpc || rpc.rpcEndpoint !== request.url) throw new Error("explicit live RPC adapter mismatch");
-  const genesis = await rpc.getGenesisHash();
-  assertDevnetGenesis(genesis, contract.genesis);
-  const state = JSON.parse(readFileSync(request.statePath, "utf8"));
-  if (state.schemaVersion !== 3) throw new Error("uploader state schema must be v3");
+  if (typeof request.binaryPath !== "string" || request.binaryPath.length === 0) {
+    throw new Error("explicit binary path is required");
+  }
+  const stateBytes = readFileSync(request.statePath);
+  const state = JSON.parse(stateBytes.toString("utf8"));
+  const localBytes = readFileSync(request.binaryPath);
   const buffer = state.deployment?.buffer;
   const expected = {
+    genesis: contract.genesis,
     program: contract.program,
     buffer: contract.buffer,
     authority: contract.authority,
     owner: contract.owner,
-    allocation: buffer?.allocatedLength,
+    allocation: localBytes.length + BUFFER_METADATA_LENGTH,
+    binaryLength: localBytes.length,
+    binarySha256: sha256(localBytes),
     planFingerprint: buffer?.planFingerprint,
+    stateSha256: sha256(stateBytes),
   };
-  const programAccount = await rpc.getAccountInfo(new PublicKey(expected.program), "confirmed");
+  validateUploadStateV3(state, expected);
+  const plan = planBufferUpload({
+    localBytes,
+    bufferBytes: Buffer.alloc(localBytes.length),
+    buffer: new PublicKey(expected.buffer),
+    authority: new PublicKey(expected.authority),
+  });
+  const planFingerprint = createPlanFingerprint({
+    program: expected.program,
+    buffer: expected.buffer,
+    authority: expected.authority,
+    allocation: expected.allocation,
+    binarySha256: expected.binarySha256,
+    maxPayload: plan.maxPayload,
+    chunks: plan.chunks,
+  });
+  if (planFingerprint !== expected.planFingerprint) throw new Error("plan fingerprint mismatch");
+  if (buffer.chunks.length !== plan.chunks.length) throw new Error("plan chunk count mismatch");
+  for (const [record, chunk] of buffer.chunks.map((record, index) => [record, plan.chunks[index]])) {
+    if (!chunk || record.index !== chunk.index || record.offset !== chunk.offset || record.length !== chunk.length || record.sha256 !== chunk.sha256) {
+      throw new Error("plan chunk evidence mismatch");
+    }
+  }
+
+  const genesis = await rpc.getGenesisHash();
+  assertDevnetGenesis(genesis, contract.genesis);
+  const transactions = [];
+  let minimumContextSlot = 0;
+  for (const { record, recordedStatus } of reconciliationProofRecords(state, request.executionId)) {
+    const statusResponse = await rpc.getSignatureStatuses([record.signature], { searchTransactionHistory: true });
+    const status = Array.isArray(statusResponse?.value) && statusResponse.value.length === 1 && statusResponse.value[0] && typeof statusResponse.value[0] === "object"
+      ? statusResponse.value[0]
+      : null;
+    const transaction = await rpc.getTransaction(record.signature, { commitment: "finalized", maxSupportedTransactionVersion: 0 });
+    const transactionFound = transaction !== null && typeof transaction === "object" && !Array.isArray(transaction);
+    const transactionMeta = transaction?.meta !== null && typeof transaction?.meta === "object" && !Array.isArray(transaction.meta)
+      ? transaction.meta
+      : null;
+    const transactionSlot = Number.isSafeInteger(transaction?.slot) && transaction.slot >= 0 ? transaction.slot : null;
+    if (transactionSlot !== null) minimumContextSlot = Math.max(minimumContextSlot, transactionSlot);
+    const signatures = Array.isArray(transaction?.transaction?.signatures) ? transaction.transaction.signatures : [];
+    const message = transaction?.transaction?.message;
+    const legacyMessage = (transaction?.version === undefined || transaction.version === "legacy") &&
+      Array.isArray(message?.accountKeys) && Array.isArray(message?.instructions);
+    const instructionCount = Array.isArray(message?.instructions) ? message.instructions.length : 0;
+    const innerInstructionCount = Array.isArray(transactionMeta?.innerInstructions)
+      ? transactionMeta.innerInstructions.length
+      : null;
+    let instruction = null;
+    try {
+      if (legacyMessage && instructionCount === 1) {
+        instruction = Transaction.populate(message).instructions[0] ?? null;
+      }
+    } catch {
+      instruction = null;
+    }
+    const keys = Array.isArray(instruction?.keys) ? instruction.keys : [];
+    const data = Buffer.isBuffer(instruction?.data) ? instruction.data : null;
+    let offset = null;
+    let payload = null;
+    if (data && data.length >= 16 && data.readUInt32LE(0) === 1) {
+      const declaredLength = data.readBigUInt64LE(8);
+      if (declaredLength <= BigInt(Number.MAX_SAFE_INTEGER) && data.length === 16 + Number(declaredLength)) {
+        offset = data.readUInt32LE(4);
+        payload = data.subarray(16);
+      }
+    }
+    const expectedBytes = localBytes.subarray(record.offset, record.offset + record.length);
+    transactions.push({
+      chunkIndex: record.index,
+      recordedStatus,
+      signature: record.signature,
+      signatureStatusFound: status !== null,
+      confirmationStatus: typeof status?.confirmationStatus === "string" ? status.confirmationStatus : null,
+      statusSlot: Number.isSafeInteger(status?.slot) && status.slot >= 0 ? status.slot : null,
+      statusErr: status && Object.hasOwn(status, "err") ? status.err !== null : null,
+      transactionFound,
+      transactionSignature: typeof signatures[0] === "string" ? signatures[0] : null,
+      signatureCount: signatures.length,
+      slot: transactionSlot,
+      feeLamports: Number.isSafeInteger(transactionMeta?.fee) && transactionMeta.fee >= 0 ? transactionMeta.fee : null,
+      metaErr: transactionMeta && Object.hasOwn(transactionMeta, "err") ? transactionMeta.err !== null : null,
+      legacyMessage,
+      instructionCount,
+      innerInstructionCount,
+      instructionDecoded: payload !== null,
+      program: instruction?.programId?.toBase58?.() ?? null,
+      accountCount: keys.length,
+      buffer: keys[0]?.pubkey?.toBase58?.() ?? null,
+      authority: keys[1]?.pubkey?.toBase58?.() ?? null,
+      bufferWritable: keys[0]?.isWritable === true && keys[0]?.isSigner === false,
+      authoritySigner: keys[1]?.isSigner === true,
+      offset,
+      payloadLength: payload?.length ?? 0,
+      payloadSha256: payload ? sha256(payload) : null,
+      payloadExactMatch: payload?.equals(expectedBytes) === true,
+      onchainLength: 0,
+      onchainSha256: sha256(Buffer.alloc(0)),
+      onchainExactMatch: false,
+      snapshotSlot: null,
+    });
+  }
+
+  const accountOptions = { commitment: "finalized", minContextSlot: minimumContextSlot };
+  const accountsResponse = await rpc.getMultipleAccountsInfoAndContext([
+    new PublicKey(expected.program),
+    new PublicKey(expected.buffer),
+  ], accountOptions);
+  const accountContextSlot = accountsResponse?.context?.slot;
+  if (!Number.isSafeInteger(accountContextSlot) || accountContextSlot < minimumContextSlot || !Array.isArray(accountsResponse?.value) || accountsResponse.value.length !== 2) {
+    throw new Error("program/buffer finalized context invariant mismatch");
+  }
+  const [programAccount, account] = accountsResponse.value;
   if (programAccount !== null) throw new Error("UNEXPECTED_EXISTING_PROGRAM");
-  const account = await rpc.getAccountInfo(new PublicKey(expected.buffer), "confirmed");
+  const programContextSlot = accountContextSlot;
+  const bufferContextSlot = accountContextSlot;
   if (!account || account.executable || account.owner.toBase58() !== expected.owner || account.data.length !== expected.allocation || Buffer.from(account.data).readUInt32LE(0) !== 1 || account.data[4] !== 1) {
     throw new Error("buffer on-chain invariant mismatch");
   }
   const authority = new PublicKey(Buffer.from(account.data).subarray(5, 37)).toBase58();
   if (authority !== expected.authority) throw new Error("buffer authority mismatch");
+  const accountData = Buffer.from(account.data);
+  const onchainPayload = accountData.subarray(BUFFER_METADATA_LENGTH);
+  for (const evidence of transactions) {
+    const record = buffer.chunks[evidence.chunkIndex];
+    const bytes = onchainPayload.subarray(record.offset, record.offset + record.length);
+    evidence.onchainLength = bytes.length;
+    evidence.onchainSha256 = sha256(bytes);
+    evidence.onchainExactMatch = bytes.length === record.length && evidence.onchainSha256 === record.sha256;
+    evidence.snapshotSlot = bufferContextSlot;
+  }
   return {
     statePath: request.statePath,
     executionId: request.executionId,
     expected,
     observations: {
       genesisVerified: true,
+      verifiedGenesis: genesis,
       programAbsent: true,
-      confirmedChunksMatch: confirmedChunksMatch(state, account.data),
+      programContextSlot,
+      confirmedChunksMatch: confirmedChunksMatch(state, accountData),
+      bufferDataSha256: sha256(accountData),
+      bufferContextSlot,
       buffer: {
         address: expected.buffer,
         owner: expected.owner,
@@ -210,6 +388,7 @@ export async function collectLeaseReconciliationInput(request, adapters) {
         allocation: account.data.length,
         planFingerprint: expected.planFingerprint,
       },
+      transactions,
     },
   };
 }

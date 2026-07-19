@@ -22,6 +22,7 @@ import {
   executeUploadWindow,
 } from "../../scripts/devnet/upload-execution-command.mjs";
 import {
+  applyUploadReconciliation,
   reconcileUploadLease,
   releaseUploadLease,
 } from "../../scripts/devnet/upload-execution-lease.mjs";
@@ -69,6 +70,21 @@ async function waitForSignature(connection, signature) {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error("SIGNATURE_CONFIRMATION_TIMEOUT");
+}
+
+async function waitForFinalizedSignatures(connection, signatures) {
+  const deadline = Date.now() + 45_000;
+  let lastStatuses = [];
+  while (Date.now() < deadline) {
+    const statuses = (await connection.getSignatureStatuses(signatures, { searchTransactionHistory: true })).value;
+    lastStatuses = statuses;
+    if (statuses.every((status) => status?.err || status?.confirmationStatus === "finalized")) {
+      assert.ok(statuses.every((status) => status?.err === null));
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  throw new Error(`FINALIZED_SIGNATURE_TIMEOUT ${JSON.stringify(lastStatuses.map((status) => ({ confirmationStatus: status?.confirmationStatus ?? null, confirmations: status?.confirmations ?? null, hasError: status?.err != null })))}`);
 }
 
 async function stopOwnedValidator(child) {
@@ -240,13 +256,43 @@ test("production execution path enforces five chunks, lease recovery and exact r
     assert.equal(maximumInFlight, 1);
     assert.ok(sleeps.every((ms) => ms === 1000));
 
-    const reconciliationInput = await collectLeaseReconciliationInput({
+    const firstWindowSignatures = JSON.parse(readFileSync(statePath)).deployment.buffer.chunks
+      .slice(0, 5)
+      .map(({ signature }) => signature);
+    await waitForFinalizedSignatures(connection, firstWindowSignatures);
+
+    const interruptedState = JSON.parse(readFileSync(statePath, "utf8"));
+    interruptedState.deployment.buffer.chunks[4].status = "SENT";
+    interruptedState.deployment.buffer.uploadWindows[0].status = "RPC_OUTCOME_UNKNOWN";
+    writeFileSync(statePath, `${JSON.stringify(interruptedState, null, 2)}\n`);
+
+    let reconciliationInput = await collectLeaseReconciliationInput({
       ...request,
       executionId: "local-window-1",
     }, dependencies);
-    const safe = reconcileUploadLease(reconciliationInput, { processIsActive: () => false });
-    assert.equal(safe.result, "SAFE_TO_RELEASE");
-    assert.equal(releaseUploadLease({ ...reconciliationInput, reconciliationHash: safe.evidenceHash, acknowledgement: "R4_RELEASE_UPLOAD_LEASE" }, { processIsActive: () => false }).lifecycle, "ARCHIVED/RELEASED");
+    const beforeApply = reconcileUploadLease(reconciliationInput, { processIsActive: () => false });
+    assert.equal(beforeApply.result, "SAFE_TO_RELEASE");
+    assert.equal(beforeApply.releaseReady, false);
+    assert.deepEqual(beforeApply.proposedTransitions.map(({ chunkIndex, from, to }) => ({ chunkIndex, from, to })), [
+      { chunkIndex: 4, from: "SENT", to: "CONFIRMED" },
+    ]);
+    assert.throws(() => releaseUploadLease({ ...reconciliationInput, reconciliationHash: beforeApply.evidenceHash, acknowledgement: "R4_RELEASE_UPLOAD_LEASE" }, { processIsActive: () => false }), /transitions must be applied/);
+    assert.equal(applyUploadReconciliation({
+      ...reconciliationInput,
+      reconciliationHash: beforeApply.evidenceHash,
+      acknowledgement: "R4_APPLY_UPLOAD_RECONCILIATION",
+    }, { processIsActive: () => false, now: () => "2026-07-19T00:00:01.000Z" }).status, "APPLIED");
+
+    reconciliationInput = await collectLeaseReconciliationInput({
+      ...request,
+      executionId: "local-window-1",
+    }, dependencies);
+    const afterApply = reconcileUploadLease(reconciliationInput, { processIsActive: () => false });
+    assert.equal(afterApply.result, "SAFE_TO_RELEASE");
+    assert.equal(afterApply.releaseReady, true);
+    assert.deepEqual(afterApply.proposedTransitions, []);
+    assert.notEqual(afterApply.evidenceHash, beforeApply.evidenceHash);
+    assert.equal(releaseUploadLease({ ...reconciliationInput, reconciliationHash: afterApply.evidenceHash, acknowledgement: "R4_RELEASE_UPLOAD_LEASE" }, { processIsActive: () => false }).lifecycle, "ARCHIVED/RELEASED");
 
     authority = null;
     dependencies = null;

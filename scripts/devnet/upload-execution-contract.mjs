@@ -5,6 +5,7 @@ import { PLAN_UPLOAD_IDENTITIES } from "./plan-upload-command.mjs";
 
 export const LIVE_UPLOAD_ACKNOWLEDGEMENT = "R4_BUFFER_UPLOAD";
 export const RELEASE_LEASE_ACKNOWLEDGEMENT = "R4_RELEASE_UPLOAD_LEASE";
+export const APPLY_RECONCILIATION_ACKNOWLEDGEMENT = "R4_APPLY_UPLOAD_RECONCILIATION";
 export const MIGRATE_STATE_ACKNOWLEDGEMENT = "R4_MIGRATE_STATE_V3";
 export const MAX_UPLOAD_CHUNKS = 5;
 export const MIN_UPLOAD_DELAY_MS = 1_000;
@@ -21,7 +22,8 @@ const LIVE_KEYS = new Set([
 ]);
 const INSPECT_KEYS = new Set(["state", "binary"]);
 const MIGRATE_KEYS = new Set(["state", "binary", "acknowledge-state-migration"]);
-const RECONCILE_KEYS = new Set(["url", "program", "buffer", "state", "execution-id"]);
+const RECONCILE_KEYS = new Set(["url", "program", "buffer", "state", "binary", "execution-id"]);
+const APPLY_RECONCILIATION_KEYS = new Set([...RECONCILE_KEYS, "reconciliation-hash", "acknowledge-upload-reconciliation"]);
 const RELEASE_KEYS = new Set([...RECONCILE_KEYS, "reconciliation-hash", "acknowledge-lease-release"]);
 
 function parseExactOptions(argv, allowed) {
@@ -59,8 +61,8 @@ export function parseUploadCommand(argv) {
     throw new Error("public command is required");
   }
   const values = parseExactOptions(argv, LIVE_KEYS);
-  const rpc = assertAllowedRpcUrl(values.url, "devnet");
-  if (rpc.origin !== DEVNET_RPC_URL) throw new Error("exact devnet RPC is required");
+  assertAllowedRpcUrl(values.url, "devnet");
+  if (values.url !== DEVNET_RPC_URL) throw new Error("exact devnet RPC is required");
   if (values.program !== PLAN_UPLOAD_IDENTITIES.program) throw new Error("canonical program is required");
   if (values.buffer !== PLAN_UPLOAD_IDENTITIES.buffer) throw new Error("preserved buffer is required");
   if (values["acknowledge-devnet-write"] !== LIVE_UPLOAD_ACKNOWLEDGEMENT) {
@@ -80,10 +82,22 @@ export function parseUploadCommand(argv) {
 }
 
 function assertCanonicalLeaseCommand(values) {
-  const rpc = assertAllowedRpcUrl(values.url, "devnet");
-  if (rpc.origin !== DEVNET_RPC_URL) throw new Error("exact devnet RPC is required");
+  assertAllowedRpcUrl(values.url, "devnet");
+  if (values.url !== DEVNET_RPC_URL) throw new Error("exact devnet RPC is required");
   if (values.program !== PLAN_UPLOAD_IDENTITIES.program) throw new Error("canonical program is required");
   if (values.buffer !== PLAN_UPLOAD_IDENTITIES.buffer) throw new Error("preserved buffer is required");
+}
+
+function assertSafeExecutionId(value) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value)) {
+    throw new Error("safe execution ID is required");
+  }
+}
+
+function assertLowercaseReconciliationHash(value) {
+  if (!/^[a-f0-9]{64}$/.test(value)) {
+    throw new Error("lowercase reconciliation hash is required");
+  }
 }
 
 export function parseRuntimeCommand(argv) {
@@ -104,12 +118,34 @@ export function parseRuntimeCommand(argv) {
     case "reconcile-upload-lease": {
       const values = parseExactOptions(argv, RECONCILE_KEYS);
       assertCanonicalLeaseCommand(values);
-      return { command: argv[0], url: values.url, program: values.program, buffer: values.buffer, state: values.state, executionId: values["execution-id"] };
+      assertSafeExecutionId(values["execution-id"]);
+      return { command: argv[0], url: values.url, program: values.program, buffer: values.buffer, state: values.state, binary: values.binary, executionId: values["execution-id"] };
+    }
+    case "apply-upload-reconciliation": {
+      const values = parseExactOptions(argv, APPLY_RECONCILIATION_KEYS);
+      assertCanonicalLeaseCommand(values);
+      assertSafeExecutionId(values["execution-id"]);
+      assertLowercaseReconciliationHash(values["reconciliation-hash"]);
+      if (values["acknowledge-upload-reconciliation"] !== APPLY_RECONCILIATION_ACKNOWLEDGEMENT) {
+        throw new Error("explicit upload-reconciliation acknowledgement is required");
+      }
+      return {
+        command: argv[0],
+        url: values.url,
+        program: values.program,
+        buffer: values.buffer,
+        state: values.state,
+        binary: values.binary,
+        executionId: values["execution-id"],
+        reconciliationHash: values["reconciliation-hash"],
+        acknowledgement: values["acknowledge-upload-reconciliation"],
+      };
     }
     case "release-upload-lease": {
       const values = parseExactOptions(argv, RELEASE_KEYS);
       assertCanonicalLeaseCommand(values);
-      if (!/^[a-f0-9]{64}$/i.test(values["reconciliation-hash"])) throw new Error("matching reconciliation hash is required");
+      assertSafeExecutionId(values["execution-id"]);
+      assertLowercaseReconciliationHash(values["reconciliation-hash"]);
       if (values["acknowledge-lease-release"] !== RELEASE_LEASE_ACKNOWLEDGEMENT) throw new Error("explicit lease-release acknowledgement is required");
       return {
         command: argv[0],
@@ -117,6 +153,7 @@ export function parseRuntimeCommand(argv) {
         program: values.program,
         buffer: values.buffer,
         state: values.state,
+        binary: values.binary,
         executionId: values["execution-id"],
         reconciliationHash: values["reconciliation-hash"],
         acknowledgement: values["acknowledge-lease-release"],
@@ -139,24 +176,84 @@ export function validateUploadRequest(parsed, { repoRoot, isIgnoredPath }) {
   return { ...parsed, statePath, authorityPath };
 }
 
-const SECRET_KEY = /^(mnemonic|secret|secretkey|privatekey|seed|seedphrase|signedtransaction|rawtransaction|keypair)$/i;
+const SECRET_KEYS = new Set([
+  "authorization", "body", "cookie", "credential", "data", "endpoint", "error", "header", "headers",
+  "keypair", "mnemonic", "path", "payload", "privatekey", "rawtransaction", "requestid", "response",
+  "secret", "secretkey", "seed", "seedphrase", "serializedtransaction", "signedtransaction", "url",
+]);
+const SECRET_KEY_SUFFIX = /(?:authorization|body|credential|headers?|keypair|path|requestid|url)$/;
+const SECRET_TEXT = /(?:https?|wss?):\/\/|[A-Za-z]:[\\/]|^\\\\|^\/\S|^~[\\/]|(?:^|[\\/])\.devnet(?:[\\/]|$)|(?:^|[\\/])\.config[\\/]solana(?:[\\/]|$)|(?:^|[\\/])[^\\/]*keypair[^\\/]*\.json$|mnemonic|private[-_ ]?key|secret[-_ ]?key|seed[-_ ]?phrase|signed[-_ ]?transaction|raw[-_ ]?transaction/i;
+const MNEMONIC_LIKE_TEXT = /^(?:[a-z]+[\s,]+){11,}[a-z]+$/i;
+const UPLOAD_RESULT_KEYS = [
+  "command", "confirmedIndexes", "executionId", "leaseLifecycle", "liveWriteAttempted",
+  "liveWriteExecuted", "processed", "sent", "skippedIndexes", "stateMutation", "status",
+];
+const UPLOAD_RESULT_STATUSES = new Set(["COMPLETE", "WINDOW_LIMIT", "RATE_LIMITED", "CONFIRMED_FAILURE", "UNKNOWN"]);
 
-function assertSafeOutput(value, path = "output") {
+function isSecretKey(key) {
+  const normalized = key.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
+  return SECRET_KEYS.has(normalized) || SECRET_KEY_SUFFIX.test(normalized);
+}
+
+function isStrictPublicIndexArray(value) {
+  return Array.isArray(value) && value.every((item, index) =>
+    Number.isSafeInteger(item) && item >= 0 && (index === 0 || item > value[index - 1]),
+  );
+}
+
+function allowedPublicIndexArrays(value) {
+  const allowed = new WeakSet();
+  if (Object.keys(value).sort().join("\0") !== [...UPLOAD_RESULT_KEYS].sort().join("\0") ||
+      value.command !== "upload-buffer-throttled" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value.executionId ?? "") ||
+      !UPLOAD_RESULT_STATUSES.has(value.status) ||
+      value.leaseLifecycle !== "RECONCILIATION_REQUIRED" || value.stateMutation !== true ||
+      typeof value.liveWriteAttempted !== "boolean" ||
+      (typeof value.liveWriteExecuted !== "boolean" && value.liveWriteExecuted !== null) ||
+      !Number.isSafeInteger(value.processed) || value.processed < 0 || value.processed > MAX_UPLOAD_CHUNKS ||
+      value.sent !== value.processed ||
+      !isStrictPublicIndexArray(value.confirmedIndexes) || value.confirmedIndexes.length !== value.sent ||
+      !isStrictPublicIndexArray(value.skippedIndexes) ||
+      new Set([...value.confirmedIndexes, ...value.skippedIndexes]).size !== value.confirmedIndexes.length + value.skippedIndexes.length) {
+    return allowed;
+  }
+  allowed.add(value.confirmedIndexes);
+  allowed.add(value.skippedIndexes);
+  return allowed;
+}
+
+function assertSafeOutput(value, allowedIndexArrays, path = "output") {
+  if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
+    throw new Error("secret-bearing output is forbidden");
+  }
   if (Array.isArray(value)) {
-    if (value.length === 64 && value.every((item) => Number.isInteger(item) && item >= 0 && item <= 255)) {
+    if (allowedIndexArrays.has(value)) return;
+    if (value.length >= 16 && value.every((item) => Number.isInteger(item) && item >= 0 && item <= 255)) {
       throw new Error("secret-bearing output is forbidden");
     }
-    value.forEach((item, index) => assertSafeOutput(item, `${path}[${index}]`));
+    value.forEach((item, index) => assertSafeOutput(item, allowedIndexArrays, `${path}[${index}]`));
     return;
   }
-  if (value === null || typeof value !== "object") return;
+  if (typeof value === "string") {
+    if (SECRET_TEXT.test(value) || MNEMONIC_LIKE_TEXT.test(value) || (/^[A-Za-z0-9+/]{80,}={0,2}$/.test(value) && /[+/=]/.test(value))) {
+      throw new Error("secret-bearing output is forbidden");
+    }
+    return;
+  }
+  if (value === null || ["number", "boolean"].includes(typeof value)) return;
+  if (typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new Error("secret-bearing output is forbidden");
+  }
   for (const [key, item] of Object.entries(value)) {
-    if (SECRET_KEY.test(key)) throw new Error("secret-bearing output is forbidden");
-    assertSafeOutput(item, `${path}.${key}`);
+    if (isSecretKey(key)) throw new Error("secret-bearing output is forbidden");
+    assertSafeOutput(item, allowedIndexArrays, `${path}.${key}`);
   }
 }
 
 export function sanitizeExecutionOutput(value) {
-  assertSafeOutput(value);
+  if (value === null || Array.isArray(value) || typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new Error("secret-bearing output is forbidden");
+  }
+  assertSafeOutput(value, allowedPublicIndexArrays(value));
   return structuredClone(value);
 }

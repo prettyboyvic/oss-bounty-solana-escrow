@@ -11,7 +11,11 @@ import {
 } from "./upload-execution-contract.mjs";
 import { PLAN_UPLOAD_IDENTITIES, createPlanUploadConnection } from "./plan-upload-command.mjs";
 import { inspectStateMigration, migrateStateV3 } from "./state-migration-command.mjs";
-import { reconcileUploadLease, releaseUploadLease } from "./upload-execution-lease.mjs";
+import {
+  applyUploadReconciliation,
+  reconcileUploadLease,
+  releaseUploadLease,
+} from "./upload-execution-lease.mjs";
 import {
   collectLeaseReconciliationInput,
   createProductionUploadDependencies,
@@ -20,12 +24,44 @@ import {
 
 const DEFAULT_REPO_ROOT = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 
-const UNSAFE_CLI_ERROR = /(?:https?:\/\/|[A-Za-z]:\\|(?:^|[\s"'])(?:\/[^\s"']+)+|mnemonic|private[-_ ]?key|secret|keypair|signed[-_ ]?transaction|\[(?:\s*\d+\s*,){15,})/i;
+const RATE_LIMITED_ERROR = Object.freeze({ code: "RPC_RATE_LIMITED", retryable: false, terminal: true });
+const SAFE_COMMAND_ERROR = Object.freeze({ code: "COMMAND_FAILED_SAFE", retryable: false, terminal: true });
+const RATE_LIMIT_TEXT = /\b429\s+too many requests\b|\btoo many requests\b|\brate[-_ ]limit(?:ed|ing| exceeded| response)\b/i;
+const RATE_LIMIT_JSON = /["']?(?:code|status|statusCode|httpStatus)["']?\s*:\s*429\b/i;
+const NEGATED_RATE_LIMIT = /\bnot\s+rate[-_ ]limited\b/i;
+const RATE_LIMIT_NUMBER_KEYS = /^(?:code|status|statusCode|httpStatus)$/i;
+const INSPECT_ERROR_KEYS = ["message", "code", "status", "statusCode", "httpStatus", "data", "body", "response", "error", "cause"];
+
+function containsRateLimit(value, seen = new WeakSet(), key = "", depth = 0) {
+  if (typeof value === "string") {
+    if (NEGATED_RATE_LIMIT.test(value)) return false;
+    return RATE_LIMIT_TEXT.test(value) || RATE_LIMIT_JSON.test(value);
+  }
+  if (typeof value === "number") return value === 429 && RATE_LIMIT_NUMBER_KEYS.test(key);
+  if (value === null || (typeof value !== "object" && typeof value !== "function") || depth > 8) return false;
+  if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer || seen.has(value)) return false;
+  seen.add(value);
+  let enumerableKeys = [];
+  try {
+    enumerableKeys = Object.keys(value);
+  } catch {
+    // Continue with the known error-shape keys.
+  }
+  for (const property of new Set([...INSPECT_ERROR_KEYS, ...enumerableKeys])) {
+    if (property === "stack") continue;
+    let item;
+    try {
+      item = value[property];
+    } catch {
+      continue;
+    }
+    if (containsRateLimit(item, seen, property, depth + 1)) return true;
+  }
+  return false;
+}
 
 export function sanitizeCliErrorMessage(error) {
-  const message = String(error?.message ?? "command failed");
-  if (message.length > 200 || UNSAFE_CLI_ERROR.test(message)) return "COMMAND_FAILED_SAFE";
-  return message.replace(/[\r\n\t]/g, " ");
+  return containsRateLimit(error) ? RATE_LIMITED_ERROR : SAFE_COMMAND_ERROR;
 }
 
 function defaultIgnoredPath(path) {
@@ -73,16 +109,22 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
       : ((value) => migrateStateV3(value, { isIgnoredPath }));
     return sanitizeExecutionOutput(await handler(request));
   }
-  const request = { ...parsed, statePath };
-  const injectedHandler = parsed.command === "reconcile-upload-lease"
-    ? dependencies.reconcileUploadLease
-    : dependencies.releaseUploadLease;
+  const binaryPath = resolve(repoRoot, parsed.binary);
+  const request = { ...parsed, statePath, binaryPath };
+  const handlerProperty = {
+    "reconcile-upload-lease": "reconcileUploadLease",
+    "apply-upload-reconciliation": "applyUploadReconciliation",
+    "release-upload-lease": "releaseUploadLease",
+  }[parsed.command];
+  const injectedHandler = dependencies[handlerProperty];
   if (injectedHandler) return sanitizeExecutionOutput(await injectedHandler(request));
   const rpc = createPlanUploadConnection(parsed.url);
   const reconciliationInput = await collectLeaseReconciliationInput(request, { rpc });
-  const result = parsed.command === "reconcile-upload-lease"
-    ? reconcileUploadLease(reconciliationInput)
-    : releaseUploadLease({ ...reconciliationInput, reconciliationHash: parsed.reconciliationHash, acknowledgement: parsed.acknowledgement });
+  const result = {
+    "reconcile-upload-lease": () => reconcileUploadLease(reconciliationInput),
+    "apply-upload-reconciliation": () => applyUploadReconciliation({ ...reconciliationInput, reconciliationHash: parsed.reconciliationHash, acknowledgement: parsed.acknowledgement }),
+    "release-upload-lease": () => releaseUploadLease({ ...reconciliationInput, reconciliationHash: parsed.reconciliationHash, acknowledgement: parsed.acknowledgement }),
+  }[parsed.command]();
   return sanitizeExecutionOutput(result);
 }
 
@@ -91,7 +133,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const report = await main();
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   } catch (error) {
-    process.stderr.write(`${sanitizeCliErrorMessage(error)}\n`);
+    process.stderr.write(`${JSON.stringify(sanitizeCliErrorMessage(error))}\n`);
     process.exitCode = 1;
   }
 }
