@@ -196,8 +196,9 @@ test("environment variables and global Solana paths cannot enable or fill live a
 
 test("public command dispatch preserves read-only and local-only authority boundaries", async () => {
   const calls = [];
+  const repoRoot = join(tmpdir(), "upload-cli-dispatch-root");
   const common = {
-    repoRoot: "D:/repo",
+    repoRoot,
     isIgnoredPath: () => true,
     inspectStateMigration: async (request) => { calls.push(["inspect", request.command]); return { stateMutation: false }; },
     migrateStateV3: async (request) => { calls.push(["migrate", request.command]); return { stateMutation: true }; },
@@ -213,21 +214,22 @@ test("public command dispatch preserves read-only and local-only authority bound
   assert.deepEqual(calls, [
     ["inspect", "inspect-state-migration"],
     ["migrate", "migrate-state-v3"],
-    ["reconcile", "reconcile-upload-lease", join("D:/repo", "target/program.so")],
-    ["apply", "apply-upload-reconciliation", join("D:/repo", "target/program.so")],
-    ["release", "release-upload-lease", join("D:/repo", "target/program.so")],
+    ["reconcile", "reconcile-upload-lease", join(repoRoot, "target/program.so")],
+    ["apply", "apply-upload-reconciliation", join(repoRoot, "target/program.so")],
+    ["release", "release-upload-lease", join(repoRoot, "target/program.so")],
   ]);
 });
 
 test("apply dispatch touches only its local-mutation dependency and passes exact resolved paths", async () => {
   const accesses = [];
+  const repoRoot = join(tmpdir(), "upload-cli-apply-root");
   const target = {
-    repoRoot: "D:/repo",
+    repoRoot,
     isIgnoredPath: () => true,
     applyUploadReconciliation: async (request) => {
       assert.equal(request.command, "apply-upload-reconciliation");
-      assert.equal(request.statePath, join("D:/repo", ".devnet/state.json"));
-      assert.equal(request.binaryPath, join("D:/repo", "target/program.so"));
+      assert.equal(request.statePath, join(repoRoot, ".devnet/state.json"));
+      assert.equal(request.binaryPath, join(repoRoot, "target/program.so"));
       assert.equal(request.reconciliationHash, "a".repeat(64));
       assert.equal(request.acknowledgement, "R4_APPLY_UPLOAD_RECONCILIATION");
       return { command: request.command, stateMutation: true, onchainWrite: false };
@@ -268,7 +270,7 @@ test("successful resume output preserves sixteen or more public skipped chunk in
     "--delay-ms", "1000",
     "--acknowledge-devnet-write", "R4_BUFFER_UPLOAD",
   ], {
-    repoRoot: "D:/repo",
+    repoRoot: join(tmpdir(), "upload-cli-resume-root"),
     isIgnoredPath: () => true,
     executionDependencies: {},
     executeUploadWindow: async () => ({
