@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { resolve } from "node:path";
 import test from "node:test";
 
 import {
@@ -90,17 +91,18 @@ test("enforces the first-window hard rate policy", () => {
 
 test("validates explicit ignored paths without reading global config or signer files", () => {
   const calls = [];
+  const repoRoot = resolve("test-repo-root");
   const request = validateUploadRequest(parseUploadCommand(argv()), {
-    repoRoot: "D:/repo",
+    repoRoot,
     isIgnoredPath(path) {
       calls.push(path);
       return path.includes(".devnet");
     },
   });
-  assert.equal(request.statePath, "D:\\repo\\.devnet\\state.json");
-  assert.equal(request.authorityPath, "D:\\repo\\.devnet\\authority.json");
+  assert.equal(request.statePath, resolve(repoRoot, ".devnet/state.json"));
+  assert.equal(request.authorityPath, resolve(repoRoot, ".devnet/authority.json"));
   assert.equal(calls.length, 2);
-  assert.throws(() => validateUploadRequest(parseUploadCommand(argv({ state: "state.json" })), { repoRoot: "D:/repo", isIgnoredPath: () => false }), /ignored/);
+  assert.throws(() => validateUploadRequest(parseUploadCommand(argv({ state: "state.json" })), { repoRoot, isIgnoredPath: () => false }), /ignored/);
 });
 
 test("rejects every secret-bearing output shape instead of redacting it ambiguously", () => {
