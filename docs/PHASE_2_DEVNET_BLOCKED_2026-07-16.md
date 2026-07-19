@@ -381,3 +381,49 @@ The real ignored `.devnet/state.json` remains schema v2 and was not migrated or
 mutated. The canonical program remains undeployed, so there is still no
 DEVTEST mint, token-account, escrow release/refund, or other devnet escrow-flow
 evidence. No Explorer link or live-readiness claim is added at this checkpoint.
+
+## Phase 2-R4A addendum — bounded live gate publication
+
+R4A implements and locally verifies the public `upload-buffer-throttled`
+entrypoint but does not execute it against devnet. The fixed first-window policy
+is at most five chunks, at least 1,000 ms between sends, concurrency one, and an
+immediate stop on the first 429, confirmed failure, byte mismatch, or unresolved
+outcome. The command requires every canonical identity, explicit ignored state
+and authority paths, and the literal acknowledgement `R4_BUFFER_UPLOAD`.
+
+Lease recovery is split by authority. `reconcile-upload-lease` is strictly
+read-only and returns `SAFE_TO_RELEASE` only after a dead process, complete
+terminal evidence, no `SENT` or `UNKNOWN` records, exact identities and on-chain
+metadata, and fresh byte-level validation of every `CONFIRMED` chunk.
+`release-upload-lease` then requires the matching fresh evidence hash and
+`R4_RELEASE_UPLOAD_LEASE`; it atomically archives the audit directory and never
+deletes it. It is a local filesystem mutation only. Neither lease command sends
+or simulates a transaction, and lease age alone is insufficient evidence.
+
+The single R4A live read-only preflight observed:
+
+```text
+Live state schema:               v2 (migration required)
+Program:                         absent
+Binary length:                   395,144 bytes
+Binary SHA-256:                  f0820f1f06e5ffcb64026ae3c748b47b6e64674333f3ca98e8e468717c668fcd
+Buffer allocation:               395,181 bytes
+Packet / payload / max tx:       1,232 / 1,011 / 1,231 bytes
+Planned / exact / remaining:     391 / 219 / 172 chunks
+Authority balance:               3,247,383,680 lamports
+Required including reserve:      3,004,277,760 lamports
+Headroom after reserve:            243,105,920 lamports
+State mutation:                  false
+Live write executed:             false
+```
+
+Before and after the preflight, the real state SHA-256 remained
+`d848bb001251e30a6a7a5270199f573a8acf1560694496886e8d5e224a3b4115`,
+its nanosecond mtime and schema v2 were unchanged, and the ignored runtime file
+count remained 22. Authority balance, buffer history count (220), newest
+signature hash, program absence, buffer owner/authority/allocation/state, and
+buffer data SHA-256
+`7a8e3d1076cc6f4c3f6a5522215604caff5c17b7451a8780bda1694f7cba92f5`
+were also unchanged. The RPC audit contained only genesis, account, balance,
+rent, and signature-history reads. R4A did not load the real signer, fetch a
+live blockhash, migrate real state, or send any devnet transaction.

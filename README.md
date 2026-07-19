@@ -62,7 +62,16 @@ reference hash is stored in the escrow account.
 Phase 2 devnet work remains
 [blocked pending a separately approved live execution window](docs/PHASE_2_DEVNET_BLOCKED_2026-07-16.md).
 Read-only planning and local interruption/resume are validated, but the live
-uploader is hard-disabled and the program has not been deployed to devnet.
+uploader has not been executed and the program has not been deployed to devnet.
+R4A publishes a fail-closed `upload-buffer-throttled` entrypoint for a later,
+separately approved window. Its fixed policy, state-v3 migration boundary, and
+read-only reconciliation/local-only release protocol are documented in the
+[R4A bounded upload gate design](docs/superpowers/specs/2026-07-19-r4a-bounded-devnet-upload-gate-design.md).
+
+`reconcile-upload-lease` performs read-only Solana queries and never clears a
+lease. `release-upload-lease` performs only an acknowledged atomic local archive
+after matching fresh `SAFE_TO_RELEASE` evidence. Neither lease command performs
+an on-chain write. Lease age alone is never release evidence.
 
 Verified locally on Windows:
 
