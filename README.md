@@ -59,19 +59,23 @@ reference hash is stored in the escrow account.
 
 ## Current verification
 
-Phase 2 devnet work remains
-[blocked pending a separately approved live execution window](docs/PHASE_2_DEVNET_BLOCKED_2026-07-16.md).
-Read-only planning and local interruption/resume are validated, but the live
-uploader has not been executed and the program has not been deployed to devnet.
-R4A publishes a fail-closed `upload-buffer-throttled` entrypoint for a later,
-separately approved window. Its fixed policy, state-v3 migration boundary, and
-read-only reconciliation/local-only release protocol are documented in the
-[R4A bounded upload gate design](docs/superpowers/specs/2026-07-19-r4a-bounded-devnet-upload-gate-design.md).
+Phase 2 remains blocked from any further devnet write pending a separately
+approved local recovery step. The first bounded R4B upload window was executed:
+four buffer writes landed, the program remains absent, and the active execution
+lease is intentionally retained. R4B-R1 now proves the last locally `SENT`
+chunk finalized successfully and matches the exact buffer bytes, returning a
+read-only `SAFE_TO_RELEASE` proposal without applying it. See the
+[sanitized R4B checkpoint](docs/PHASE_2_R4B_BLOCKED_2026-07-19.md) and
+[R4B-R1 recovery design](docs/superpowers/specs/2026-07-19-r4b-r1-reconciliation-recovery-design.md).
 
 `reconcile-upload-lease` performs read-only Solana queries and never clears a
-lease. `release-upload-lease` performs only an acknowledged atomic local archive
-after matching fresh `SAFE_TO_RELEASE` evidence. Neither lease command performs
-an on-chain write. Lease age alone is never release evidence.
+lease. `apply-upload-reconciliation` is a separately acknowledged local state
+mutation that can apply only exact, freshly re-proven `SENT/UNKNOWN ->
+CONFIRMED` transitions. `release-upload-lease` is another separately
+acknowledged local-only operation and archives only after fresh zero-transition
+evidence. The commands share a fail-closed local operation lock; neither apply
+nor release performs an on-chain write. Lease age alone is never release
+evidence.
 
 Verified locally on Windows:
 
