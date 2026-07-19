@@ -85,6 +85,9 @@ jobs:
       - name: Run throttled uploader interruption and resume integration
         run: node --test tests/local-validator/throttled-uploader.test.mjs
 
+      - name: Run bounded upload execution integration
+        run: node --test tests/local-validator/upload-execution-command.test.mjs
+
       - name: Run Rust tests
         run: cargo test --workspace
 

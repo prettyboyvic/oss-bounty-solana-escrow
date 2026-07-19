@@ -138,6 +138,7 @@ test("records only public resumable buffer fields", () => {
     retryEligible: true,
     chunks: [],
     planFingerprint: null,
+    uploadWindows: [],
   });
   assert.equal(JSON.stringify(state).includes("keypair"), false);
 });

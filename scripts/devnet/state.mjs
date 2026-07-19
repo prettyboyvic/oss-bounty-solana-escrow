@@ -118,6 +118,7 @@ export function migrateState(value) {
         ...migrated.deployment.buffer,
         chunks: migrated.deployment.buffer.chunks ?? [],
         planFingerprint: migrated.deployment.buffer.planFingerprint ?? null,
+        uploadWindows: migrated.deployment.buffer.uploadWindows ?? [],
       };
     }
   }
@@ -205,6 +206,7 @@ export function configureDeploymentBuffer(state, input) {
     retryEligible: true,
     chunks: [],
     planFingerprint: null,
+    uploadWindows: [],
   };
   assertNoSecretMaterial(migrated);
   return migrated;
