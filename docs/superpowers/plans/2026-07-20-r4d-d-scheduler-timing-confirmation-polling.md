@@ -187,8 +187,8 @@ Require both suites to pass and leave no validator process.
 git commit -m "fix(devnet): enforce literal RPC pacing intervals"
 ```
 
-- [ ] **Step 3: Write the sanitized checkpoint and self-review it**
-- [ ] **Step 4: Commit documentation only**
+- [x] **Step 3: Write the sanitized checkpoint and self-review it**
+- [x] **Step 4: Commit documentation only**
 
 ```text
 git commit -m "docs(devnet): record R4D scheduler timing review"
