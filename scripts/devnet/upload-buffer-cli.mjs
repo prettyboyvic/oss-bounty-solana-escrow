@@ -11,6 +11,8 @@ import {
 } from "./upload-execution-contract.mjs";
 import { PLAN_UPLOAD_IDENTITIES, createPlanUploadConnection } from "./plan-upload-command.mjs";
 import { inspectStateMigration, migrateStateV3 } from "./state-migration-command.mjs";
+import { RPC_METHOD_CLASSES, RPC_OUTCOMES } from "./rpc-request-ledger.mjs";
+import { createRpcRequestScheduler } from "./rpc-request-scheduler.mjs";
 import {
   applyUploadReconciliation,
   reconcileUploadLease,
@@ -31,6 +33,8 @@ const RATE_LIMIT_JSON = /["']?(?:code|status|statusCode|httpStatus)["']?\s*:\s*4
 const NEGATED_RATE_LIMIT = /\bnot\s+rate[-_ ]limited\b/i;
 const RATE_LIMIT_NUMBER_KEYS = /^(?:code|status|statusCode|httpStatus)$/i;
 const INSPECT_ERROR_KEYS = ["message", "code", "status", "statusCode", "httpStatus", "data", "body", "response", "error", "cause"];
+const SAFE_RPC_METHOD_CLASSES = new Set(RPC_METHOD_CLASSES);
+const SAFE_RPC_OUTCOMES = new Set(RPC_OUTCOMES.filter((outcome) => outcome !== "SUCCESS"));
 
 function containsRateLimit(value, seen = new WeakSet(), key = "", depth = 0) {
   if (typeof value === "string") {
@@ -61,6 +65,19 @@ function containsRateLimit(value, seen = new WeakSet(), key = "", depth = 0) {
 }
 
 export function sanitizeCliErrorMessage(error) {
+  if (
+    SAFE_RPC_OUTCOMES.has(error?.classification) &&
+    SAFE_RPC_METHOD_CLASSES.has(error?.methodClass) &&
+    Number.isSafeInteger(error?.sequence) && error.sequence > 0 &&
+    typeof error?.signaturePersisted === "boolean"
+  ) {
+    return {
+      classification: error.classification,
+      methodClass: error.methodClass,
+      sequence: error.sequence,
+      signaturePersisted: error.signaturePersisted,
+    };
+  }
   return containsRateLimit(error) ? RATE_LIMITED_ERROR : SAFE_COMMAND_ERROR;
 }
 
@@ -83,7 +100,14 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     };
     const execute = dependencies.executeUploadWindow ?? executeUploadWindow;
     const runtime = dependencies.executionDependencies ?? createProductionUploadDependencies(parsed.url);
-    return sanitizeExecutionOutput(await execute(request, runtime));
+    try {
+      return sanitizeExecutionOutput(await execute(request, runtime));
+    } catch (error) {
+      if (runtime.rpcRequestScheduler) await runtime.rpcRequestScheduler.abort(error);
+      throw error;
+    } finally {
+      if (runtime.rpcRequestScheduler) await runtime.rpcRequestScheduler.close();
+    }
   }
   const statePath = resolve(repoRoot, parsed.state);
   if (!isIgnoredPath(statePath)) throw new Error("state path must be explicitly ignored");
@@ -119,13 +143,21 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const injectedHandler = dependencies[handlerProperty];
   if (injectedHandler) return sanitizeExecutionOutput(await injectedHandler(request));
   const rpc = createPlanUploadConnection(parsed.url);
-  const reconciliationInput = await collectLeaseReconciliationInput(request, { rpc });
-  const result = {
-    "reconcile-upload-lease": () => reconcileUploadLease(reconciliationInput),
-    "apply-upload-reconciliation": () => applyUploadReconciliation({ ...reconciliationInput, reconciliationHash: parsed.reconciliationHash, acknowledgement: parsed.acknowledgement }),
-    "release-upload-lease": () => releaseUploadLease({ ...reconciliationInput, reconciliationHash: parsed.reconciliationHash, acknowledgement: parsed.acknowledgement }),
-  }[parsed.command]();
-  return sanitizeExecutionOutput(result);
+  const rpcRequestScheduler = createRpcRequestScheduler();
+  try {
+    const reconciliationInput = await collectLeaseReconciliationInput(request, { rpc, rpcRequestScheduler });
+    const result = {
+      "reconcile-upload-lease": () => reconcileUploadLease(reconciliationInput),
+      "apply-upload-reconciliation": () => applyUploadReconciliation({ ...reconciliationInput, reconciliationHash: parsed.reconciliationHash, acknowledgement: parsed.acknowledgement }),
+      "release-upload-lease": () => releaseUploadLease({ ...reconciliationInput, reconciliationHash: parsed.reconciliationHash, acknowledgement: parsed.acknowledgement }),
+    }[parsed.command]();
+    return sanitizeExecutionOutput(result);
+  } catch (error) {
+    await rpcRequestScheduler.abort(error);
+    throw error;
+  } finally {
+    await rpcRequestScheduler.close();
+  }
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

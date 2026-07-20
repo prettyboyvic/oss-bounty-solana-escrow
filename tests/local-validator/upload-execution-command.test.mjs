@@ -125,10 +125,11 @@ async function createBuffer(connection, authority, buffer, binaryLength) {
   transaction.sign(authority, buffer);
   const signature = await connection.sendRawTransaction(transaction.serialize(), { maxRetries: 0 });
   assert.equal((await waitForSignature(connection, signature)).err, null);
+  await waitForFinalizedSignatures(connection, [signature]);
   return allocation;
 }
 
-test("production execution path enforces five chunks, lease recovery and exact resume", { timeout: 120_000 }, async () => {
+test("production entrypoint covers scheduler pacing, injected 429 recovery and cold resume", { timeout: 180_000 }, async (t) => {
   const runtime = mkdtempSync(join(tmpdir(), "upload-entrypoint-local-"));
   const ledger = join(runtime, "ledger");
   const statePath = join(runtime, "state.json");
@@ -156,6 +157,7 @@ test("production execution path enforces five chunks, lease recovery and exact r
     "--reset",
     "--bind-address", "127.0.0.1",
     "--rpc-port", String(rpcPort),
+    "--ticks-per-slot", "8",
     "--account", authority.publicKey.toBase58(), authorityAccountPath,
     "--quiet",
   ], { stdio: "ignore", windowsHide: true });
@@ -163,147 +165,317 @@ test("production execution path enforces five chunks, lease recovery and exact r
   try {
     const connection = new Connection(rpcUrl, "confirmed");
     await waitForValidator(connection, validator);
-    const localBytes = Buffer.from(Array.from({ length: 6 * 1011 }, (_, index) => (index % 250) + 1));
-    writeFileSync(binaryPath, localBytes);
-    const allocation = await createBuffer(connection, authority, buffer, localBytes.length);
-    const initialAccount = await connection.getAccountInfo(buffer.publicKey, "confirmed");
-    const plan = planBufferUpload({
-      localBytes,
-      bufferBytes: Buffer.from(initialAccount.data).subarray(METADATA_LENGTH),
-      buffer: buffer.publicKey,
-      authority: authority.publicKey,
-    });
-    assert.equal(plan.totalChunks, 6);
-    const contract = {
-      url: rpcUrl,
-      genesis: await connection.getGenesisHash(),
-      program: program.toBase58(),
-      buffer: buffer.publicKey.toBase58(),
-      authority: authority.publicKey.toBase58(),
-      owner: LOADER,
-    };
-    const fingerprint = createPlanFingerprint({
-      program: contract.program,
-      buffer: contract.buffer,
-      authority: contract.authority,
-      allocation,
-      binarySha256: sha256(localBytes),
-      maxPayload: plan.maxPayload,
-      chunks: plan.chunks,
-    });
-    writeFileSync(statePath, `${JSON.stringify({
-      schemaVersion: 3,
-      identities: { program: contract.program },
-      deployment: {
-        buffer: {
-          publicKey: contract.buffer,
-          expectedOwner: LOADER,
-          expectedAuthority: contract.authority,
-          allocatedLength: allocation,
-          localBinary: { length: localBytes.length, sha256: sha256(localBytes) },
-          planFingerprint: fingerprint,
-          chunks: plan.chunks.map(({ index, offset, length, sha256: chunkSha256 }) => ({ index, offset, length, sha256: chunkSha256, status: "PLANNED", signature: null })),
-          uploadWindows: [],
-        },
-      },
-    }, null, 2)}\n`);
-    const request = {
-      command: "upload-buffer-throttled",
-      url: rpcUrl,
-      program: contract.program,
-      buffer: contract.buffer,
-      statePath,
-      authorityPath,
-      binaryPath,
-      maxChunks: 5,
-      delayMs: 1000,
-      acknowledgement: "R4_BUFFER_UPLOAD",
-    };
-    const sentIndexes = [];
-    const sleeps = [];
+    const genesis = await connection.getGenesisHash();
+    const schedulerSleeps = [];
+    const requestLedgers = [];
     let inFlight = 0;
     let maximumInFlight = 0;
-    const runtimeDependencies = (executionId) => {
-      const dependencies = createProductionUploadDependencies(rpcUrl, { bufferAddress: contract.buffer });
+
+    async function makeFixture(label, chunkCount) {
+      const fixtureStatePath = label === "recovery" ? statePath : join(runtime, `${label}-state.json`);
+      const fixtureBinaryPath = label === "recovery" ? binaryPath : join(runtime, `${label}-program.so`);
+      const fixtureBuffer = label === "recovery" ? buffer : Keypair.generate();
+      const fixtureProgram = label === "recovery" ? program : Keypair.generate().publicKey;
+      const localBytes = Buffer.from(Array.from({ length: chunkCount * 1011 }, (_, index) => ((index * 17) % 250) + 1));
+      writeFileSync(fixtureBinaryPath, localBytes);
+      const allocation = await createBuffer(connection, authority, fixtureBuffer, localBytes.length);
+      const initialAccount = await connection.getAccountInfo(fixtureBuffer.publicKey, "confirmed");
+      const plan = planBufferUpload({
+        localBytes,
+        bufferBytes: Buffer.from(initialAccount.data).subarray(METADATA_LENGTH),
+        buffer: fixtureBuffer.publicKey,
+        authority: authority.publicKey,
+      });
+      assert.equal(plan.totalChunks, chunkCount);
+      const contract = {
+        url: rpcUrl,
+        genesis,
+        program: fixtureProgram.toBase58(),
+        buffer: fixtureBuffer.publicKey.toBase58(),
+        authority: authority.publicKey.toBase58(),
+        owner: LOADER,
+      };
+      const fingerprint = createPlanFingerprint({
+        program: contract.program,
+        buffer: contract.buffer,
+        authority: contract.authority,
+        allocation,
+        binarySha256: sha256(localBytes),
+        maxPayload: plan.maxPayload,
+        chunks: plan.chunks,
+      });
+      writeFileSync(fixtureStatePath, `${JSON.stringify({
+        schemaVersion: 3,
+        identities: { program: contract.program },
+        deployment: {
+          buffer: {
+            publicKey: contract.buffer,
+            expectedOwner: LOADER,
+            expectedAuthority: contract.authority,
+            allocatedLength: allocation,
+            localBinary: { length: localBytes.length, sha256: sha256(localBytes) },
+            planFingerprint: fingerprint,
+            chunks: plan.chunks.map(({ index, offset, length, sha256: chunkSha256 }) => ({ index, offset, length, sha256: chunkSha256, status: "PLANNED", signature: null })),
+            uploadWindows: [],
+          },
+        },
+      }, null, 2)}\n`);
+      return {
+        statePath: fixtureStatePath,
+        binaryPath: fixtureBinaryPath,
+        buffer: fixtureBuffer,
+        localBytes,
+        contract,
+        request: {
+          command: "upload-buffer-throttled",
+          url: rpcUrl,
+          program: contract.program,
+          buffer: contract.buffer,
+          statePath: fixtureStatePath,
+          authorityPath,
+          binaryPath: fixtureBinaryPath,
+          maxChunks: 5,
+          delayMs: 1000,
+          acknowledgement: "R4_BUFFER_UPLOAD",
+        },
+      };
+    }
+
+    function runtimeDependencies(fixture, executionId, mode = "normal") {
+      let monotonicMs = 0;
+      const counters = {
+        accountSnapshotAttempts: 0,
+        blockhashAttempts: 0,
+        buildAndSignCalls: 0,
+        confirmationSignatures: [],
+        events: [],
+        sendChunks: [],
+        sendTransportCalls: 0,
+        signerLoads: 0,
+        transmittedSignatures: [],
+      };
+      const injectedConnection = {
+        rpcEndpoint: rpcUrl,
+        getGenesisHash: (...args) => connection.getGenesisHash(...args),
+        getAccountInfo: (...args) => connection.getAccountInfo(...args),
+        async getAccountInfoAndContext(...args) {
+          counters.accountSnapshotAttempts += 1;
+          if (mode === "preflight-read-429" && counters.accountSnapshotAttempts < 3) {
+            throw Object.assign(new Error("injected rate limit"), { status: 429 });
+          }
+          return connection.getAccountInfoAndContext(...args);
+        },
+        getBalance: (...args) => connection.getBalance(...args),
+        getMinimumBalanceForRentExemption: (...args) => connection.getMinimumBalanceForRentExemption(...args),
+        async getLatestBlockhash(...args) {
+          counters.blockhashAttempts += 1;
+          if (mode === "blockhash-429") throw Object.assign(new Error("injected rate limit"), { status: 429 });
+          return connection.getLatestBlockhash(...args);
+        },
+        async sendRawTransaction(...args) {
+          counters.sendTransportCalls += 1;
+          const signature = await connection.sendRawTransaction(...args);
+          counters.transmittedSignatures.push(signature);
+          if (mode === "send-429-after-submit") throw Object.assign(new Error("injected rate limit"), { status: 429 });
+          return signature;
+        },
+        async getSignatureStatuses(signatures, ...args) {
+          counters.confirmationSignatures.push([...signatures]);
+          if (mode === "confirmation-429") throw Object.assign(new Error("injected rate limit"), { status: 429 });
+          return connection.getSignatureStatuses(signatures, ...args);
+        },
+        getTransaction: (...args) => connection.getTransaction(...args),
+        getMultipleAccountsInfoAndContext: (...args) => connection.getMultipleAccountsInfoAndContext(...args),
+      };
+      const dependencies = createProductionUploadDependencies(rpcUrl, {
+        bufferAddress: fixture.contract.buffer,
+        connection: injectedConnection,
+        monotonicNow: () => monotonicMs,
+        schedulerSleep: async (ms) => { schedulerSleeps.push(ms); monotonicMs += ms; },
+        transactionSleep: async (ms) => {
+          if (ms === 250) await new Promise((resolve) => setTimeout(resolve, 25));
+        },
+      });
+      requestLedgers.push(dependencies.rpcRequestLedger);
       const rawSend = dependencies.sendRawTransaction;
-      dependencies.contract = contract;
+      const rawLoad = dependencies.loadAuthorityKeypair;
+      const rawBuildAndSign = dependencies.buildAndSign;
+      const rawConfirm = dependencies.confirmSignature;
+      const rawReadChunkMatches = dependencies.readChunkMatches;
+      dependencies.contract = fixture.contract;
       dependencies.executionId = () => executionId;
-      dependencies.pid = executionId === "local-window-1" ? 8101 : 8102;
+      dependencies.pid = 8100 + requestLedgers.length;
       dependencies.hostname = "local-test-host";
       dependencies.now = () => "2026-07-19T00:00:00.000Z";
-      dependencies.sleep = async (ms) => { sleeps.push(ms); };
+      dependencies.loadAuthorityKeypair = async (...args) => {
+        counters.signerLoads += 1;
+        if (mode === "preflight-read-429") assert.equal(counters.accountSnapshotAttempts, 3);
+        return rawLoad(...args);
+      };
+      dependencies.buildAndSign = (...args) => {
+        counters.buildAndSignCalls += 1;
+        return rawBuildAndSign(...args);
+      };
       dependencies.sendRawTransaction = async (raw, chunk) => {
-        const record = JSON.parse(readFileSync(statePath)).deployment.buffer.chunks[chunk.index];
+        const record = JSON.parse(readFileSync(fixture.statePath)).deployment.buffer.chunks[chunk.index];
         assert.equal(record.status, "SENT");
+        assert.ok(record.signature);
+        counters.sendChunks.push(chunk.index);
+        counters.events.push(`send:${chunk.index}`);
         inFlight += 1;
         maximumInFlight = Math.max(maximumInFlight, inFlight);
         try {
-          const signature = await rawSend(raw);
-          assert.equal(signature, record.signature);
-          sentIndexes.push(chunk.index);
-          return signature;
+          return await rawSend(raw);
         } finally {
           inFlight -= 1;
         }
       };
-      return dependencies;
-    };
+      dependencies.confirmSignature = async (...args) => {
+        const result = await rawConfirm(...args);
+        counters.events.push(`confirm:${args[3].index}`);
+        return result;
+      };
+      dependencies.readChunkMatches = async (chunk) => {
+        const result = await rawReadChunkMatches(chunk);
+        counters.events.push(`match:${chunk.index}`);
+        return result;
+      };
+      return { dependencies, counters };
+    }
 
-    let dependencies = runtimeDependencies("local-window-1");
-    const first = await executeUploadWindow(request, dependencies);
+    async function releaseWindow(fixture, executionId, dependencies) {
+      let reconciliationInput = await collectLeaseReconciliationInput({
+        ...fixture.request,
+        executionId,
+      }, dependencies);
+      let result = reconcileUploadLease(reconciliationInput, { processIsActive: () => false });
+      assert.equal(result.result, "SAFE_TO_RELEASE");
+      if (result.proposedTransitions.length > 0) {
+        assert.equal(applyUploadReconciliation({
+          ...reconciliationInput,
+          reconciliationHash: result.evidenceHash,
+          acknowledgement: "R4_APPLY_UPLOAD_RECONCILIATION",
+        }, { processIsActive: () => false, now: () => "2026-07-19T00:00:01.000Z" }).status, "APPLIED");
+        reconciliationInput = await collectLeaseReconciliationInput({ ...fixture.request, executionId }, dependencies);
+        result = reconcileUploadLease(reconciliationInput, { processIsActive: () => false });
+        assert.equal(result.result, "SAFE_TO_RELEASE");
+      }
+      assert.equal(result.releaseReady, true);
+      assert.equal(releaseUploadLease({
+        ...reconciliationInput,
+        reconciliationHash: result.evidenceHash,
+        acknowledgement: "R4_RELEASE_UPLOAD_LEASE",
+      }, { processIsActive: () => false }).lifecycle, "ARCHIVED/RELEASED");
+    }
+
+    const normal = await makeFixture("normal-three", 3);
+    t.diagnostic("scenario A fixture finalized");
+    let runtimeResult = runtimeDependencies(normal, "normal-three");
+    const normalResult = await executeUploadWindow({ ...normal.request, maxChunks: 3 }, runtimeResult.dependencies);
+    assert.equal(normalResult.status, "COMPLETE");
+    assert.equal(runtimeResult.counters.accountSnapshotAttempts, 1);
+    assert.deepEqual(runtimeResult.counters.sendChunks, [0, 1, 2]);
+    const normalEntries = runtimeResult.dependencies.rpcRequestLedger.debugSafeEntries();
+    const finalPreflightRead = normalEntries.filter(({ methodClass }) => methodClass === "GET_RENT_EXEMPTION").at(-1);
+    const firstBlockhashRead = normalEntries.find(({ methodClass }) => methodClass === "GET_LATEST_BLOCKHASH");
+    assert.ok(firstBlockhashRead.startMonotonicMs - finalPreflightRead.endMonotonicMs >= 3000);
+    for (const index of [0, 1]) {
+      assert.ok(runtimeResult.counters.events.indexOf(`confirm:${index}`) < runtimeResult.counters.events.indexOf(`send:${index + 1}`));
+      assert.ok(runtimeResult.counters.events.indexOf(`match:${index}`) < runtimeResult.counters.events.indexOf(`send:${index + 1}`));
+    }
+    await waitForFinalizedSignatures(connection, runtimeResult.counters.transmittedSignatures);
+    const normalAccount = await connection.getAccountInfo(normal.buffer.publicKey, "confirmed");
+    assert.equal(Buffer.from(normalAccount.data).subarray(METADATA_LENGTH).equals(normal.localBytes), true);
+    await releaseWindow(normal, "normal-three", runtimeResult.dependencies);
+    await runtimeResult.dependencies.rpcRequestScheduler.close();
+    t.diagnostic("scenario A complete and archived");
+
+    const recovery = await makeFixture("recovery", 6);
+    t.diagnostic("recovery fixture finalized");
+    const allRecoverySendChunks = [];
+
+    runtimeResult = runtimeDependencies(recovery, "preflight-read-retry", "preflight-read-429");
+    const first = await executeUploadWindow({ ...recovery.request, maxChunks: 3 }, runtimeResult.dependencies);
+    allRecoverySendChunks.push(...runtimeResult.counters.sendChunks);
     assert.equal(first.status, "WINDOW_LIMIT");
-    assert.deepEqual(sentIndexes, [0, 1, 2, 3, 4]);
-    assert.equal(maximumInFlight, 1);
-    assert.ok(sleeps.every((ms) => ms === 1000));
+    assert.equal(runtimeResult.counters.accountSnapshotAttempts, 3);
+    assert.equal(runtimeResult.counters.signerLoads, 1);
+    assert.deepEqual(runtimeResult.counters.sendChunks, [0, 1, 2]);
+    await waitForFinalizedSignatures(connection, runtimeResult.counters.transmittedSignatures);
+    await releaseWindow(recovery, "preflight-read-retry", runtimeResult.dependencies);
+    await runtimeResult.dependencies.rpcRequestScheduler.close();
+    t.diagnostic("scenario B complete and archived");
 
-    const firstWindowSignatures = JSON.parse(readFileSync(statePath)).deployment.buffer.chunks
-      .slice(0, 5)
-      .map(({ signature }) => signature);
-    await waitForFinalizedSignatures(connection, firstWindowSignatures);
-
-    const interruptedState = JSON.parse(readFileSync(statePath, "utf8"));
-    interruptedState.deployment.buffer.chunks[4].status = "SENT";
-    interruptedState.deployment.buffer.uploadWindows[0].status = "RPC_OUTCOME_UNKNOWN";
-    writeFileSync(statePath, `${JSON.stringify(interruptedState, null, 2)}\n`);
-
-    let reconciliationInput = await collectLeaseReconciliationInput({
-      ...request,
-      executionId: "local-window-1",
-    }, dependencies);
-    const beforeApply = reconcileUploadLease(reconciliationInput, { processIsActive: () => false });
-    assert.equal(beforeApply.result, "SAFE_TO_RELEASE");
-    assert.equal(beforeApply.releaseReady, false);
-    assert.deepEqual(beforeApply.proposedTransitions.map(({ chunkIndex, from, to }) => ({ chunkIndex, from, to })), [
-      { chunkIndex: 4, from: "SENT", to: "CONFIRMED" },
+    runtimeResult = runtimeDependencies(recovery, "blockhash-exhaustion", "blockhash-429");
+    await assert.rejects(executeUploadWindow(recovery.request, runtimeResult.dependencies), (error) =>
+      error.classification === "RPC_RATE_LIMITED" && error.methodClass === "GET_LATEST_BLOCKHASH");
+    assert.equal(runtimeResult.counters.blockhashAttempts, 3);
+    assert.equal(runtimeResult.counters.buildAndSignCalls, 0);
+    assert.equal(runtimeResult.counters.sendTransportCalls, 0);
+    assert.deepEqual(JSON.parse(readFileSync(recovery.statePath)).deployment.buffer.chunks.slice(3).map(({ status, signature }) => ({ status, signature })), [
+      { status: "PLANNED", signature: null },
+      { status: "PLANNED", signature: null },
+      { status: "PLANNED", signature: null },
     ]);
-    assert.throws(() => releaseUploadLease({ ...reconciliationInput, reconciliationHash: beforeApply.evidenceHash, acknowledgement: "R4_RELEASE_UPLOAD_LEASE" }, { processIsActive: () => false }), /transitions must be applied/);
-    assert.equal(applyUploadReconciliation({
-      ...reconciliationInput,
-      reconciliationHash: beforeApply.evidenceHash,
-      acknowledgement: "R4_APPLY_UPLOAD_RECONCILIATION",
-    }, { processIsActive: () => false, now: () => "2026-07-19T00:00:01.000Z" }).status, "APPLIED");
+    await releaseWindow(recovery, "blockhash-exhaustion", runtimeResult.dependencies);
+    await runtimeResult.dependencies.rpcRequestScheduler.close();
+    t.diagnostic("scenario C complete and archived");
 
-    reconciliationInput = await collectLeaseReconciliationInput({
-      ...request,
-      executionId: "local-window-1",
-    }, dependencies);
-    const afterApply = reconcileUploadLease(reconciliationInput, { processIsActive: () => false });
-    assert.equal(afterApply.result, "SAFE_TO_RELEASE");
-    assert.equal(afterApply.releaseReady, true);
-    assert.deepEqual(afterApply.proposedTransitions, []);
-    assert.notEqual(afterApply.evidenceHash, beforeApply.evidenceHash);
-    assert.equal(releaseUploadLease({ ...reconciliationInput, reconciliationHash: afterApply.evidenceHash, acknowledgement: "R4_RELEASE_UPLOAD_LEASE" }, { processIsActive: () => false }).lifecycle, "ARCHIVED/RELEASED");
+    runtimeResult = runtimeDependencies(recovery, "send-uncertainty", "send-429-after-submit");
+    const uncertain = await executeUploadWindow(recovery.request, runtimeResult.dependencies);
+    allRecoverySendChunks.push(...runtimeResult.counters.sendChunks);
+    assert.equal(uncertain.status, "RATE_LIMITED");
+    assert.equal(runtimeResult.counters.sendTransportCalls, 1);
+    assert.deepEqual(runtimeResult.counters.sendChunks, [3]);
+    assert.equal(JSON.parse(readFileSync(recovery.statePath)).deployment.buffer.chunks[3].status, "SENT");
+    await waitForFinalizedSignatures(connection, runtimeResult.counters.transmittedSignatures);
+    await releaseWindow(recovery, "send-uncertainty", runtimeResult.dependencies);
+    await runtimeResult.dependencies.rpcRequestScheduler.close();
+    t.diagnostic("scenario D complete and archived");
+
+    runtimeResult = runtimeDependencies(recovery, "confirmation-exhaustion", "confirmation-429");
+    await assert.rejects(executeUploadWindow(recovery.request, runtimeResult.dependencies), (error) =>
+      error.classification === "RPC_RATE_LIMITED" && error.methodClass === "GET_SIGNATURE_STATUSES");
+    allRecoverySendChunks.push(...runtimeResult.counters.sendChunks);
+    assert.equal(runtimeResult.counters.sendTransportCalls, 1);
+    assert.deepEqual(runtimeResult.counters.sendChunks, [4]);
+    assert.deepEqual(runtimeResult.counters.confirmationSignatures, Array.from({ length: 3 }, () => [runtimeResult.counters.transmittedSignatures[0]]));
+    assert.equal(JSON.parse(readFileSync(recovery.statePath)).deployment.buffer.chunks[5].status, "PLANNED");
+    await waitForFinalizedSignatures(connection, runtimeResult.counters.transmittedSignatures);
+    await runtimeResult.dependencies.rpcRequestScheduler.close();
+    t.diagnostic("scenario E execution preserved unresolved state");
+    runtimeResult = runtimeDependencies(recovery, "confirmation-reconciliation");
+    await releaseWindow(recovery, "confirmation-exhaustion", runtimeResult.dependencies);
+    await runtimeResult.dependencies.rpcRequestScheduler.close();
+    t.diagnostic("scenario E reconciled and archived");
 
     authority = null;
-    dependencies = null;
-    dependencies = runtimeDependencies("local-window-2");
-    const second = await executeUploadWindow(request, dependencies);
-    assert.equal(second.status, "COMPLETE");
-    assert.deepEqual(sentIndexes, [0, 1, 2, 3, 4, 5]);
-    assert.deepEqual(second.skippedIndexes, [0, 1, 2, 3, 4]);
-    const finalAccount = await connection.getAccountInfo(buffer.publicKey, "confirmed");
-    assert.equal(Buffer.from(finalAccount.data).subarray(METADATA_LENGTH).equals(localBytes), true);
-    assert.deepEqual(JSON.parse(readFileSync(statePath)).deployment.buffer.chunks.map(({ status }) => status), ["CONFIRMED", "CONFIRMED", "CONFIRMED", "CONFIRMED", "CONFIRMED", "CONFIRMED"]);
+    runtimeResult = null;
+    runtimeResult = runtimeDependencies(recovery, "cold-resume");
+    const resumed = await executeUploadWindow(recovery.request, runtimeResult.dependencies);
+    allRecoverySendChunks.push(...runtimeResult.counters.sendChunks);
+    assert.equal(resumed.status, "COMPLETE");
+    assert.deepEqual(resumed.skippedIndexes, [0, 1, 2, 3, 4]);
+    assert.deepEqual(runtimeResult.counters.sendChunks, [5]);
+    assert.deepEqual(allRecoverySendChunks, [0, 1, 2, 3, 4, 5]);
+    await waitForFinalizedSignatures(connection, runtimeResult.counters.transmittedSignatures);
+    const finalAccount = await connection.getAccountInfo(recovery.buffer.publicKey, "confirmed");
+    assert.equal(Buffer.from(finalAccount.data).subarray(METADATA_LENGTH).equals(recovery.localBytes), true);
+    assert.deepEqual(JSON.parse(readFileSync(recovery.statePath)).deployment.buffer.chunks.map(({ status }) => status), ["CONFIRMED", "CONFIRMED", "CONFIRMED", "CONFIRMED", "CONFIRMED", "CONFIRMED"]);
+    await releaseWindow(recovery, "cold-resume", runtimeResult.dependencies);
+    await runtimeResult.dependencies.rpcRequestScheduler.close();
+    t.diagnostic("scenario F complete and archived");
+
+    assert.equal(maximumInFlight, 1);
+    assert.ok(schedulerSleeps.some((ms) => ms === 3000));
+    assert.ok(schedulerSleeps.some((ms) => ms === 2000));
+    assert.ok(schedulerSleeps.some((ms) => ms === 5000));
+    for (const ledger of requestLedgers) {
+      const entries = ledger.debugSafeEntries();
+      for (let index = 1; index < entries.length; index += 1) {
+        assert.ok(entries[index].startMonotonicMs - entries[index - 1].startMonotonicMs >= 500);
+      }
+    }
   } finally {
     await stopOwnedValidator(validator);
     rmSync(runtime, { recursive: true, force: true });

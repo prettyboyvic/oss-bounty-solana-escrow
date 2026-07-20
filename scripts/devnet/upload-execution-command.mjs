@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { hostname } from "node:os";
+import { performance } from "node:perf_hooks";
 
 import {
   Connection,
@@ -11,6 +12,7 @@ import {
 
 import { inspectUpgradeableBuffer } from "./live-deployment.mjs";
 import { makeLoaderV3WriteInstruction } from "./loader-v3-codec.mjs";
+import { createRpcRequestScheduler } from "./rpc-request-scheduler.mjs";
 import {
   calculateFunding,
   PLAN_UPLOAD_IDENTITIES,
@@ -26,6 +28,10 @@ import {
 import { acquireUploadLease } from "./upload-execution-lease.mjs";
 import { LIVE_UPLOAD_ACKNOWLEDGEMENT } from "./upload-execution-contract.mjs";
 import { planBufferUpload } from "./upload-plan.mjs";
+import {
+  createConfirmedValidationSnapshot,
+  validateConfirmedValidationSnapshot,
+} from "./upload-validation-snapshot.mjs";
 
 const BUFFER_METADATA_LENGTH = 37;
 const PROGRAM_ACCOUNT_LENGTH = 36;
@@ -105,6 +111,26 @@ function defaultContract() {
   };
 }
 
+function validationSnapshotExpected(expected, stateSha256) {
+  return {
+    bufferAddress: expected.buffer,
+    owner: expected.owner,
+    authority: expected.authority,
+    allocation: expected.allocation,
+    stateSha256,
+    binarySha256: expected.binarySha256,
+    planFingerprint: expected.planFingerprint,
+  };
+}
+
+function recordRpc(adapters, methodClass, operation, { signaturePersisted = false, mutationCapability = "read" } = {}) {
+  const scheduler = adapters.rpcRequestScheduler;
+  if (scheduler) return scheduler.schedule({ methodClass, signaturePersisted, mutationCapability }, operation);
+  const ledger = adapters.rpcRequestLedger;
+  if (!ledger) return operation();
+  return ledger.record({ methodClass, retryNumber: 0, signaturePersisted, mutationCapability }, operation);
+}
+
 function expectedCheckpoint(localBytes, state, contract) {
   const buffer = state.deployment?.buffer;
   return {
@@ -132,18 +158,23 @@ export async function preflightUploadExecution(request, adapters) {
   assertRequest(request, contract);
   const rpc = adapters.rpc;
   if (!rpc || rpc.rpcEndpoint !== request.url) throw new Error("explicit live RPC adapter mismatch");
-  const genesis = await rpc.getGenesisHash();
+  const genesis = await recordRpc(adapters, "GET_GENESIS_HASH", () => rpc.getGenesisHash());
   assertDevnetGenesis(genesis, contract.genesis);
 
   const programKey = new PublicKey(request.program);
   const bufferKey = new PublicKey(request.buffer);
-  const programAccount = await rpc.getAccountInfo(programKey, "confirmed");
+  const programAccount = await recordRpc(adapters, "GET_ACCOUNT_INFO", () => rpc.getAccountInfo(programKey, "confirmed"));
   if (programAccount !== null) throw new Error("UNEXPECTED_EXISTING_PROGRAM");
-  const bufferAccount = await rpc.getAccountInfo(bufferKey, "confirmed");
+  const bufferResponse = await recordRpc(adapters, "GET_ACCOUNT_INFO", () =>
+    rpc.getAccountInfoAndContext(bufferKey, { commitment: "finalized" }));
+  const capturedAtMonotonicMs = (adapters.monotonicNow ?? (() => performance.now()))();
+  const bufferAccount = bufferResponse?.value;
   if (!bufferAccount) throw new Error("buffer account is absent");
 
   const localBytes = readFileSync(request.binaryPath);
-  const state = JSON.parse(readFileSync(request.statePath, "utf8"));
+  const stateBytes = readFileSync(request.statePath);
+  const state = JSON.parse(stateBytes.toString("utf8"));
+  const stateSha256 = sha256(stateBytes);
   const expected = expectedCheckpoint(localBytes, state, contract);
   validateUploadStateV3(state, expected);
   const observedBuffer = inspectUpgradeableBuffer(bufferAccount, {
@@ -175,10 +206,34 @@ export async function preflightUploadExecution(request, adapters) {
       throw new Error("plan chunk evidence mismatch");
     }
   }
+  const validationSnapshot = createConfirmedValidationSnapshot({
+    bufferAddress: expected.buffer,
+    owner: observedBuffer.owner,
+    authority: observedBuffer.authority,
+    allocation: observedBuffer.dataLength,
+    lamports: bufferAccount.lamports,
+    accountData: bufferAccount.data,
+    finalizedSlot: bufferResponse?.context?.slot,
+    capturedAtMonotonicMs,
+    stateSha256,
+    binarySha256: expected.binarySha256,
+    planFingerprint: expected.planFingerprint,
+  });
+  const confirmedValidation = validateConfirmedValidationSnapshot({
+    snapshot: validationSnapshot,
+    expected: validationSnapshotExpected(expected, stateSha256),
+    chunks: plan.chunks,
+    records: state.deployment.buffer.chunks,
+    localBytes,
+    nowMonotonicMs: capturedAtMonotonicMs,
+  });
 
-  const balanceLamports = await rpc.getBalance(new PublicKey(expected.authority), "confirmed");
-  const programAccountRentLamports = await rpc.getMinimumBalanceForRentExemption(PROGRAM_ACCOUNT_LENGTH, "confirmed");
-  const programDataRentLamports = await rpc.getMinimumBalanceForRentExemption(PROGRAMDATA_METADATA_LENGTH + localBytes.length, "confirmed");
+  const balanceLamports = await recordRpc(adapters, "GET_BALANCE", () =>
+    rpc.getBalance(new PublicKey(expected.authority), "confirmed"));
+  const programAccountRentLamports = await recordRpc(adapters, "GET_RENT_EXEMPTION", () =>
+    rpc.getMinimumBalanceForRentExemption(PROGRAM_ACCOUNT_LENGTH, "confirmed"));
+  const programDataRentLamports = await recordRpc(adapters, "GET_RENT_EXEMPTION", () =>
+    rpc.getMinimumBalanceForRentExemption(PROGRAMDATA_METADATA_LENGTH + localBytes.length, "confirmed"));
   const funding = calculateFunding({
     balanceLamports,
     programAccountRentLamports,
@@ -189,22 +244,25 @@ export async function preflightUploadExecution(request, adapters) {
   return {
     verifiedGenesis: genesis,
     state,
-    stateSha256: sha256(readFileSync(request.statePath)),
+    stateSha256,
     localBytes,
     expected,
     observedBuffer,
     bufferDataSha256: sha256(bufferAccount.data),
+    validationSnapshot,
+    confirmedValidation,
     plan,
     funding,
     observations: {
       genesisVerified: true,
       programAbsent: true,
-      confirmedChunksMatch: confirmedChunksMatch(state, bufferAccount.data),
+      confirmedChunksMatch: true,
       buffer: {
         address: expected.buffer,
         owner: observedBuffer.owner,
         authority: observedBuffer.authority,
         allocation: observedBuffer.dataLength,
+        finalizedSlot: validationSnapshot.finalizedSlot,
         planFingerprint: expected.planFingerprint,
       },
     },
@@ -262,16 +320,18 @@ export async function collectLeaseReconciliationInput(request, adapters) {
     }
   }
 
-  const genesis = await rpc.getGenesisHash();
+  const genesis = await recordRpc(adapters, "GET_GENESIS_HASH", () => rpc.getGenesisHash());
   assertDevnetGenesis(genesis, contract.genesis);
   const transactions = [];
   let minimumContextSlot = 0;
   for (const { record, recordedStatus } of reconciliationProofRecords(state, request.executionId)) {
-    const statusResponse = await rpc.getSignatureStatuses([record.signature], { searchTransactionHistory: true });
+    const statusResponse = await recordRpc(adapters, "GET_SIGNATURE_STATUSES", () =>
+      rpc.getSignatureStatuses([record.signature], { searchTransactionHistory: true }), { signaturePersisted: true });
     const status = Array.isArray(statusResponse?.value) && statusResponse.value.length === 1 && statusResponse.value[0] && typeof statusResponse.value[0] === "object"
       ? statusResponse.value[0]
       : null;
-    const transaction = await rpc.getTransaction(record.signature, { commitment: "finalized", maxSupportedTransactionVersion: 0 });
+    const transaction = await recordRpc(adapters, "GET_TRANSACTION", () =>
+      rpc.getTransaction(record.signature, { commitment: "finalized", maxSupportedTransactionVersion: 0 }), { signaturePersisted: true });
     const transactionFound = transaction !== null && typeof transaction === "object" && !Array.isArray(transaction);
     const transactionMeta = transaction?.meta !== null && typeof transaction?.meta === "object" && !Array.isArray(transaction.meta)
       ? transaction.meta
@@ -342,10 +402,11 @@ export async function collectLeaseReconciliationInput(request, adapters) {
   }
 
   const accountOptions = { commitment: "finalized", minContextSlot: minimumContextSlot };
-  const accountsResponse = await rpc.getMultipleAccountsInfoAndContext([
-    new PublicKey(expected.program),
-    new PublicKey(expected.buffer),
-  ], accountOptions);
+  const accountsResponse = await recordRpc(adapters, "GET_ACCOUNT_INFO", () =>
+    rpc.getMultipleAccountsInfoAndContext([
+      new PublicKey(expected.program),
+      new PublicKey(expected.buffer),
+    ], accountOptions));
   const accountContextSlot = accountsResponse?.context?.slot;
   if (!Number.isSafeInteger(accountContextSlot) || accountContextSlot < minimumContextSlot || !Array.isArray(accountsResponse?.value) || accountsResponse.value.length !== 2) {
     throw new Error("program/buffer finalized context invariant mismatch");
@@ -419,6 +480,16 @@ function classifyTerminalError(statePath, error) {
 
 export async function executeUploadWindow(request, adapters) {
   const preflight = await preflightUploadExecution(request, adapters);
+  const currentStateSha256 = sha256(readFileSync(request.statePath));
+  const currentLocalBytes = readFileSync(request.binaryPath);
+  const confirmedValidation = validateConfirmedValidationSnapshot({
+    snapshot: preflight.validationSnapshot,
+    expected: validationSnapshotExpected(preflight.expected, currentStateSha256),
+    chunks: preflight.plan.chunks,
+    records: preflight.state.deployment.buffer.chunks,
+    localBytes: currentLocalBytes,
+    nowMonotonicMs: (adapters.monotonicNow ?? (() => performance.now()))(),
+  });
   const executionId = (adapters.executionId ?? randomUUID)();
   const startedAt = (adapters.now ?? (() => new Date().toISOString()))();
   acquireUploadLease({
@@ -435,15 +506,23 @@ export async function executeUploadWindow(request, adapters) {
 
   const chunks = preflight.plan.chunks.map((chunk) => ({
     ...chunk,
-    bytes: preflight.localBytes.subarray(chunk.offset, chunk.offset + chunk.length),
+    bytes: currentLocalBytes.subarray(chunk.offset, chunk.offset + chunk.length),
   }));
   let authority;
+  let preSignCoolOffComplete = false;
   const sign = async (chunk) => {
+    if (!preSignCoolOffComplete && adapters.rpcRequestScheduler) {
+      await adapters.rpcRequestScheduler.waitForCoolOff(3000);
+      preSignCoolOffComplete = true;
+    }
     authority ??= await adapters.loadAuthorityKeypair(request.authorityPath);
     if (authority?.publicKey?.toBase58() !== preflight.expected.authority) {
       throw new Error("buffer authority signer mismatch");
     }
-    const latestBlockhash = await adapters.getLatestBlockhash();
+    const latestBlockhash = await adapters.getLatestBlockhash({
+      statePath: request.statePath,
+      chunkIndex: chunk.index,
+    });
     return adapters.buildAndSign({
       chunk,
       latestBlockhash,
@@ -459,6 +538,7 @@ export async function executeUploadWindow(request, adapters) {
       statePath: request.statePath,
       checkpoint: preflight.expected,
       chunks,
+      confirmedChunkIndexes: confirmedValidation.confirmedIndexes,
       policy: { maxChunksPerWindow: request.maxChunks, minimumDelayMs: request.delayMs },
       sign,
       send: async (signed, chunk) => {
@@ -506,6 +586,7 @@ export async function executeUploadWindow(request, adapters) {
     liveWriteAttempted,
     liveWriteExecuted: result.confirmedIndexes.length > 0 ? true : liveWriteAttempted ? null : false,
     stateMutation: true,
+    ...(adapters.rpcRequestLedger ? { rpcRequestSummary: adapters.rpcRequestLedger.summary() } : {}),
   };
 }
 
@@ -528,16 +609,51 @@ export function encodeBase58(bytes) {
   return digits.reverse().map((digit) => alphabet[digit]).join("");
 }
 
-export function createProductionUploadDependencies(url, { bufferAddress = PLAN_UPLOAD_IDENTITIES.buffer } = {}) {
-  const connection = new Connection(url, { commitment: "confirmed", disableRetryOnRateLimit: true });
-  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+export function createProductionUploadDependencies(url, {
+  bufferAddress = PLAN_UPLOAD_IDENTITIES.buffer,
+  connection: injectedConnection,
+  monotonicNow,
+  schedulerSleep,
+  transactionSleep,
+} = {}) {
+  const connection = injectedConnection ?? new Connection(url, { commitment: "confirmed", disableRetryOnRateLimit: true });
+  const sleep = transactionSleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const requestMonotonicNow = monotonicNow ?? (() => performance.now());
+  const rpcRequestScheduler = createRpcRequestScheduler({
+    monotonicNow: requestMonotonicNow,
+    ...(schedulerSleep ? { sleep: schedulerSleep } : {}),
+  });
+  const rpcRequestLedger = rpcRequestScheduler.ledger;
   return {
     rpc: connection,
+    rpcRequestLedger,
+    rpcRequestScheduler,
+    monotonicNow: requestMonotonicNow,
     loadAuthorityKeypair(path) {
       const bytes = JSON.parse(readFileSync(path, "utf8"));
       return Keypair.fromSecretKey(Uint8Array.from(bytes));
     },
-    getLatestBlockhash: () => connection.getLatestBlockhash("confirmed"),
+    getLatestBlockhash: ({ statePath, chunkIndex } = {}) => rpcRequestScheduler.schedule({
+      methodClass: "GET_LATEST_BLOCKHASH",
+      signaturePersisted: false,
+      mutationCapability: "read",
+    }, () => connection.getLatestBlockhash("confirmed"), {
+      beforeAttempt() {
+        if (typeof statePath !== "string" || !Number.isSafeInteger(chunkIndex) || chunkIndex < 0) {
+          throw new Error("blockhash checkpoint context is required");
+        }
+        let state;
+        try {
+          state = JSON.parse(readFileSync(statePath, "utf8"));
+        } catch {
+          throw new Error("blockhash checkpoint drift");
+        }
+        const record = state?.deployment?.buffer?.chunks?.[chunkIndex];
+        if (!record || record.index !== chunkIndex || record.status !== "PLANNED" || record.signature !== null) {
+          throw new Error("blockhash checkpoint drift");
+        }
+      },
+    }),
     buildAndSign({ chunk, latestBlockhash, authority, buffer }) {
       const transaction = new Transaction({
         feePayer: authority.publicKey,
@@ -554,11 +670,19 @@ export function createProductionUploadDependencies(url, { bufferAddress = PLAN_U
         rawTransaction: transaction.serialize(),
       };
     },
-    sendRawTransaction: (rawTransaction) => connection.sendRawTransaction(rawTransaction, { maxRetries: 0, skipPreflight: true }),
+    sendRawTransaction: (rawTransaction) => rpcRequestScheduler.schedule({
+      methodClass: "SEND_RAW_TRANSACTION",
+      signaturePersisted: true,
+      mutationCapability: "write",
+    }, () => connection.sendRawTransaction(rawTransaction, { maxRetries: 0, skipPreflight: true })),
     async confirmSignature(signature, timeoutMs) {
       const deadline = Date.now() + timeoutMs;
       while (Date.now() < deadline) {
-        const response = await connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
+        const response = await rpcRequestScheduler.schedule({
+          methodClass: "GET_SIGNATURE_STATUSES",
+          signaturePersisted: true,
+          mutationCapability: "read",
+        }, () => connection.getSignatureStatuses([signature], { searchTransactionHistory: true }));
         const status = response.value[0];
         if (status?.err || status?.confirmationStatus === "confirmed" || status?.confirmationStatus === "finalized") return status;
         await sleep(250);
@@ -566,7 +690,11 @@ export function createProductionUploadDependencies(url, { bufferAddress = PLAN_U
       return null;
     },
     async readChunkMatches(chunk) {
-      const account = await connection.getAccountInfo(new PublicKey(bufferAddress), "confirmed");
+      const account = await rpcRequestScheduler.schedule({
+        methodClass: "GET_ACCOUNT_INFO",
+        signaturePersisted: true,
+        mutationCapability: "read",
+      }, () => connection.getAccountInfo(new PublicKey(bufferAddress), "confirmed"));
       if (!account) return false;
       return Buffer.from(account.data)
         .subarray(BUFFER_METADATA_LENGTH + chunk.offset, BUFFER_METADATA_LENGTH + chunk.offset + chunk.length)

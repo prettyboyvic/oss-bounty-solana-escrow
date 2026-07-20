@@ -314,6 +314,7 @@ test("real local validator resumes the same loader buffer after interruption", {
     const resumed = await runPersistedSequentialUpload({
       statePath,
       checkpoint,
+      confirmedChunkIndexes: resumedPlan.chunks.filter(({ exactMatch }) => exactMatch).map(({ index }) => index),
       chunks: resumedPlan.chunks.map((chunk) => ({
         ...chunk,
         bytes: localBytes.subarray(chunk.offset, chunk.offset + chunk.length),

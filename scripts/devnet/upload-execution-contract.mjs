@@ -2,6 +2,7 @@ import { resolve } from "node:path";
 
 import { assertAllowedRpcUrl, DEVNET_RPC_URL } from "./safety.mjs";
 import { PLAN_UPLOAD_IDENTITIES } from "./plan-upload-command.mjs";
+import { isSafeRpcRequestSummary } from "./rpc-request-ledger.mjs";
 
 export const LIVE_UPLOAD_ACKNOWLEDGEMENT = "R4_BUFFER_UPLOAD";
 export const RELEASE_LEASE_ACKNOWLEDGEMENT = "R4_RELEASE_UPLOAD_LEASE";
@@ -203,7 +204,10 @@ function isStrictPublicIndexArray(value) {
 
 function allowedPublicIndexArrays(value) {
   const allowed = new WeakSet();
-  if (Object.keys(value).sort().join("\0") !== [...UPLOAD_RESULT_KEYS].sort().join("\0") ||
+  const expectedKeys = value?.rpcRequestSummary === undefined
+    ? UPLOAD_RESULT_KEYS
+    : [...UPLOAD_RESULT_KEYS, "rpcRequestSummary"];
+  if (Object.keys(value).sort().join("\0") !== [...expectedKeys].sort().join("\0") ||
       value.command !== "upload-buffer-throttled" ||
       !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value.executionId ?? "") ||
       !UPLOAD_RESULT_STATUSES.has(value.status) ||
@@ -214,7 +218,8 @@ function allowedPublicIndexArrays(value) {
       value.sent !== value.processed ||
       !isStrictPublicIndexArray(value.confirmedIndexes) || value.confirmedIndexes.length !== value.sent ||
       !isStrictPublicIndexArray(value.skippedIndexes) ||
-      new Set([...value.confirmedIndexes, ...value.skippedIndexes]).size !== value.confirmedIndexes.length + value.skippedIndexes.length) {
+      new Set([...value.confirmedIndexes, ...value.skippedIndexes]).size !== value.confirmedIndexes.length + value.skippedIndexes.length ||
+      (value.rpcRequestSummary !== undefined && !isSafeRpcRequestSummary(value.rpcRequestSummary))) {
     return allowed;
   }
   allowed.add(value.confirmedIndexes);

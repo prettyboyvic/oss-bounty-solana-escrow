@@ -49,7 +49,9 @@ export async function runSequentialUpload({ chunks, policy: policyInput, persist
     if (!signed?.signature) throw new Error("signer did not return a public signature");
     await persist({ status: "SENT", index: chunk.index, signature: signed.signature });
     try { await send(signed, chunk); } catch (error) {
-      if (/\b429\b|too many requests/i.test(String(error?.message))) return { status: "RATE_LIMITED", processed, sent, confirmedIndexes, skippedIndexes };
+      if (error?.classification === "RPC_RATE_LIMITED" || /\b429\b|too many requests/i.test(String(error?.message))) {
+        return { status: "RATE_LIMITED", processed, sent, confirmedIndexes, skippedIndexes };
+      }
       throw error;
     }
     const reconciliation = reconcileChunk({ signatureStatus: await confirm(signed.signature, policy.confirmationTimeoutMs, signed, chunk), chunkMatches: await readChunkMatches(chunk), expired: false });
@@ -120,6 +122,7 @@ export async function runPersistedSequentialUpload({
   statePath,
   checkpoint,
   chunks,
+  confirmedChunkIndexes = [],
   policy,
   sign,
   send,
@@ -131,6 +134,12 @@ export async function runPersistedSequentialUpload({
   let state = loadUploaderCheckpoint(statePath, checkpoint);
   const records = state.deployment.buffer.chunks;
   if (records.length !== chunks.length) throw new Error("plan chunk count mismatch");
+  if (!Array.isArray(confirmedChunkIndexes) || confirmedChunkIndexes.some((index, position) =>
+    !Number.isSafeInteger(index) || index < 0 || (position > 0 && index <= confirmedChunkIndexes[position - 1]))) {
+    throw new Error("confirmed snapshot indexes are invalid");
+  }
+  if (confirmedChunkIndexes.some((index) => index >= chunks.length)) throw new Error("confirmed snapshot index out of range");
+  const confirmedSnapshotIndexes = new Set(confirmedChunkIndexes);
   const persist = async (event) => {
     const record = records[event.index];
     if (!record || record.index !== event.index) throw new Error("plan chunk index mismatch");
@@ -147,6 +156,9 @@ export async function runPersistedSequentialUpload({
     const record = records[chunk.index];
     if (!record || record.offset !== chunk.offset || record.length !== chunk.length || record.sha256 !== chunk.sha256) {
       throw new Error("plan chunk evidence mismatch");
+    }
+    if (record.status !== "CONFIRMED" && confirmedSnapshotIndexes.has(chunk.index)) {
+      throw new Error("confirmed snapshot status mismatch");
     }
     if (record.status === "FAILED") {
       return { status: "CONFIRMED_FAILURE", processed: 0, sent: 0, confirmedIndexes: [], skippedIndexes: [] };
@@ -170,7 +182,7 @@ export async function runPersistedSequentialUpload({
       return { status: "UNKNOWN", processed: 0, sent: 0, confirmedIndexes: [], skippedIndexes: [] };
     }
     if (record.status === "CONFIRMED") {
-      if (!(await readChunkMatches(chunk))) throw new Error("confirmed chunk bytes mismatch");
+      if (!confirmedSnapshotIndexes.has(chunk.index)) throw new Error("confirmed chunk snapshot evidence missing");
       runnable.push({ ...chunk, exactMatch: true });
       continue;
     }

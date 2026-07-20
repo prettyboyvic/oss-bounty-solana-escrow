@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { createRpcRequestLedger } from "../../scripts/devnet/rpc-request-ledger.mjs";
 import {
   assertChunkTransition,
   createPlanFingerprint,
@@ -98,6 +99,32 @@ test("persists a public signature before send and stops on first 429", async () 
   assert.equal(result.sent, 0);
 });
 
+test("ledger-wrapped send 429 preserves the RATE_LIMITED result contract without retry", async () => {
+  let sends = 0;
+  const ledger = createRpcRequestLedger();
+  const result = await runSequentialUpload({
+    chunks: [{ index: 0, exactMatch: false }],
+    policy: {},
+    persist: async () => {},
+    sign: async () => ({ signature: "persisted-signature" }),
+    send: async () => ledger.record({
+      methodClass: "SEND_RAW_TRANSACTION",
+      retryNumber: 0,
+      signaturePersisted: true,
+      mutationCapability: "write",
+    }, async () => {
+      sends += 1;
+      throw { status: 429, body: "CANARY-RAW-BODY" };
+    }),
+    confirm: async () => { throw new Error("must not confirm"); },
+    readChunkMatches: async () => { throw new Error("must not read"); },
+    sleep: async () => {},
+  });
+
+  assert.equal(result.status, "RATE_LIMITED");
+  assert.equal(sends, 1);
+});
+
 test("exact skipped chunks do not consume the bounded send window", async () => {
   const sent = [];
   const result = await runSequentialUpload({
@@ -177,6 +204,43 @@ test("UNKNOWN signature is reconciled before any signer or retry", async () => {
   assert.equal(result.status, "UNKNOWN");
   assert.deepEqual(calls, ["confirm", "match"]);
   assert.equal(JSON.parse(readFileSync(statePath, "utf8")).deployment.buffer.chunks[0].status, "UNKNOWN");
+});
+
+test("prevalidated confirmed indexes skip per-record buffer reads", async () => {
+  const { statePath, checkpoint, chunk } = checkpointFixture("CONFIRMED");
+  const calls = [];
+  const result = await runPersistedSequentialUpload({
+    statePath,
+    checkpoint,
+    chunks: [chunk],
+    confirmedChunkIndexes: [0],
+    policy: {},
+    confirm: async () => { calls.push("confirm"); },
+    readChunkMatches: async () => { calls.push("match"); throw new Error("redundant confirmed read"); },
+    sign: async () => { calls.push("sign"); },
+    send: async () => { calls.push("send"); },
+    sleep: async () => {},
+  });
+
+  assert.equal(result.status, "COMPLETE");
+  assert.deepEqual(result.skippedIndexes, [0]);
+  assert.deepEqual(calls, []);
+});
+
+test("confirmed snapshot evidence rejects indexes outside the plan", async () => {
+  const { statePath, checkpoint, chunk } = checkpointFixture("CONFIRMED");
+  await assert.rejects(runPersistedSequentialUpload({
+    statePath,
+    checkpoint,
+    chunks: [chunk],
+    confirmedChunkIndexes: [1],
+    policy: {},
+    confirm: async () => null,
+    readChunkMatches: async () => true,
+    sign: async () => null,
+    send: async () => null,
+    sleep: async () => {},
+  }), /confirmed snapshot index out of range/);
 });
 
 test("confirmed failed transaction persists FAILED and is never success or resent", async () => {

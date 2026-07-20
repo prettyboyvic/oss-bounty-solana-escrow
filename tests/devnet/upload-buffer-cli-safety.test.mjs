@@ -7,6 +7,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { createRpcRequestLedger } from "../../scripts/devnet/rpc-request-ledger.mjs";
 import { main, sanitizeCliErrorMessage } from "../../scripts/devnet/upload-buffer-cli.mjs";
 
 const ENTRY = fileURLToPath(new URL("../../scripts/devnet/upload-buffer-cli.mjs", import.meta.url));
@@ -259,6 +260,7 @@ test("apply dispatch touches only its local-mutation dependency and passes exact
 
 test("successful resume output preserves sixteen or more public skipped chunk indexes", async () => {
   const skippedIndexes = Array.from({ length: 20 }, (_, index) => index);
+  const rpcRequestSummary = createRpcRequestLedger().summary();
   const result = await main([
     "upload-buffer-throttled",
     "--url", "https://api.devnet.solana.com",
@@ -285,9 +287,11 @@ test("successful resume output preserves sixteen or more public skipped chunk in
       liveWriteAttempted: false,
       liveWriteExecuted: false,
       stateMutation: true,
+      rpcRequestSummary,
     }),
   });
   assert.deepEqual(result.skippedIndexes, skippedIndexes);
+  assert.deepEqual(result.rpcRequestSummary, rpcRequestSummary);
 });
 
 test("classifies message, structured, nested and body-backed 429 errors without retaining RPC details", () => {
@@ -312,6 +316,33 @@ test("classifies message, structured, nested and body-backed 429 errors without 
     assert.deepEqual(sanitizeCliErrorMessage(error), RATE_LIMITED);
     assert.doesNotMatch(JSON.stringify(sanitizeCliErrorMessage(error)), /CANARY|authorization|requestId/i);
   }
+});
+
+test("ledger-backed RPC errors expose only safe method classification", async () => {
+  const ticks = [10, 12];
+  const ledger = createRpcRequestLedger({ monotonicNow: () => ticks.shift() });
+  let error;
+  try {
+    await ledger.record({
+      methodClass: "GET_ACCOUNT_INFO",
+      retryNumber: 0,
+      signaturePersisted: false,
+      mutationCapability: "read",
+    }, async () => {
+      throw { status: 429, body: "CANARY-BODY", headers: { authorization: "CANARY-TOKEN" } };
+    });
+  } catch (caught) {
+    error = caught;
+  }
+
+  const output = sanitizeCliErrorMessage(error);
+  assert.deepEqual(output, {
+    classification: "RPC_RATE_LIMITED",
+    methodClass: "GET_ACCOUNT_INFO",
+    sequence: 1,
+    signaturePersisted: false,
+  });
+  assert.doesNotMatch(JSON.stringify(output), /CANARY|body|header|authorization/i);
 });
 
 test("rate-limit inspection is cycle safe", () => {

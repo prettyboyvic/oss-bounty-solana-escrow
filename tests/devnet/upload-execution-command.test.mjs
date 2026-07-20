@@ -9,11 +9,14 @@ import { PublicKey, Transaction } from "@solana/web3.js";
 
 import { makeLoaderV3WriteInstruction } from "../../scripts/devnet/loader-v3-codec.mjs";
 import { PLAN_UPLOAD_IDENTITIES } from "../../scripts/devnet/plan-upload-command.mjs";
+import { createRpcRequestLedger } from "../../scripts/devnet/rpc-request-ledger.mjs";
+import { createRpcRequestScheduler } from "../../scripts/devnet/rpc-request-scheduler.mjs";
 import { createPlanFingerprint } from "../../scripts/devnet/throttled-uploader.mjs";
 import { planBufferUpload } from "../../scripts/devnet/upload-plan.mjs";
 import {
   encodeBase58,
   collectLeaseReconciliationInput,
+  createProductionUploadDependencies,
   executeUploadWindow,
   preflightUploadExecution,
 } from "../../scripts/devnet/upload-execution-command.mjs";
@@ -33,6 +36,12 @@ function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+function publicTestSignature(index) {
+  const bytes = Buffer.alloc(64);
+  bytes.writeUInt32LE(index + 1);
+  return encodeBase58(bytes);
+}
+
 function bufferAccount(programBytes, overrides = {}) {
   const data = Buffer.alloc(METADATA_LENGTH + programBytes.length);
   data.writeUInt32LE(1, 0);
@@ -48,7 +57,7 @@ function bufferAccount(programBytes, overrides = {}) {
   };
 }
 
-function fixture({ chunks = 2, status = "PLANNED", balance } = {}) {
+function fixture({ chunks = 2, status = "PLANNED", confirmedChunks = null, balance } = {}) {
   const root = mkdtempSync(join(tmpdir(), "upload-execution-"));
   const statePath = join(root, "state.json");
   const binaryPath = join(root, "program.so");
@@ -72,14 +81,17 @@ function fixture({ chunks = 2, status = "PLANNED", balance } = {}) {
     maxPayload: plan.maxPayload,
     chunks: plan.chunks,
   });
-  const records = plan.chunks.map(({ index, offset, length, sha256: chunkSha256 }) => ({
-    index,
-    offset,
-    length,
-    sha256: chunkSha256,
-    status,
-    signature: status === "PLANNED" ? null : PUBLIC_SIGNATURE,
-  }));
+  const records = plan.chunks.map(({ index, offset, length, sha256: chunkSha256 }) => {
+    const recordStatus = confirmedChunks === null ? status : index < confirmedChunks ? "CONFIRMED" : "PLANNED";
+    return {
+      index,
+      offset,
+      length,
+      sha256: chunkSha256,
+      status: recordStatus,
+      signature: recordStatus === "PLANNED" ? null : confirmedChunks === null ? PUBLIC_SIGNATURE : publicTestSignature(index),
+    };
+  });
   const state = {
     schemaVersion: 3,
     identities: { program: PLAN_UPLOAD_IDENTITIES.program },
@@ -100,6 +112,11 @@ function fixture({ chunks = 2, status = "PLANNED", balance } = {}) {
   writeFileSync(binaryPath, localBytes);
   writeFileSync(authorityPath, "test-only-placeholder");
   const account = bufferAccount(currentBytes);
+  if (confirmedChunks !== null) {
+    for (const chunk of plan.chunks.slice(0, confirmedChunks)) {
+      localBytes.copy(account.data, METADATA_LENGTH + chunk.offset, chunk.offset, chunk.offset + chunk.length);
+    }
+  }
   const calls = [];
   const rpc = {
     rpcEndpoint: RPC,
@@ -108,6 +125,12 @@ function fixture({ chunks = 2, status = "PLANNED", balance } = {}) {
       const address = key.toBase58();
       calls.push(address === PLAN_UPLOAD_IDENTITIES.program ? "program" : "buffer");
       return address === PLAN_UPLOAD_IDENTITIES.program ? null : account;
+    },
+    getAccountInfoAndContext: async (key, options) => {
+      assert.equal(key.toBase58(), PLAN_UPLOAD_IDENTITIES.buffer);
+      assert.deepEqual(options, { commitment: "finalized" });
+      calls.push("buffer");
+      return { context: { slot: 55 }, value: account };
     },
     getBalance: async () => { calls.push("balance"); return balance ?? 10_000_000_000; },
     getMinimumBalanceForRentExemption: async (length) => { calls.push(`rent:${length}`); return length === 36 ? 100 : 200; },
@@ -127,6 +150,29 @@ function fixture({ chunks = 2, status = "PLANNED", balance } = {}) {
   return { root, statePath, binaryPath, authorityPath, localBytes, currentBytes, account, rpc, calls, request, state, plan, fingerprint, allocation };
 }
 
+function productionRuntime(input, connectionOverrides = {}) {
+  let monotonicMs = 0;
+  const schedulerSleeps = [];
+  const connection = Object.assign(input.rpc, {
+    getLatestBlockhash: async () => ({ blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1 }),
+    sendRawTransaction: async () => "test-signature",
+    getSignatureStatuses: async () => ({ value: [{ err: null, confirmationStatus: "finalized" }] }),
+  }, connectionOverrides);
+  const dependencies = createProductionUploadDependencies(RPC, {
+    connection,
+    bufferAddress: PLAN_UPLOAD_IDENTITIES.buffer,
+    monotonicNow: () => monotonicMs,
+    schedulerSleep: async (ms) => { schedulerSleeps.push(ms); monotonicMs += ms; },
+    transactionSleep: async () => {},
+  });
+  dependencies.loadAuthorityKeypair = async () => ({ publicKey: new PublicKey(PLAN_UPLOAD_IDENTITIES.authority) });
+  dependencies.buildAndSign = async ({ chunk }) => ({
+    signature: `signature-${chunk.index}`,
+    rawTransaction: Buffer.from([chunk.index]),
+  });
+  return { dependencies, schedulerSleeps, monotonicNow: () => monotonicMs };
+}
+
 test("preflight validates ordered read-only invariants without signer, blockhash or send", async () => {
   const input = fixture();
   const forbidden = [];
@@ -141,6 +187,273 @@ test("preflight validates ordered read-only invariants without signer, blockhash
   assert.equal(result.plan.remainingChunks, 2);
   assert.equal(result.funding.operationalReserveLamports, 250_000_000);
   assert.equal(result.liveWriteExecuted, false);
+  assert.equal(existsSync(leasePaths(input.statePath).activeDirectory), false);
+});
+
+test("preflight records all read calls in one sanitized invocation ledger", async () => {
+  const input = fixture();
+  let tick = 0;
+  const ledger = createRpcRequestLedger({ monotonicNow: () => tick++ });
+  await preflightUploadExecution(input.request, {
+    rpc: input.rpc,
+    rpcRequestLedger: ledger,
+  });
+
+  const summary = ledger.summary();
+  assert.equal(summary.totalRecorded, 6);
+  assert.equal(summary.countsByMethod.GET_GENESIS_HASH, 1);
+  assert.equal(summary.countsByMethod.GET_ACCOUNT_INFO, 2);
+  assert.equal(summary.countsByMethod.GET_BALANCE, 1);
+  assert.equal(summary.countsByMethod.GET_RENT_EXEMPTION, 2);
+  assert.equal(summary.countsByMethod.GET_LATEST_BLOCKHASH, 0);
+  assert.equal(summary.countsByMethod.SEND_RAW_TRANSACTION, 0);
+});
+
+test("production dependency set owns one shared scheduler and empty bounded ledger without making RPC calls", () => {
+  const dependencies = createProductionUploadDependencies("http://127.0.0.1:8899");
+  assert.deepEqual(dependencies.rpcRequestScheduler.policy(), {
+    concurrency: 1,
+    queueCapacity: 256,
+    ledgerCapacity: 256,
+    minimumRequestStartGapMs: 500,
+    retryBackoffMs: [2000, 5000],
+  });
+  assert.equal(dependencies.rpcRequestScheduler.ledger, dependencies.rpcRequestLedger);
+  assert.deepEqual(dependencies.rpcRequestLedger.summary(), {
+    capacity: 256,
+    totalRecorded: 0,
+    retained: 0,
+    dropped: 0,
+    countsByOutcome: { SUCCESS: 0, RPC_RATE_LIMITED: 0, RPC_ERROR: 0 },
+    countsByMethod: {
+      GET_GENESIS_HASH: 0,
+      GET_ACCOUNT_INFO: 0,
+      GET_BALANCE: 0,
+      GET_RENT_EXEMPTION: 0,
+      GET_SIGNATURE_HISTORY: 0,
+      GET_LATEST_BLOCKHASH: 0,
+      GET_FEE_FOR_MESSAGE: 0,
+      GET_SIGNATURE_STATUSES: 0,
+      GET_TRANSACTION: 0,
+      SEND_RAW_TRANSACTION: 0,
+    },
+  });
+});
+
+test("production preflight routes a rate-limited read through initial plus two bounded scheduler attempts", async () => {
+  const input = fixture();
+  let now = 0;
+  const sleeps = [];
+  const scheduler = createRpcRequestScheduler({
+    monotonicNow: () => now,
+    sleep: async (ms) => { sleeps.push(ms); now += ms; },
+  });
+  let genesisAttempts = 0;
+  input.rpc.getGenesisHash = async () => {
+    genesisAttempts += 1;
+    if (genesisAttempts < 3) throw Object.assign(new Error("rate limited"), { status: 429 });
+    return GENESIS;
+  };
+
+  await preflightUploadExecution(input.request, { rpc: input.rpc, rpcRequestScheduler: scheduler });
+  assert.equal(genesisAttempts, 3);
+  assert.deepEqual(sleeps.slice(0, 2), [2000, 5000]);
+  assert.deepEqual(scheduler.ledger.debugSafeEntries().slice(0, 3).map(({ methodClass, retryNumber }) => ({ methodClass, retryNumber })), [
+    { methodClass: "GET_GENESIS_HASH", retryNumber: 0 },
+    { methodClass: "GET_GENESIS_HASH", retryNumber: 1 },
+    { methodClass: "GET_GENESIS_HASH", retryNumber: 2 },
+  ]);
+  await scheduler.close();
+});
+
+test("production execution enforces the 3000ms pre-sign cool-off before blockhash", async () => {
+  const input = fixture({ chunks: 1 });
+  let blockhashStartedAt = null;
+  const runtime = productionRuntime(input, {
+    getLatestBlockhash: async () => {
+      blockhashStartedAt = runtime.monotonicNow();
+      return { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1 };
+    },
+  });
+  runtime.dependencies.readChunkMatches = async () => true;
+  const result = await executeUploadWindow(input.request, {
+    ...runtime.dependencies,
+    executionId: () => "cool-off-window",
+    pid: 8001,
+    hostname: "test-host",
+    now: () => "2026-07-20T00:00:00.000Z",
+  });
+  assert.equal(result.status, "COMPLETE");
+  const entries = runtime.dependencies.rpcRequestLedger.debugSafeEntries();
+  const finalPreflight = entries.filter(({ methodClass }) => methodClass === "GET_RENT_EXEMPTION").at(-1);
+  assert.ok(blockhashStartedAt - finalPreflight.endMonotonicMs >= 3000);
+  assert.ok(runtime.schedulerSleeps.includes(3000));
+  await runtime.dependencies.rpcRequestScheduler.close();
+});
+
+test("blockhash 429 exhaustion remains pre-sign with zero signature, SENT, and send", async () => {
+  const input = fixture({ chunks: 1 });
+  let blockhashCalls = 0;
+  let sendCalls = 0;
+  let signCalls = 0;
+  const runtime = productionRuntime(input, {
+    getLatestBlockhash: async () => {
+      blockhashCalls += 1;
+      throw Object.assign(new Error("rate limited"), { status: 429 });
+    },
+    sendRawTransaction: async () => { sendCalls += 1; },
+  });
+  runtime.dependencies.buildAndSign = async () => { signCalls += 1; throw new Error("must not sign"); };
+  await assert.rejects(executeUploadWindow(input.request, {
+    ...runtime.dependencies,
+    executionId: () => "blockhash-exhaustion",
+    pid: 8002,
+    hostname: "test-host",
+    now: () => "2026-07-20T00:00:00.000Z",
+  }), (error) => error.classification === "RPC_RATE_LIMITED" && error.methodClass === "GET_LATEST_BLOCKHASH");
+  assert.equal(blockhashCalls, 3);
+  assert.equal(signCalls, 0);
+  assert.equal(sendCalls, 0);
+  assert.deepEqual(JSON.parse(readFileSync(input.statePath)).deployment.buffer.chunks.map(({ status, signature }) => ({ status, signature })), [
+    { status: "PLANNED", signature: null },
+  ]);
+  assert.ok(runtime.schedulerSleeps.includes(2000));
+  assert.ok(runtime.schedulerSleeps.includes(5000));
+  await runtime.dependencies.rpcRequestScheduler.close();
+});
+
+test("blockhash retry fails closed if the chunk stops being PLANNED between attempts", async () => {
+  const input = fixture({ chunks: 1 });
+  let blockhashCalls = 0;
+  let sendCalls = 0;
+  const runtime = productionRuntime(input, {
+    getLatestBlockhash: async () => {
+      blockhashCalls += 1;
+      if (blockhashCalls === 1) {
+        const state = JSON.parse(readFileSync(input.statePath));
+        state.deployment.buffer.chunks[0].status = "SENT";
+        state.deployment.buffer.chunks[0].signature = PUBLIC_SIGNATURE;
+        writeFileSync(input.statePath, `${JSON.stringify(state, null, 2)}\n`);
+      }
+      throw Object.assign(new Error("rate limited"), { status: 429 });
+    },
+    sendRawTransaction: async () => { sendCalls += 1; },
+  });
+  await assert.rejects(executeUploadWindow(input.request, {
+    ...runtime.dependencies,
+    executionId: () => "blockhash-state-drift",
+    pid: 8005,
+    hostname: "test-host",
+    now: () => "2026-07-20T00:00:00.000Z",
+  }), /blockhash checkpoint drift/);
+  assert.equal(blockhashCalls, 1);
+  assert.equal(sendCalls, 0);
+  await runtime.dependencies.rpcRequestScheduler.close();
+});
+
+test("send 429 is attempted once and leaves the same persisted signature for reconciliation", async () => {
+  const input = fixture({ chunks: 2 });
+  let sendCalls = 0;
+  const runtime = productionRuntime(input, {
+    sendRawTransaction: async () => {
+      sendCalls += 1;
+      throw Object.assign(new Error("rate limited"), { status: 429 });
+    },
+  });
+  const result = await executeUploadWindow(input.request, {
+    ...runtime.dependencies,
+    executionId: () => "send-rate-limit",
+    pid: 8003,
+    hostname: "test-host",
+    now: () => "2026-07-20T00:00:00.000Z",
+  });
+  assert.equal(result.status, "RATE_LIMITED");
+  assert.equal(sendCalls, 1);
+  assert.deepEqual(JSON.parse(readFileSync(input.statePath)).deployment.buffer.chunks.map(({ status, signature }) => ({ status, signature })), [
+    { status: "SENT", signature: "signature-0" },
+    { status: "PLANNED", signature: null },
+  ]);
+  assert.equal(runtime.dependencies.rpcRequestLedger.summary().countsByMethod.SEND_RAW_TRANSACTION, 1);
+  await runtime.dependencies.rpcRequestScheduler.close();
+});
+
+test("confirmation 429 exhaustion polls only the same signature and never advances the next chunk", async () => {
+  const input = fixture({ chunks: 2 });
+  const polled = [];
+  let sendCalls = 0;
+  const runtime = productionRuntime(input, {
+    sendRawTransaction: async () => { sendCalls += 1; return "signature-0"; },
+    getSignatureStatuses: async (signatures) => {
+      polled.push([...signatures]);
+      throw Object.assign(new Error("rate limited"), { status: 429 });
+    },
+  });
+  await assert.rejects(executeUploadWindow(input.request, {
+    ...runtime.dependencies,
+    executionId: () => "confirmation-rate-limit",
+    pid: 8004,
+    hostname: "test-host",
+    now: () => "2026-07-20T00:00:00.000Z",
+  }), (error) => error.classification === "RPC_RATE_LIMITED" && error.methodClass === "GET_SIGNATURE_STATUSES");
+  assert.equal(sendCalls, 1);
+  assert.deepEqual(polled, [["signature-0"], ["signature-0"], ["signature-0"]]);
+  assert.deepEqual(JSON.parse(readFileSync(input.statePath)).deployment.buffer.chunks.map(({ status, signature }) => ({ status, signature })), [
+    { status: "SENT", signature: "signature-0" },
+    { status: "PLANNED", signature: null },
+  ]);
+  await runtime.dependencies.rpcRequestScheduler.close();
+});
+
+test("R4C-shaped validation uses one finalized buffer snapshot for 223 confirmed chunks", async () => {
+  const input = fixture({ chunks: 391, confirmedChunks: 223 });
+  const forbidden = [];
+  await assert.rejects(executeUploadWindow(input.request, {
+    rpc: input.rpc,
+    executionId: () => "r4c-shaped-read-count",
+    pid: 8999,
+    hostname: "test-host",
+    now: () => "2026-07-20T00:00:00.000Z",
+    loadAuthorityKeypair: async () => { throw new Error("TEST_SIGNER_BOUNDARY"); },
+    getLatestBlockhash: async () => { forbidden.push("blockhash"); },
+    sendRawTransaction: async () => { forbidden.push("send"); },
+    confirmSignature: async () => { forbidden.push("confirm"); },
+    readChunkMatches: async (chunk) => {
+      const account = await input.rpc.getAccountInfo(new PublicKey(PLAN_UPLOAD_IDENTITIES.buffer), "confirmed");
+      return Buffer.from(account.data)
+        .subarray(METADATA_LENGTH + chunk.offset, METADATA_LENGTH + chunk.offset + chunk.length)
+        .equals(chunk.bytes);
+    },
+    sleep: async () => {},
+  }), /TEST_SIGNER_BOUNDARY/);
+
+  assert.equal(input.calls.filter((call) => call === "buffer").length, 1);
+  assert.deepEqual(forbidden, []);
+});
+
+test("binary drift during preflight invalidates the snapshot before lease or signer", async () => {
+  const input = fixture({ chunks: 1 });
+  const calls = [];
+  const rpc = {
+    ...input.rpc,
+    getBalance: async () => {
+      calls.push("balance");
+      writeFileSync(input.binaryPath, Buffer.alloc(input.localBytes.length, 0xff));
+      return 10_000_000_000;
+    },
+  };
+
+  await assert.rejects(executeUploadWindow(input.request, {
+    rpc,
+    executionId: () => "binary-drift-before-lease",
+    loadAuthorityKeypair: async () => { calls.push("signer"); },
+    getLatestBlockhash: async () => { calls.push("blockhash"); },
+    sendRawTransaction: async () => { calls.push("send"); },
+    confirmSignature: async () => null,
+    readChunkMatches: async () => false,
+    sleep: async () => {},
+  }), /snapshot binary hash mismatch/);
+
+  assert.deepEqual(calls, ["balance"]);
   assert.equal(existsSync(leasePaths(input.statePath).activeDirectory), false);
 });
 
@@ -367,10 +680,13 @@ test("preflight rejects wrong genesis, existing program, buffer metadata, state 
 test("execution persists SENT and locally derived signature before sending each transaction", async () => {
   const input = fixture({ chunks: 2 });
   const lifecycle = [];
+  let monotonicTick = 0;
+  const rpcRequestLedger = createRpcRequestLedger({ monotonicNow: () => monotonicTick++ });
   let inFlight = 0;
   let maximumInFlight = 0;
   const result = await executeUploadWindow(input.request, {
     rpc: input.rpc,
+    rpcRequestLedger,
     executionId: () => "window-persist-before-send",
     pid: 9001,
     hostname: "test-host",
@@ -394,6 +710,9 @@ test("execution persists SENT and locally derived signature before sending each 
   assert.equal(result.liveWriteExecuted, true);
   assert.equal(result.liveWriteAttempted, true);
   assert.equal(result.leaseLifecycle, "RECONCILIATION_REQUIRED");
+  assert.equal(result.rpcRequestSummary.totalRecorded, 6);
+  assert.equal(result.rpcRequestSummary.countsByMethod.GET_ACCOUNT_INFO, 2);
+  assert.doesNotMatch(JSON.stringify(result.rpcRequestSummary), /duration|sequence|startMonotonic|accountData/i);
   assert.equal(maximumInFlight, 1);
   assert.equal(lifecycle.filter((item) => item === "blockhash").length, 2);
   for (const index of [0, 1]) {
