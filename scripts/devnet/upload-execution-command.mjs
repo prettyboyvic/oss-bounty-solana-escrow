@@ -36,6 +36,7 @@ import {
 const BUFFER_METADATA_LENGTH = 37;
 const PROGRAM_ACCOUNT_LENGTH = 36;
 const PROGRAMDATA_METADATA_LENGTH = 45;
+const CONFIRMATION_POLL_INTERVAL_MS = 2_000;
 const APPLY_RECEIPT_VERSION = "UPLOAD_RECONCILIATION_V1";
 const APPLY_RECEIPT_KEYS = ["appliedAt", "evidenceHash", "executionId", "leaseSha256", "onchainEvidenceFingerprint", "stateSha256Before", "transitions", "version"];
 const APPLY_TRANSITION_KEYS = ["chunkIndex", "chunkSha256", "feeLamports", "from", "signature", "slot", "to"];
@@ -587,6 +588,7 @@ export async function executeUploadWindow(request, adapters) {
     liveWriteExecuted: result.confirmedIndexes.length > 0 ? true : liveWriteAttempted ? null : false,
     stateMutation: true,
     ...(adapters.rpcRequestLedger ? { rpcRequestSummary: adapters.rpcRequestLedger.summary() } : {}),
+    ...(adapters.rpcRequestPolicy ? { rpcRequestPolicy: adapters.rpcRequestPolicy } : {}),
   };
 }
 
@@ -624,9 +626,16 @@ export function createProductionUploadDependencies(url, {
     ...(schedulerSleep ? { sleep: schedulerSleep } : {}),
   });
   const rpcRequestLedger = rpcRequestScheduler.ledger;
+  const schedulerPolicy = rpcRequestScheduler.policy();
+  const rpcRequestPolicy = Object.freeze({
+    globalRequestStartGapMs: schedulerPolicy.minimumRequestStartGapMs,
+    confirmationPollIntervalMs: CONFIRMATION_POLL_INTERVAL_MS,
+    rateLimitRetryScheduleMs: Object.freeze([...schedulerPolicy.retryBackoffMs]),
+  });
   return {
     rpc: connection,
     rpcRequestLedger,
+    rpcRequestPolicy,
     rpcRequestScheduler,
     monotonicNow: requestMonotonicNow,
     loadAuthorityKeypair(path) {
@@ -676,16 +685,24 @@ export function createProductionUploadDependencies(url, {
       mutationCapability: "write",
     }, () => connection.sendRawTransaction(rawTransaction, { maxRetries: 0, skipPreflight: true })),
     async confirmSignature(signature, timeoutMs) {
-      const deadline = Date.now() + timeoutMs;
-      while (Date.now() < deadline) {
+      const deadlineMonotonicMs = requestMonotonicNow() + timeoutMs;
+      let lastStatusAttemptStartMs = null;
+      while (requestMonotonicNow() < deadlineMonotonicMs) {
         const response = await rpcRequestScheduler.schedule({
           methodClass: "GET_SIGNATURE_STATUSES",
           signaturePersisted: true,
           mutationCapability: "read",
-        }, () => connection.getSignatureStatuses([signature], { searchTransactionHistory: true }));
+        }, () => connection.getSignatureStatuses([signature], { searchTransactionHistory: true }), {
+          ...(lastStatusAttemptStartMs === null ? {} : {
+            notBeforeMonotonicMs: lastStatusAttemptStartMs + CONFIRMATION_POLL_INTERVAL_MS,
+          }),
+          onInvocationStart({ startMonotonicMs }) {
+            lastStatusAttemptStartMs = startMonotonicMs;
+          },
+        });
         const status = response.value[0];
-        if (status?.err || status?.confirmationStatus === "confirmed" || status?.confirmationStatus === "finalized") return status;
-        await sleep(250);
+        if (status?.err || status?.confirmationStatus === "finalized") return status;
+        if (lastStatusAttemptStartMs + CONFIRMATION_POLL_INTERVAL_MS >= deadlineMonotonicMs) return null;
       }
       return null;
     },

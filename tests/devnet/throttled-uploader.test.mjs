@@ -78,6 +78,9 @@ test("allows only explicit schema-v3 chunk state transitions", () => {
 
 test("reconciliation does not blind-replace an uncertain transaction", () => {
   assert.equal(reconcileChunk({ signatureStatus: null, chunkMatches: true, expired: true }), "CONFIRMED");
+  assert.equal(reconcileChunk({ signatureStatus: null, chunkMatches: true, expired: false }), "UNKNOWN");
+  assert.equal(reconcileChunk({ signatureStatus: { err: null, confirmationStatus: "confirmed" }, chunkMatches: true, expired: false }), "UNKNOWN");
+  assert.equal(reconcileChunk({ signatureStatus: { err: null, confirmationStatus: "finalized" }, chunkMatches: true, expired: false }), "CONFIRMED");
   assert.equal(reconcileChunk({ signatureStatus: { err: { Custom: 1 } }, chunkMatches: false, expired: false }), "CONFIRMED_FAILURE");
   assert.equal(reconcileChunk({ signatureStatus: null, chunkMatches: false, expired: true }), "UNKNOWN");
 });
@@ -137,7 +140,7 @@ test("exact skipped chunks do not consume the bounded send window", async () => 
     persist: async () => {},
     sign: async (chunk) => ({ signature: `sig-${chunk.index}` }),
     send: async (_signed, chunk) => sent.push(chunk.index),
-    confirm: async () => ({ err: null }),
+    confirm: async () => ({ err: null, confirmationStatus: "finalized" }),
     readChunkMatches: async () => true,
     sleep: async () => {},
   });

@@ -44,10 +44,15 @@ export function createRpcRequestScheduler({
   let abortError = null;
   let lastRequestStartMs = null;
   let lastRequestCompletionMs = null;
+  let lastSchedulerClockReadMs = null;
 
   function readMonotonic() {
     const value = monotonicNow();
     if (!Number.isFinite(value)) throw new Error("RPC scheduler monotonic clock is invalid");
+    if (lastSchedulerClockReadMs !== null && value < lastSchedulerClockReadMs) {
+      throw new Error("RPC scheduler monotonic clock regression");
+    }
+    lastSchedulerClockReadMs = value;
     return value;
   }
 
@@ -61,16 +66,36 @@ export function createRpcRequestScheduler({
     return new Promise((resolve) => idleWaiters.push(resolve));
   }
 
+  function markAborted(error) {
+    if (aborted) return;
+    aborted = true;
+    closed = true;
+    abortError = error instanceof Error ? error : new Error("RPC scheduler aborted");
+    for (const item of queue.splice(0)) item.reject(abortError);
+    settleIdleWaiters();
+  }
+
   async function wait(ms) {
     if (ms <= 0) return;
     await sleep(ms);
   }
 
-  async function waitForRequestStartGap() {
-    if (lastRequestStartMs === null) return;
-    const now = readMonotonic();
-    if (now < lastRequestStartMs) throw new Error("RPC scheduler monotonic clock regression");
-    await wait(Math.max(0, minimumRequestStartGapMs - (now - lastRequestStartMs)));
+  async function waitUntil(earliestMonotonicMs) {
+    while (true) {
+      if (aborted) throw abortError;
+      const now = readMonotonic();
+      if (now >= earliestMonotonicMs) return now;
+      await wait(earliestMonotonicMs - now);
+    }
+  }
+
+  async function waitForRequestStartGap(notBeforeMonotonicMs) {
+    let earliestStart = notBeforeMonotonicMs ?? null;
+    if (lastRequestStartMs !== null) {
+      earliestStart = Math.max(earliestStart ?? -Infinity, lastRequestStartMs + minimumRequestStartGapMs);
+    }
+    if (earliestStart === null) readMonotonic();
+    else await waitUntil(earliestStart);
   }
 
   async function runItem(item) {
@@ -78,19 +103,39 @@ export function createRpcRequestScheduler({
     for (let retryNumber = 0; ; retryNumber += 1) {
       if (aborted) throw abortError;
       if (item.beforeAttempt) await item.beforeAttempt(retryNumber);
-      await waitForRequestStartGap();
+      await waitForRequestStartGap(
+        retryNumber === 0 ? item.notBeforeMonotonicMs : undefined,
+      );
       if (aborted) throw abortError;
-      lastRequestStartMs = readMonotonic();
+      let observerError = null;
       try {
-        const result = await requestLedger.record({ ...item.metadata, retryNumber }, item.operation);
+        const result = await requestLedger.record({ ...item.metadata, retryNumber }, item.operation, {
+          invocationMonotonicNow: readMonotonic,
+          onInvocationStart(boundary) {
+            lastRequestStartMs = boundary.startMonotonicMs;
+            try {
+              item.onInvocationStart?.(boundary);
+            } catch {
+              observerError = new Error("RPC scheduler invocation observer failed");
+            }
+          },
+        });
         lastRequestCompletionMs = readMonotonic();
+        if (observerError) {
+          markAborted(observerError);
+          throw observerError;
+        }
         return result;
       } catch (error) {
         lastRequestCompletionMs = readMonotonic();
+        if (observerError) {
+          markAborted(observerError);
+          throw observerError;
+        }
         if (!retryAllowed || error?.classification !== "RPC_RATE_LIMITED" || retryNumber >= retryBackoffMs.length || aborted) {
           throw error;
         }
-        await wait(retryBackoffMs[retryNumber]);
+        await waitUntil(lastRequestCompletionMs + retryBackoffMs[retryNumber]);
       }
     }
   }
@@ -118,12 +163,14 @@ export function createRpcRequestScheduler({
 
   return Object.freeze({
     ledger: requestLedger,
-    schedule(metadata, operation, { beforeAttempt } = {}) {
+    schedule(metadata, operation, { beforeAttempt, notBeforeMonotonicMs, onInvocationStart } = {}) {
       if (closed || aborted) return Promise.reject(abortError ?? new Error("RPC scheduler is closed"));
       if (typeof operation !== "function") return Promise.reject(new Error("RPC scheduler operation is required"));
       if (beforeAttempt !== undefined && typeof beforeAttempt !== "function") return Promise.reject(new Error("RPC scheduler before-attempt guard is invalid"));
+      if (notBeforeMonotonicMs !== undefined && !Number.isFinite(notBeforeMonotonicMs)) return Promise.reject(new Error("RPC scheduler not-before time is invalid"));
+      if (onInvocationStart !== undefined && typeof onInvocationStart !== "function") return Promise.reject(new Error("RPC scheduler invocation observer is invalid"));
       if (queue.length >= queueCapacity) return Promise.reject(new Error("RPC scheduler queue capacity exceeded"));
-      const promise = new Promise((resolve, reject) => queue.push({ metadata, operation, beforeAttempt, resolve, reject }));
+      const promise = new Promise((resolve, reject) => queue.push({ metadata, operation, beforeAttempt, notBeforeMonotonicMs, onInvocationStart, resolve, reject }));
       void pump();
       return promise;
     },
@@ -132,9 +179,7 @@ export function createRpcRequestScheduler({
       if (active !== 0 || queue.length !== 0) throw new Error("RPC scheduler must be idle before cool-off");
       if (lastRequestCompletionMs === null) throw new Error("RPC scheduler cool-off requires a completed RPC request");
       if (aborted) throw abortError;
-      const now = readMonotonic();
-      if (now < lastRequestCompletionMs) throw new Error("RPC scheduler monotonic clock regression");
-      await wait(Math.max(0, minimumCoolOffMs - (now - lastRequestCompletionMs)));
+      await waitUntil(lastRequestCompletionMs + minimumCoolOffMs);
       if (aborted) throw abortError;
     },
     async close() {
@@ -142,13 +187,7 @@ export function createRpcRequestScheduler({
       await waitUntilIdle();
     },
     abort(error = new Error("RPC scheduler aborted")) {
-      if (!aborted) {
-        aborted = true;
-        closed = true;
-        abortError = error instanceof Error ? error : new Error("RPC scheduler aborted");
-        for (const item of queue.splice(0)) item.reject(abortError);
-        settleIdleWaiters();
-      }
+      markAborted(error);
       return waitUntilIdle();
     },
     status() {

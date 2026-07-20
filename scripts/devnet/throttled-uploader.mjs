@@ -30,8 +30,8 @@ export function normalizeRatePolicy(input) {
 }
 
 export function reconcileChunk({ signatureStatus, chunkMatches, expired }) {
-  if (chunkMatches) return "CONFIRMED";
   if (signatureStatus?.err) return "CONFIRMED_FAILURE";
+  if (chunkMatches && (expired || signatureStatus?.confirmationStatus === "finalized")) return "CONFIRMED";
   if (!signatureStatus && expired) return "UNKNOWN";
   return "UNKNOWN";
 }

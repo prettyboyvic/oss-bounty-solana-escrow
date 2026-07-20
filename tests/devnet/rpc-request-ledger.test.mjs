@@ -50,6 +50,45 @@ test("ledger records only the closed safe schema with monotonic timing", async (
   assert.equal(Object.isFrozen(ledger.debugSafeEntries()[0]), true);
 });
 
+test("scheduler-supplied invocation clock assigns sequence and ledger start at operation call", async () => {
+  const starts = [];
+  const order = [];
+  const ledger = createRpcRequestLedger({ monotonicNow: () => 75 });
+  await ledger.record({
+    methodClass: "GET_ACCOUNT_INFO",
+    retryNumber: 0,
+    signaturePersisted: false,
+    mutationCapability: "read",
+  }, async () => { order.push("operation"); return null; }, {
+    invocationMonotonicNow: () => 50,
+    onInvocationStart: (value) => { order.push("observer"); starts.push(value); },
+  });
+
+  assert.deepEqual(order, ["operation", "observer"]);
+  assert.deepEqual(starts, [{ sequence: 1, startMonotonicMs: 50, retryNumber: 0 }]);
+  assert.equal(ledger.debugSafeEntries()[0].startMonotonicMs, 50);
+  assert.equal(ledger.debugSafeEntries()[0].endMonotonicMs, 75);
+});
+
+test("observer failure waits for the started operation and does not misclassify its ledger outcome", async () => {
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const ledger = createRpcRequestLedger({ monotonicNow: () => 10 });
+  let settled = false;
+  const recorded = ledger.record({
+    methodClass: "GET_ACCOUNT_INFO",
+    retryNumber: 0,
+    signaturePersisted: false,
+    mutationCapability: "read",
+  }, () => pending, { onInvocationStart: () => { throw new Error("private observer detail"); } });
+  recorded.catch(() => { settled = true; });
+  await Promise.resolve();
+  assert.equal(settled, false);
+  release("ok");
+  await assert.rejects(recorded, /RPC ledger invocation observer failed/);
+  assert.equal(ledger.debugSafeEntries()[0].outcome, "SUCCESS");
+});
+
 test("method, outcome and mutation enums are closed", async () => {
   assert.deepEqual(RPC_METHOD_CLASSES, [
     "GET_GENESIS_HASH",

@@ -190,6 +190,18 @@ const UPLOAD_RESULT_KEYS = [
   "liveWriteExecuted", "processed", "sent", "skippedIndexes", "stateMutation", "status",
 ];
 const UPLOAD_RESULT_STATUSES = new Set(["COMPLETE", "WINDOW_LIMIT", "RATE_LIMITED", "CONFIRMED_FAILURE", "UNKNOWN"]);
+const RPC_REQUEST_POLICY_KEYS = ["confirmationPollIntervalMs", "globalRequestStartGapMs", "rateLimitRetryScheduleMs"];
+
+function isSafeRpcRequestPolicy(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) &&
+    Object.keys(value).sort().join("\0") === [...RPC_REQUEST_POLICY_KEYS].sort().join("\0") &&
+    value.globalRequestStartGapMs === 500 &&
+    value.confirmationPollIntervalMs === 2_000 &&
+    Array.isArray(value.rateLimitRetryScheduleMs) &&
+    value.rateLimitRetryScheduleMs.length === 2 &&
+    value.rateLimitRetryScheduleMs[0] === 2_000 &&
+    value.rateLimitRetryScheduleMs[1] === 5_000;
+}
 
 function isSecretKey(key) {
   const normalized = key.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
@@ -204,9 +216,11 @@ function isStrictPublicIndexArray(value) {
 
 function allowedPublicIndexArrays(value) {
   const allowed = new WeakSet();
-  const expectedKeys = value?.rpcRequestSummary === undefined
-    ? UPLOAD_RESULT_KEYS
-    : [...UPLOAD_RESULT_KEYS, "rpcRequestSummary"];
+  const expectedKeys = [
+    ...UPLOAD_RESULT_KEYS,
+    ...(value?.rpcRequestSummary === undefined ? [] : ["rpcRequestSummary"]),
+    ...(value?.rpcRequestPolicy === undefined ? [] : ["rpcRequestPolicy"]),
+  ];
   if (Object.keys(value).sort().join("\0") !== [...expectedKeys].sort().join("\0") ||
       value.command !== "upload-buffer-throttled" ||
       !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value.executionId ?? "") ||
@@ -219,7 +233,8 @@ function allowedPublicIndexArrays(value) {
       !isStrictPublicIndexArray(value.confirmedIndexes) || value.confirmedIndexes.length !== value.sent ||
       !isStrictPublicIndexArray(value.skippedIndexes) ||
       new Set([...value.confirmedIndexes, ...value.skippedIndexes]).size !== value.confirmedIndexes.length + value.skippedIndexes.length ||
-      (value.rpcRequestSummary !== undefined && !isSafeRpcRequestSummary(value.rpcRequestSummary))) {
+      (value.rpcRequestSummary !== undefined && !isSafeRpcRequestSummary(value.rpcRequestSummary)) ||
+      (value.rpcRequestPolicy !== undefined && !isSafeRpcRequestPolicy(value.rpcRequestPolicy))) {
     return allowed;
   }
   allowed.add(value.confirmedIndexes);
@@ -251,6 +266,7 @@ function assertSafeOutput(value, allowedIndexArrays, path = "output") {
   }
   for (const [key, item] of Object.entries(value)) {
     if (isSecretKey(key)) throw new Error("secret-bearing output is forbidden");
+    if (key === "rpcRequestPolicy" && !isSafeRpcRequestPolicy(item)) throw new Error("secret-bearing output is forbidden");
     assertSafeOutput(item, allowedIndexArrays, `${path}.${key}`);
   }
 }

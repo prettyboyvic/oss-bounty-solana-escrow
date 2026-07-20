@@ -219,6 +219,11 @@ test("production dependency set owns one shared scheduler and empty bounded ledg
     retryBackoffMs: [2000, 5000],
   });
   assert.equal(dependencies.rpcRequestScheduler.ledger, dependencies.rpcRequestLedger);
+  assert.deepEqual(dependencies.rpcRequestPolicy, {
+    globalRequestStartGapMs: 500,
+    confirmationPollIntervalMs: 2000,
+    rateLimitRetryScheduleMs: [2000, 5000],
+  });
   assert.deepEqual(dependencies.rpcRequestLedger.summary(), {
     capacity: 256,
     totalRecorded: 0,
@@ -238,6 +243,93 @@ test("production dependency set owns one shared scheduler and empty bounded ledg
       SEND_RAW_TRANSACTION: 0,
     },
   });
+});
+
+test("three roughly 13-second finalized confirmations use bounded 2000ms normal polls", async (t) => {
+  let now = 0;
+  const startsBySignature = new Map();
+  const connection = {
+    rpcEndpoint: RPC,
+    async getSignatureStatuses([signature]) {
+      const starts = startsBySignature.get(signature) ?? [];
+      starts.push(now);
+      startsBySignature.set(signature, starts);
+      return { value: [{ err: null, confirmationStatus: starts[0] + 12_000 <= now ? "finalized" : "processed" }] };
+    },
+  };
+  const dependencies = createProductionUploadDependencies(RPC, {
+    connection,
+    monotonicNow: () => now,
+    schedulerSleep: async (ms) => { now += ms; },
+    transactionSleep: async (ms) => { now += ms; },
+  });
+
+  for (const signature of ["signature-a", "signature-b", "signature-c"]) {
+    const status = await dependencies.confirmSignature(signature, 30_000);
+    assert.equal(status.confirmationStatus, "finalized");
+  }
+  const starts = [...startsBySignature.values()];
+  for (const signatureStarts of starts) {
+    assert.ok(signatureStarts.slice(1).every((value, index) => value - signatureStarts[index] >= 2000));
+  }
+  assert.ok(starts.flat().length < 46);
+  t.diagnostic(`three-confirmation status request count: ${starts.flat().length}`);
+  assert.deepEqual([...startsBySignature.keys()], ["signature-a", "signature-b", "signature-c"]);
+  await dependencies.rpcRequestScheduler.close();
+});
+
+test("status retry backoff and normal polling floor cannot overlap or burst", async () => {
+  let now = 0;
+  const starts = [];
+  const signatures = [];
+  let calls = 0;
+  const connection = {
+    rpcEndpoint: RPC,
+    async getSignatureStatuses([signature]) {
+      starts.push(now);
+      signatures.push(signature);
+      calls += 1;
+      if (calls === 1) throw Object.assign(new Error("rate limited"), { status: 429 });
+      return { value: [{ err: null, confirmationStatus: calls === 2 ? "processed" : "finalized" }] };
+    },
+  };
+  const dependencies = createProductionUploadDependencies(RPC, {
+    connection,
+    monotonicNow: () => now,
+    schedulerSleep: async (ms) => { now += ms; },
+    transactionSleep: async (ms) => { now += ms; },
+  });
+
+  const status = await dependencies.confirmSignature("same-signature", 30_000);
+  assert.equal(status.confirmationStatus, "finalized");
+  assert.deepEqual(signatures, ["same-signature", "same-signature", "same-signature"]);
+  assert.ok(starts[1] - starts[0] >= 2000);
+  assert.ok(starts[2] - starts[1] >= 2000);
+  assert.equal(dependencies.rpcRequestLedger.summary().countsByMethod.GET_SIGNATURE_STATUSES, 3);
+  await dependencies.rpcRequestScheduler.close();
+});
+
+test("confirmed is nonterminal until the same signature reaches finalized", async () => {
+  let now = 0;
+  const signatures = [];
+  const statuses = ["confirmed", "finalized"];
+  const dependencies = createProductionUploadDependencies(RPC, {
+    connection: {
+      rpcEndpoint: RPC,
+      async getSignatureStatuses([signature]) {
+        signatures.push(signature);
+        return { value: [{ err: null, confirmationStatus: statuses.shift() }] };
+      },
+    },
+    monotonicNow: () => now,
+    schedulerSleep: async (ms) => { now += ms; },
+    transactionSleep: async (ms) => { now += ms; },
+  });
+
+  const status = await dependencies.confirmSignature("one-signature", 30_000);
+  assert.equal(status.confirmationStatus, "finalized");
+  assert.deepEqual(signatures, ["one-signature", "one-signature"]);
+  await dependencies.rpcRequestScheduler.close();
 });
 
 test("production preflight routes a rate-limited read through initial plus two bounded scheduler attempts", async () => {
@@ -702,7 +794,7 @@ test("execution persists SENT and locally derived signature before sending each 
       inFlight += 1;
       maximumInFlight = Math.max(maximumInFlight, inFlight);
     },
-    confirmSignature: async (_signature, _timeout, _signed, chunk) => { lifecycle.push(`confirm:${chunk.index}`); inFlight -= 1; return { err: null }; },
+    confirmSignature: async (_signature, _timeout, _signed, chunk) => { lifecycle.push(`confirm:${chunk.index}`); inFlight -= 1; return { err: null, confirmationStatus: "finalized" }; },
     readChunkMatches: async (chunk) => { lifecycle.push(`match:${chunk.index}`); return true; },
     sleep: async (ms) => { lifecycle.push(`sleep:${ms}`); },
   });
@@ -739,7 +831,7 @@ test("five-chunk ceiling is absolute and exact skipped chunks do not consume it"
     getLatestBlockhash: async () => ({ blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1 }),
     buildAndSign: async ({ chunk }) => ({ signature: `signature-${chunk.index}`, rawTransaction: Buffer.from([chunk.index]) }),
     sendRawTransaction: async (_raw, chunk) => { sent.push(chunk.index); },
-    confirmSignature: async () => ({ err: null }),
+    confirmSignature: async () => ({ err: null, confirmationStatus: "finalized" }),
     readChunkMatches: async () => true,
     sleep: async () => {},
   });
@@ -772,9 +864,9 @@ test("existing SENT or UNKNOWN is reconciled before signer and unresolved eviden
 
 test("first 429, confirmed failure and exact chunk mismatch stop without lifecycle calls", async () => {
   const scenarios = [
-    { name: "429", send: async () => { throw new Error("429 Too Many Requests"); }, confirm: async () => ({ err: null }), match: async () => true, expected: "RATE_LIMITED" },
+    { name: "429", send: async () => { throw new Error("429 Too Many Requests"); }, confirm: async () => ({ err: null, confirmationStatus: "finalized" }), match: async () => true, expected: "RATE_LIMITED" },
     { name: "failure", send: async () => {}, confirm: async () => ({ err: { InstructionError: [0, "InvalidAccountData"] } }), match: async () => false, expected: "CONFIRMED_FAILURE" },
-    { name: "mismatch", send: async () => {}, confirm: async () => ({ err: null }), match: async () => false, expected: "UNKNOWN" },
+    { name: "mismatch", send: async () => {}, confirm: async () => ({ err: null, confirmationStatus: "finalized" }), match: async () => false, expected: "UNKNOWN" },
   ];
   for (const scenario of scenarios) {
     const input = fixture({ chunks: 2 });

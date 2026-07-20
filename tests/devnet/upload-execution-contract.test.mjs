@@ -233,4 +233,25 @@ test("rejects every secret-bearing output shape instead of redacting it ambiguou
     onchainWrite: false,
   };
   assert.deepEqual(sanitizeExecutionOutput(publicResult), publicResult);
+
+  const uploadResult = {
+    command: "upload-buffer-throttled",
+    executionId: "policy-schema",
+    status: "COMPLETE",
+    processed: 0,
+    sent: 0,
+    confirmedIndexes: [],
+    skippedIndexes: [],
+    leaseLifecycle: "RECONCILIATION_REQUIRED",
+    liveWriteAttempted: false,
+    liveWriteExecuted: false,
+    stateMutation: true,
+    rpcRequestPolicy: {
+      globalRequestStartGapMs: 500,
+      confirmationPollIntervalMs: 2000,
+      rateLimitRetryScheduleMs: [2000, 5000],
+      rawMethod: "CANARY",
+    },
+  };
+  assert.throws(() => sanitizeExecutionOutput(uploadResult), /secret-bearing output/);
 });

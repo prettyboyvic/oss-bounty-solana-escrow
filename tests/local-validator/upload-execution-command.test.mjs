@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +23,7 @@ import {
 } from "../../scripts/devnet/upload-execution-command.mjs";
 import {
   applyUploadReconciliation,
+  leasePaths,
   reconcileUploadLease,
   releaseUploadLease,
 } from "../../scripts/devnet/upload-execution-lease.mjs";
@@ -129,7 +130,7 @@ async function createBuffer(connection, authority, buffer, binaryLength) {
   return allocation;
 }
 
-test("production entrypoint covers scheduler pacing, injected 429 recovery and cold resume", { timeout: 180_000 }, async (t) => {
+test("production entrypoint covers scheduler pacing, injected 429 recovery and cold resume", { timeout: 240_000 }, async (t) => {
   const runtime = mkdtempSync(join(tmpdir(), "upload-entrypoint-local-"));
   const ledger = join(runtime, "ledger");
   const statePath = join(runtime, "state.json");
@@ -248,6 +249,7 @@ test("production entrypoint covers scheduler pacing, injected 429 recovery and c
         blockhashAttempts: 0,
         buildAndSignCalls: 0,
         confirmationSignatures: [],
+        confirmationStatuses: [],
         events: [],
         sendChunks: [],
         sendTransportCalls: 0,
@@ -282,16 +284,41 @@ test("production entrypoint covers scheduler pacing, injected 429 recovery and c
         async getSignatureStatuses(signatures, ...args) {
           counters.confirmationSignatures.push([...signatures]);
           if (mode === "confirmation-429") throw Object.assign(new Error("injected rate limit"), { status: 429 });
-          return connection.getSignatureStatuses(signatures, ...args);
+          if (mode === "confirmation-timeout") {
+            const response = { value: signatures.map(() => ({ err: null, confirmationStatus: "processed" })) };
+            counters.confirmationStatuses.push(response.value.map(({ confirmationStatus }) => confirmationStatus));
+            return response;
+          }
+          const response = await connection.getSignatureStatuses(signatures, ...args);
+          counters.confirmationStatuses.push(response.value.map((status) => status?.confirmationStatus ?? null));
+          return response;
         },
         getTransaction: (...args) => connection.getTransaction(...args),
         getMultipleAccountsInfoAndContext: (...args) => connection.getMultipleAccountsInfoAndContext(...args),
       };
-      const dependencies = createProductionUploadDependencies(rpcUrl, {
+      let injectEarlyWake = mode === "early-wake";
+      let injectAbort = mode === "abort-wait";
+      let dependencies;
+      dependencies = createProductionUploadDependencies(rpcUrl, {
         bufferAddress: fixture.contract.buffer,
         connection: injectedConnection,
         monotonicNow: () => monotonicMs,
-        schedulerSleep: async (ms) => { schedulerSleeps.push(ms); monotonicMs += ms; },
+        schedulerSleep: async (ms) => {
+          schedulerSleeps.push(ms);
+          if (injectAbort && ms > 0) {
+            injectAbort = false;
+            void dependencies.rpcRequestScheduler.abort(new Error("injected abort during wait"));
+            monotonicMs += ms;
+            return;
+          }
+          if (injectEarlyWake && ms >= 500) {
+            injectEarlyWake = false;
+            monotonicMs += ms - 1;
+          } else {
+            monotonicMs += ms;
+          }
+          if (ms >= 2000) await new Promise((resolve) => setTimeout(resolve, 1000));
+        },
         transactionSleep: async (ms) => {
           if (ms === 250) await new Promise((resolve) => setTimeout(resolve, 25));
         },
@@ -370,15 +397,30 @@ test("production entrypoint covers scheduler pacing, injected 429 recovery and c
 
     const normal = await makeFixture("normal-three", 3);
     t.diagnostic("scenario A fixture finalized");
-    let runtimeResult = runtimeDependencies(normal, "normal-three");
+    let runtimeResult = runtimeDependencies(normal, "normal-three", "early-wake");
     const normalResult = await executeUploadWindow({ ...normal.request, maxChunks: 3 }, runtimeResult.dependencies);
     assert.equal(normalResult.status, "COMPLETE");
+    assert.deepEqual(normalResult.rpcRequestPolicy, {
+      globalRequestStartGapMs: 500,
+      confirmationPollIntervalMs: 2000,
+      rateLimitRetryScheduleMs: [2000, 5000],
+    });
     assert.equal(runtimeResult.counters.accountSnapshotAttempts, 1);
     assert.deepEqual(runtimeResult.counters.sendChunks, [0, 1, 2]);
     const normalEntries = runtimeResult.dependencies.rpcRequestLedger.debugSafeEntries();
     const finalPreflightRead = normalEntries.filter(({ methodClass }) => methodClass === "GET_RENT_EXEMPTION").at(-1);
     const firstBlockhashRead = normalEntries.find(({ methodClass }) => methodClass === "GET_LATEST_BLOCKHASH");
     assert.ok(firstBlockhashRead.startMonotonicMs - finalPreflightRead.endMonotonicMs >= 3000);
+    const normalStatusEntries = normalEntries.filter(({ methodClass }) => methodClass === "GET_SIGNATURE_STATUSES");
+    assert.ok(normalStatusEntries.length < 46);
+    for (let index = 1; index < normalStatusEntries.length; index += 1) {
+      assert.ok(normalStatusEntries[index].startMonotonicMs - normalStatusEntries[index - 1].startMonotonicMs >= 2000);
+    }
+    assert.equal(normalEntries.filter(({ methodClass }) => methodClass === "SEND_RAW_TRANSACTION").length, 3);
+    assert.equal(normalEntries.filter(({ methodClass }) => methodClass === "SEND_RAW_TRANSACTION").every(({ retryNumber }) => retryNumber === 0), true);
+    assert.equal(runtimeResult.counters.confirmationStatuses.filter((statuses) => statuses[0] === "finalized").length, 3);
+    const normalGaps = normalEntries.slice(1).map((entry, index) => entry.startMonotonicMs - normalEntries[index].startMonotonicMs);
+    t.diagnostic(`scenario A minimum actual invocation gap: ${Math.min(...normalGaps)}ms; status requests: ${normalStatusEntries.length}`);
     for (const index of [0, 1]) {
       assert.ok(runtimeResult.counters.events.indexOf(`confirm:${index}`) < runtimeResult.counters.events.indexOf(`send:${index + 1}`));
       assert.ok(runtimeResult.counters.events.indexOf(`match:${index}`) < runtimeResult.counters.events.indexOf(`send:${index + 1}`));
@@ -448,6 +490,34 @@ test("production entrypoint covers scheduler pacing, injected 429 recovery and c
     await releaseWindow(recovery, "confirmation-exhaustion", runtimeResult.dependencies);
     await runtimeResult.dependencies.rpcRequestScheduler.close();
     t.diagnostic("scenario E reconciled and archived");
+
+    const timeoutFixture = await makeFixture("confirmation-timeout", 2);
+    runtimeResult = runtimeDependencies(timeoutFixture, "confirmation-timeout", "confirmation-timeout");
+    const timedOut = await executeUploadWindow({ ...timeoutFixture.request, maxChunks: 2 }, runtimeResult.dependencies);
+    assert.equal(timedOut.status, "UNKNOWN");
+    assert.equal(runtimeResult.counters.sendTransportCalls, 1);
+    assert.deepEqual(runtimeResult.counters.sendChunks, [0]);
+    assert.ok(runtimeResult.counters.confirmationSignatures.length > 1);
+    assert.equal(runtimeResult.counters.confirmationSignatures.every(([signature]) =>
+      signature === runtimeResult.counters.transmittedSignatures[0]), true);
+    assert.deepEqual(JSON.parse(readFileSync(timeoutFixture.statePath)).deployment.buffer.chunks.map(({ status }) => status), ["UNKNOWN", "PLANNED"]);
+    await waitForFinalizedSignatures(connection, runtimeResult.counters.transmittedSignatures);
+    await runtimeResult.dependencies.rpcRequestScheduler.close();
+    runtimeResult = runtimeDependencies(timeoutFixture, "confirmation-timeout-reconciliation");
+    await releaseWindow(timeoutFixture, "confirmation-timeout", runtimeResult.dependencies);
+    await runtimeResult.dependencies.rpcRequestScheduler.close();
+    t.diagnostic("confirmation timeout preserved one send and blocked next chunk");
+
+    const abortFixture = await makeFixture("abort-during-wait", 1);
+    runtimeResult = runtimeDependencies(abortFixture, "abort-during-wait", "abort-wait");
+    await assert.rejects(executeUploadWindow(abortFixture.request, runtimeResult.dependencies), /injected abort during wait/);
+    assert.equal(runtimeResult.counters.signerLoads, 0);
+    assert.equal(runtimeResult.counters.sendTransportCalls, 0);
+    assert.equal(existsSync(leasePaths(abortFixture.statePath).activeDirectory), false);
+    assert.equal(runtimeResult.dependencies.rpcRequestScheduler.status().active, 0);
+    assert.equal(runtimeResult.dependencies.rpcRequestScheduler.status().pending, 0);
+    await runtimeResult.dependencies.rpcRequestScheduler.close();
+    t.diagnostic("abort during paced wait prevented invocation and lease acquisition");
 
     authority = null;
     runtimeResult = null;

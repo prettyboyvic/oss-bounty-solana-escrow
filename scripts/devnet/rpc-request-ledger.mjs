@@ -21,6 +21,7 @@ const RATE_LIMIT_TEXT = /\b429\s+too many requests\b|\btoo many requests\b|\brat
 const RATE_LIMIT_NUMBER_KEYS = /^(?:code|status|statusCode|httpStatus)$/i;
 const SAFE_ERROR_KEYS = ["message", "code", "status", "statusCode", "httpStatus", "data", "body", "response", "error", "cause"];
 const SUMMARY_KEYS = ["capacity", "countsByMethod", "countsByOutcome", "dropped", "retained", "totalRecorded"];
+const RECORD_OPTION_KEYS = ["invocationMonotonicNow", "onInvocationStart"];
 
 function containsRateLimit(value, seen = new WeakSet(), key = "", depth = 0) {
   if (typeof value === "string") return RATE_LIMIT_TEXT.test(value);
@@ -129,21 +130,48 @@ export function createRpcRequestLedger({ capacity = 256, monotonicNow = () => pe
   }
 
   return Object.freeze({
-    async record(metadata, operation) {
+    async record(metadata, operation, options = {}) {
       validateMetadata(metadata);
       if (typeof operation !== "function") throw new Error("RPC ledger operation is required");
-      const startMonotonicMs = monotonicNow();
+      if (options === null || typeof options !== "object" || Array.isArray(options) ||
+          Object.keys(options).some((key) => !RECORD_OPTION_KEYS.includes(key))) {
+        throw new Error("RPC ledger record options are invalid");
+      }
+      if (options.onInvocationStart !== undefined && typeof options.onInvocationStart !== "function") {
+        throw new Error("RPC ledger invocation observer is invalid");
+      }
+      if (options.invocationMonotonicNow !== undefined && typeof options.invocationMonotonicNow !== "function") {
+        throw new Error("RPC ledger invocation clock is invalid");
+      }
+      const requestSequence = nextSequence + 1;
+      nextSequence = requestSequence;
+      const startMonotonicMs = (options.invocationMonotonicNow ?? monotonicNow)();
       if (!Number.isFinite(startMonotonicMs)) throw new Error("RPC ledger monotonic clock is invalid");
-      const requestSequence = ++nextSequence;
+      const boundary = Object.freeze({ sequence: requestSequence, startMonotonicMs, retryNumber: metadata.retryNumber });
+      let pending;
+      let synchronousError;
+      try {
+        pending = operation();
+      } catch (error) {
+        synchronousError = error;
+      }
+      let observerError;
+      try {
+        options.onInvocationStart?.(boundary);
+      } catch {
+        observerError = new Error("RPC ledger invocation observer failed");
+      }
       let result;
       try {
-        result = await operation();
+        if (synchronousError) throw synchronousError;
+        result = await pending;
       } catch (error) {
         const outcome = containsRateLimit(error) ? "RPC_RATE_LIMITED" : "RPC_ERROR";
         const entry = append(requestSequence, metadata, startMonotonicMs, monotonicNow(), outcome);
         throw new SafeRpcRequestError(entry);
       }
       append(requestSequence, metadata, startMonotonicMs, monotonicNow(), "SUCCESS");
+      if (observerError) throw observerError;
       return result;
     },
     debugSafeEntries() {

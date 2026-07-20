@@ -294,6 +294,44 @@ test("successful resume output preserves sixteen or more public skipped chunk in
   assert.deepEqual(result.rpcRequestSummary, rpcRequestSummary);
 });
 
+test("upload output exposes only the closed sanitized RPC timing policy", async () => {
+  const rpcRequestPolicy = {
+    globalRequestStartGapMs: 500,
+    confirmationPollIntervalMs: 2000,
+    rateLimitRetryScheduleMs: [2000, 5000],
+  };
+  const result = await main([
+    "upload-buffer-throttled",
+    "--url", "https://api.devnet.solana.com",
+    "--program", "6UoYT4jtiS23rCU1zARqnn181BxwuJ9waS1sv35gRg1Z",
+    "--buffer", "CT1DGjkt9t926L6SoFxiYJmzc18nMowpdw1WcZgWwbbW",
+    "--state", ".devnet/state.json",
+    "--authority", ".devnet/authority.json",
+    "--max-chunks", "3",
+    "--delay-ms", "3000",
+    "--acknowledge-devnet-write", "R4_BUFFER_UPLOAD",
+  ], {
+    repoRoot: join(tmpdir(), "upload-cli-policy-root"),
+    isIgnoredPath: () => true,
+    executionDependencies: {},
+    executeUploadWindow: async () => ({
+      command: "upload-buffer-throttled",
+      executionId: "public-policy-output",
+      status: "COMPLETE",
+      processed: 0,
+      sent: 0,
+      confirmedIndexes: [],
+      skippedIndexes: [],
+      leaseLifecycle: "RECONCILIATION_REQUIRED",
+      liveWriteAttempted: false,
+      liveWriteExecuted: false,
+      stateMutation: true,
+      rpcRequestPolicy,
+    }),
+  });
+  assert.deepEqual(result.rpcRequestPolicy, rpcRequestPolicy);
+});
+
 test("classifies message, structured, nested and body-backed 429 errors without retaining RPC details", () => {
   const cases = [
     new Error('429 Too Many Requests: {"jsonrpc":"2.0","error":{"code":429,"data":{"requestId":"CANARY-MESSAGE"}}}'),

@@ -73,7 +73,7 @@ async function waitForValidator(connection, child) {
   throw new Error("LOCAL_VALIDATOR_START_TIMEOUT");
 }
 
-async function waitForSignature(connection, signature, timeoutMs = 10_000) {
+async function waitForSignature(connection, signature, timeoutMs = 45_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const response = await connection.getSignatureStatuses(
@@ -81,8 +81,8 @@ async function waitForSignature(connection, signature, timeoutMs = 10_000) {
       { searchTransactionHistory: true },
     );
     const status = response.value[0];
-    if (status?.confirmationStatus === "confirmed" || status?.confirmationStatus === "finalized") {
-      return { err: status.err };
+    if (status?.confirmationStatus === "finalized") {
+      return { err: status.err, confirmationStatus: status.confirmationStatus };
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
@@ -161,6 +161,7 @@ test("real local validator resumes the same loader buffer after interruption", {
     "--reset",
     "--bind-address", "127.0.0.1",
     "--rpc-port", String(rpcPort),
+    "--ticks-per-slot", "8",
     "--account", authority.publicKey.toBase58(), authorityAccountPath,
     "--quiet",
   ], { stdio: "ignore", windowsHide: true });
