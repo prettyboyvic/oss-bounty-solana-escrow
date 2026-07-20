@@ -106,4 +106,7 @@ node scripts/devnet/upload-buffer-cli.mjs upload-buffer-throttled --url https://
 - [x] **Step 2: Run both local-validator suites, 26 Anchor cases, Rust, TypeScript, both rustfmt checks, vector parity, optimized SBF/hash, IDL identity, YAML, and diff checks**
 - [x] **Step 3: Verify secret/raw-RPC/key-array/path hygiene, ignored artifacts, archive immutability, parked repositories, no active process/lease, and no forbidden flow**
 - [x] **Step 4: Create and self-review the sanitized checkpoint, then stage only the two Markdown documents**
-- [ ] **Step 5: Commit with the exact message, push normally, and wait for terminal SUCCESS from CI on the exact commit SHA**
+- [x] **Step 5: Commit with the exact message, push normally, and wait for terminal SUCCESS from CI on the exact commit SHA**
+  - Completed in commit `9de3e9c97c369c5dd56b9659c1d7e60e506ae233`; CI run
+    [29717185743](https://github.com/prettyboyvic/oss-bounty-solana-escrow/actions/runs/29717185743)
+    reached terminal `SUCCESS` on that exact commit.

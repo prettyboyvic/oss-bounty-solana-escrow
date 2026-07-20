@@ -59,12 +59,17 @@ reference hash is stored in the escrow account.
 
 ## Current verification
 
-Phase 2 remains blocked from any further devnet write pending a separately
-approved local recovery step. The first bounded R4B upload window was executed:
-four buffer writes landed, the program remains absent, and the active execution
-lease is intentionally retained. R4B-R1 now proves the last locally `SENT`
-chunk finalized successfully and matches the exact buffer bytes, returning a
-read-only `SAFE_TO_RELEASE` proposal without applying it. See the
+The sole R4F five-chunk window finalized chunks 229-233, leaving 234
+`CONFIRMED`, 157 `PLANNED`, and zero `SENT` or `UNKNOWN` chunks. Chunk 234
+remains `PLANNED` with a null signature, and the program remains absent. Fresh
+reconciliation returned `SAFE_TO_RELEASE` with `releaseReady: true` and zero
+proposed transitions, so apply was not called; lease release then returned
+`ARCHIVED/RELEASED`, leaving no active lease. R4F did not finalize or deploy
+the program. See the [R4F checkpoint](docs/PHASE_2_R4F_CHECKPOINT_2026-07-20.md),
+published in commit `9de3e9c97c369c5dd56b9659c1d7e60e506ae233` after successful exact-SHA CI
+run [29717185743](https://github.com/prettyboyvic/oss-bounty-solana-escrow/actions/runs/29717185743).
+
+Earlier recovery history remains available in the
 [sanitized R4B checkpoint](docs/PHASE_2_R4B_BLOCKED_2026-07-19.md) and
 [R4B-R1 recovery design](docs/superpowers/specs/2026-07-19-r4b-r1-reconciliation-recovery-design.md).
 
