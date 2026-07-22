@@ -36,6 +36,12 @@ test("rejects malformed chunk records and invalid transitions", () => {
   assert.throws(() => validateChunkRecords([{ index: 1, offset: 0, length: 2, sha256: "a".repeat(64), status: "PLANNED" }]), /index order/);
   assert.throws(() => validateChunkRecords([{ index: 0, offset: 0, length: 2, sha256: "a".repeat(64), status: "SENT", signature: null }]), /signature/);
   assert.throws(() => validateChunkRecords([{ index: 0, offset: 0, length: 2, sha256: "a".repeat(64), status: "SENT", signature: "" }]), /signature/);
+  assert.equal(validateChunkRecords([{ index: 0, offset: 0, length: 2, sha256: "a".repeat(64), status: "CONFIRMED", signature: "historical-signature" }]), true);
+  assert.equal(validateChunkRecords([{ index: 0, offset: 0, length: 2, sha256: "a".repeat(64), status: "CONFIRMED", signature: "current-signature", confirmationDurationMs: 0 }]), true);
+  for (const confirmationDurationMs of [-1, 0.5, Number.NaN]) {
+    assert.throws(() => validateChunkRecords([{ index: 0, offset: 0, length: 2, sha256: "a".repeat(64), status: "CONFIRMED", signature: "signature", confirmationDurationMs }]), /confirmation duration/);
+  }
+  assert.throws(() => validateChunkRecords([{ index: 0, offset: 0, length: 2, sha256: "a".repeat(64), status: "SENT", signature: "signature", confirmationDurationMs: 1 }]), /confirmation duration/);
 });
 
 test("migrates synthetic v2 deployment state to v3 without secrets", () => {

@@ -189,6 +189,7 @@ const UPLOAD_RESULT_KEYS = [
   "command", "confirmedIndexes", "executionId", "leaseLifecycle", "liveWriteAttempted",
   "liveWriteExecuted", "processed", "sent", "skippedIndexes", "stateMutation", "status",
 ];
+const CONFIRMATION_KEYS = ["chunkIndex", "confirmationDurationMs"];
 const UPLOAD_RESULT_STATUSES = new Set(["COMPLETE", "WINDOW_LIMIT", "RATE_LIMITED", "CONFIRMED_FAILURE", "UNKNOWN"]);
 const RPC_REQUEST_POLICY_KEYS = ["confirmationPollIntervalMs", "globalRequestStartGapMs", "rateLimitRetryScheduleMs"];
 
@@ -214,10 +215,21 @@ function isStrictPublicIndexArray(value) {
   );
 }
 
+function isSafeConfirmations(value, confirmedIndexes) {
+  return Array.isArray(value) && Array.isArray(confirmedIndexes) &&
+    value.length === confirmedIndexes.length && value.every((item, index) =>
+      item !== null && typeof item === "object" && !Array.isArray(item) &&
+      Object.keys(item).sort().join("\0") === [...CONFIRMATION_KEYS].sort().join("\0") &&
+      item.chunkIndex === confirmedIndexes[index] &&
+      Number.isSafeInteger(item.confirmationDurationMs) && item.confirmationDurationMs >= 0,
+    );
+}
+
 function allowedPublicIndexArrays(value) {
   const allowed = new WeakSet();
   const expectedKeys = [
     ...UPLOAD_RESULT_KEYS,
+    ...(value?.confirmations === undefined ? [] : ["confirmations"]),
     ...(value?.rpcRequestSummary === undefined ? [] : ["rpcRequestSummary"]),
     ...(value?.rpcRequestPolicy === undefined ? [] : ["rpcRequestPolicy"]),
   ];
@@ -231,6 +243,7 @@ function allowedPublicIndexArrays(value) {
       !Number.isSafeInteger(value.processed) || value.processed < 0 || value.processed > MAX_UPLOAD_CHUNKS ||
       value.sent !== value.processed ||
       !isStrictPublicIndexArray(value.confirmedIndexes) || value.confirmedIndexes.length !== value.sent ||
+      (value.confirmations !== undefined && !isSafeConfirmations(value.confirmations, value.confirmedIndexes)) ||
       !isStrictPublicIndexArray(value.skippedIndexes) ||
       new Set([...value.confirmedIndexes, ...value.skippedIndexes]).size !== value.confirmedIndexes.length + value.skippedIndexes.length ||
       (value.rpcRequestSummary !== undefined && !isSafeRpcRequestSummary(value.rpcRequestSummary)) ||
@@ -273,6 +286,10 @@ function assertSafeOutput(value, allowedIndexArrays, path = "output") {
 
 export function sanitizeExecutionOutput(value) {
   if (value === null || Array.isArray(value) || typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new Error("secret-bearing output is forbidden");
+  }
+  if (value.command === "upload-buffer-throttled" && value.confirmations !== undefined &&
+      !isSafeConfirmations(value.confirmations, value.confirmedIndexes)) {
     throw new Error("secret-bearing output is forbidden");
   }
   assertSafeOutput(value, allowedPublicIndexArrays(value));

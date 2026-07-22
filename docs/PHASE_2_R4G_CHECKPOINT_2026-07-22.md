@@ -161,6 +161,29 @@ The final publication gate must still prove only sanitized documentation is
 tracked, `.devnet/` remains ignored/untracked, no signer or credential data is
 present in the diff, exact-SHA CI succeeds, and the repository returns clean.
 
+## Post-publication confirmation-telemetry correction
+
+A source audit after R4G found `TELEMETRY_DEFECT_CONFIRMED`: the production
+confirmation loop used a monotonic clock for its deadline and polling policy,
+but the sequential uploader never calculated or attached the elapsed interval
+to a successful chunk result. Consequently the execution window record and
+sanitized CLI result had no per-chunk confirmation duration to preserve.
+
+The correction records future finalized successes as public
+`{ chunkIndex, confirmationDurationMs }` entries measured from the established
+confirmation-wait boundary immediately before `confirm()` until finalized
+status first returns authoritatively, rounded upward to an integer millisecond.
+Each successful duration is saved atomically with its confirmed chunk and is
+also retained in normal or later-error window evidence. Historical records
+without this optional field remain readable. R4G remains valid, and its five
+historical per-chunk durations remain explicitly unavailable rather than zero,
+estimated, or synthesized.
+
+This source/test/documentation correction did not change transaction
+construction, signing, send count, retries, polling intervals, pacing,
+max-window policy, reconciliation, or lease behavior. No devnet transaction
+was sent during the correction.
+
 ## R4H recommendation
 
 Retain the five-chunk ceiling and at least 900 seconds of cooldown. A future,

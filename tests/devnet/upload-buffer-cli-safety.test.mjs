@@ -321,6 +321,7 @@ test("upload output exposes only the closed sanitized RPC timing policy", async 
       processed: 0,
       sent: 0,
       confirmedIndexes: [],
+      confirmations: [],
       skippedIndexes: [],
       leaseLifecycle: "RECONCILIATION_REQUIRED",
       liveWriteAttempted: false,
@@ -330,6 +331,7 @@ test("upload output exposes only the closed sanitized RPC timing policy", async 
     }),
   });
   assert.deepEqual(result.rpcRequestPolicy, rpcRequestPolicy);
+  assert.deepEqual(result.confirmations, []);
 });
 
 test("classifies message, structured, nested and body-backed 429 errors without retaining RPC details", () => {

@@ -11,7 +11,7 @@ import { makeLoaderV3WriteInstruction } from "../../scripts/devnet/loader-v3-cod
 import { PLAN_UPLOAD_IDENTITIES } from "../../scripts/devnet/plan-upload-command.mjs";
 import { createRpcRequestLedger } from "../../scripts/devnet/rpc-request-ledger.mjs";
 import { createRpcRequestScheduler } from "../../scripts/devnet/rpc-request-scheduler.mjs";
-import { createPlanFingerprint } from "../../scripts/devnet/throttled-uploader.mjs";
+import { createPlanFingerprint, runSequentialUpload } from "../../scripts/devnet/throttled-uploader.mjs";
 import { planBufferUpload } from "../../scripts/devnet/upload-plan.mjs";
 import {
   encodeBase58,
@@ -275,6 +275,38 @@ test("three roughly 13-second finalized confirmations use bounded 2000ms normal 
   assert.ok(starts.flat().length < 46);
   t.diagnostic(`three-confirmation status request count: ${starts.flat().length}`);
   assert.deepEqual([...startsBySignature.keys()], ["signature-a", "signature-b", "signature-c"]);
+  await dependencies.rpcRequestScheduler.close();
+});
+
+test("multiple finalized-status polls produce the expected confirmation duration", async () => {
+  let now = 0;
+  let statusCalls = 0;
+  const dependencies = createProductionUploadDependencies(RPC, {
+    connection: {
+      rpcEndpoint: RPC,
+      async getSignatureStatuses() {
+        statusCalls += 1;
+        return { value: [{ err: null, confirmationStatus: statusCalls === 3 ? "finalized" : "processed" }] };
+      },
+    },
+    monotonicNow: () => now,
+    schedulerSleep: async (ms) => { now += ms; },
+    transactionSleep: async () => {},
+  });
+  const result = await runSequentialUpload({
+    chunks: [{ index: 3, exactMatch: false }],
+    policy: {},
+    persist: async () => {},
+    sign: async () => ({ signature: "same-public-signature" }),
+    send: async () => {},
+    confirm: dependencies.confirmSignature,
+    readChunkMatches: async () => true,
+    sleep: async () => {},
+    monotonicNow: dependencies.monotonicNow,
+  });
+
+  assert.equal(statusCalls, 3);
+  assert.deepEqual(result.confirmations, [{ chunkIndex: 3, confirmationDurationMs: 4_000 }]);
   await dependencies.rpcRequestScheduler.close();
 });
 
@@ -816,6 +848,66 @@ test("execution persists SENT and locally derived signature before sending each 
   assert.deepEqual(state.deployment.buffer.chunks.map(({ status }) => status), ["CONFIRMED", "CONFIRMED"]);
   assert.equal(state.deployment.buffer.uploadWindows[0].terminal, true);
   assert.equal(existsSync(leasePaths(input.statePath).activeDirectory), true);
+});
+
+test("confirmation telemetry is retained in the execution result and upload window", async () => {
+  const input = fixture({ chunks: 1 });
+  let monotonicNow = 1_000;
+  const result = await executeUploadWindow(input.request, {
+    rpc: input.rpc,
+    monotonicNow: () => monotonicNow,
+    executionId: () => "window-confirmation-telemetry",
+    pid: 9005,
+    hostname: "test-host",
+    now: () => "2026-07-22T00:00:00.000Z",
+    loadAuthorityKeypair: async () => ({ publicKey: new PublicKey(PLAN_UPLOAD_IDENTITIES.authority) }),
+    getLatestBlockhash: async () => ({ blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1 }),
+    buildAndSign: async () => ({ signature: "public-signature", rawTransaction: Buffer.from([1]) }),
+    sendRawTransaction: async () => {},
+    confirmSignature: async () => {
+      monotonicNow = 13_345;
+      return { err: null, confirmationStatus: "finalized" };
+    },
+    readChunkMatches: async () => true,
+    sleep: async () => {},
+  });
+  const expected = [{ chunkIndex: 0, confirmationDurationMs: 12_345 }];
+  assert.deepEqual(result.confirmations, expected);
+  const state = JSON.parse(readFileSync(input.statePath, "utf8"));
+  assert.deepEqual(state.deployment.buffer.uploadWindows[0].confirmations, expected);
+});
+
+test("completed confirmation telemetry survives a later chunk error", async () => {
+  const input = fixture({ chunks: 2 });
+  let now = 1_000;
+  let confirmations = 0;
+  await assert.rejects(executeUploadWindow(input.request, {
+    rpc: input.rpc,
+    monotonicNow: () => now,
+    executionId: () => "window-partial-confirmation-telemetry",
+    pid: 9006,
+    hostname: "test-host",
+    now: () => "2026-07-22T00:00:00.000Z",
+    loadAuthorityKeypair: async () => ({ publicKey: new PublicKey(PLAN_UPLOAD_IDENTITIES.authority) }),
+    getLatestBlockhash: async () => ({ blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1 }),
+    buildAndSign: async ({ chunk }) => ({ signature: `public-signature-${chunk.index}`, rawTransaction: Buffer.from([chunk.index]) }),
+    sendRawTransaction: async () => {},
+    confirmSignature: async () => {
+      confirmations += 1;
+      now += 2_500;
+      if (confirmations === 2) throw new Error("injected confirmation transport error");
+      return { err: null, confirmationStatus: "finalized" };
+    },
+    readChunkMatches: async () => true,
+    sleep: async () => {},
+  }), /confirmation transport error/);
+
+  const state = JSON.parse(readFileSync(input.statePath, "utf8"));
+  const expected = [{ chunkIndex: 0, confirmationDurationMs: 2_500 }];
+  assert.equal(state.deployment.buffer.chunks[0].confirmationDurationMs, 2_500);
+  assert.deepEqual(state.deployment.buffer.uploadWindows[0].confirmedIndexes, [0]);
+  assert.deepEqual(state.deployment.buffer.uploadWindows[0].confirmations, expected);
+  assert.equal(state.deployment.buffer.uploadWindows[0].status, "RPC_OUTCOME_UNKNOWN");
 });
 
 test("five-chunk ceiling is absolute and exact skipped chunks do not consume it", async () => {

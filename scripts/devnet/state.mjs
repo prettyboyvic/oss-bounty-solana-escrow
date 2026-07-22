@@ -29,6 +29,10 @@ export function validateChunkRecords(chunks) {
     if (signature !== null && (typeof signature !== "string" || signature.length === 0)) throw new Error("chunk signature is invalid");
     if (["SENT", "FAILED", "UNKNOWN"].includes(chunk.status) && signature === null) throw new Error("chunk signature is required for sent state");
     if (chunk.status === "PLANNED" && signature !== null) throw new Error("planned chunk signature is forbidden");
+    if (chunk.confirmationDurationMs !== undefined &&
+        (chunk.status !== "CONFIRMED" || !Number.isSafeInteger(chunk.confirmationDurationMs) || chunk.confirmationDurationMs < 0)) {
+      throw new Error("chunk confirmation duration is invalid");
+    }
     if (signature !== null && signatures.has(signature)) throw new Error("duplicate signature in chunk records");
     indices.add(chunk.index); if (signature !== null) signatures.add(signature); expectedOffset += chunk.length;
   }

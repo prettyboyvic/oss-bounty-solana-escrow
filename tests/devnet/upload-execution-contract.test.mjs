@@ -255,3 +255,44 @@ test("rejects every secret-bearing output shape instead of redacting it ambiguou
   };
   assert.throws(() => sanitizeExecutionOutput(uploadResult), /secret-bearing output/);
 });
+
+test("sanitized upload confirmation telemetry is exact, ordered and backward compatible", () => {
+  const historical = {
+    command: "upload-buffer-throttled",
+    executionId: "historical-window",
+    status: "COMPLETE",
+    processed: 1,
+    sent: 1,
+    confirmedIndexes: [4],
+    skippedIndexes: [],
+    leaseLifecycle: "RECONCILIATION_REQUIRED",
+    liveWriteAttempted: true,
+    liveWriteExecuted: true,
+    stateMutation: true,
+  };
+  assert.deepEqual(sanitizeExecutionOutput(historical), historical);
+
+  const current = {
+    ...historical,
+    executionId: "current-window",
+    confirmedIndexes: [4, 5],
+    processed: 2,
+    sent: 2,
+    confirmations: [
+      { chunkIndex: 4, confirmationDurationMs: 0 },
+      { chunkIndex: 5, confirmationDurationMs: 12_345 },
+    ],
+  };
+  assert.deepEqual(sanitizeExecutionOutput(current), current);
+
+  for (const confirmations of [
+    [{ chunkIndex: 4, confirmationDurationMs: -1 }, { chunkIndex: 5, confirmationDurationMs: 12_345 }],
+    [{ chunkIndex: 4, confirmationDurationMs: 0.5 }, { chunkIndex: 5, confirmationDurationMs: 12_345 }],
+    [{ chunkIndex: 5, confirmationDurationMs: 1 }, { chunkIndex: 4, confirmationDurationMs: 2 }],
+    [{ chunkIndex: 4, confirmationDurationMs: 1 }, { chunkIndex: 4, confirmationDurationMs: 2 }],
+    [{ chunkIndex: 4, confirmationDurationMs: 1 }],
+    [{ chunkIndex: 4, confirmationDurationMs: 1, extra: true }, { chunkIndex: 5, confirmationDurationMs: 2 }],
+  ]) {
+    assert.throws(() => sanitizeExecutionOutput({ ...current, confirmations }), /secret-bearing output/);
+  }
+});

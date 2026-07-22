@@ -534,6 +534,7 @@ export async function executeUploadWindow(request, adapters) {
 
   let result;
   let liveWriteAttempted = false;
+  const completedConfirmations = [];
   try {
     result = await runPersistedSequentialUpload({
       statePath: request.statePath,
@@ -549,6 +550,12 @@ export async function executeUploadWindow(request, adapters) {
       confirm: adapters.confirmSignature,
       readChunkMatches: adapters.readChunkMatches,
       sleep: adapters.sleep,
+      monotonicNow: adapters.monotonicNow,
+      onEvent(event) {
+        if (event.status === "CONFIRMED" && event.confirmationDurationMs !== undefined) {
+          completedConfirmations.push({ chunkIndex: event.index, confirmationDurationMs: event.confirmationDurationMs });
+        }
+      },
     });
   } catch (error) {
     appendWindowOutcome(request.statePath, {
@@ -559,6 +566,8 @@ export async function executeUploadWindow(request, adapters) {
       finishedAt: (adapters.now ?? (() => new Date().toISOString()))(),
       maxChunks: request.maxChunks,
       delayMs: request.delayMs,
+      confirmedIndexes: completedConfirmations.map(({ chunkIndex }) => chunkIndex),
+      confirmations: completedConfirmations,
     });
     throw error;
   }
@@ -573,6 +582,7 @@ export async function executeUploadWindow(request, adapters) {
     processed: result.processed,
     sent: result.sent,
     confirmedIndexes: result.confirmedIndexes,
+    confirmations: result.confirmations,
     skippedIndexes: result.skippedIndexes,
   });
   return {
@@ -582,6 +592,7 @@ export async function executeUploadWindow(request, adapters) {
     processed: result.processed,
     sent: result.sent,
     confirmedIndexes: result.confirmedIndexes,
+    confirmations: result.confirmations,
     skippedIndexes: result.skippedIndexes,
     leaseLifecycle: "RECONCILIATION_REQUIRED",
     liveWriteAttempted,

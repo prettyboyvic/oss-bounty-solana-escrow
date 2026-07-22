@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { performance } from "node:perf_hooks";
 
 import {
   migrateState,
@@ -36,32 +37,46 @@ export function reconcileChunk({ signatureStatus, chunkMatches, expired }) {
   return "UNKNOWN";
 }
 
-export async function runSequentialUpload({ chunks, policy: policyInput, persist, sign, send, confirm, readChunkMatches, sleep }) {
+export async function runSequentialUpload({ chunks, policy: policyInput, persist, sign, send, confirm, readChunkMatches, sleep, monotonicNow = () => performance.now() }) {
   const policy = normalizeRatePolicy(policyInput);
   let processed = 0;
   let sent = 0;
   const confirmedIndexes = [];
+  const confirmations = [];
   const skippedIndexes = [];
   for (const chunk of chunks) {
     if (chunk.exactMatch) { skippedIndexes.push(chunk.index); continue; }
-    if (processed >= policy.maxChunksPerWindow) return { status: "WINDOW_LIMIT", processed, sent, confirmedIndexes, skippedIndexes };
+    if (processed >= policy.maxChunksPerWindow) return { status: "WINDOW_LIMIT", processed, sent, confirmedIndexes, confirmations, skippedIndexes };
     const signed = await sign(chunk);
     if (!signed?.signature) throw new Error("signer did not return a public signature");
     await persist({ status: "SENT", index: chunk.index, signature: signed.signature });
     try { await send(signed, chunk); } catch (error) {
       if (error?.classification === "RPC_RATE_LIMITED" || /\b429\b|too many requests/i.test(String(error?.message))) {
-        return { status: "RATE_LIMITED", processed, sent, confirmedIndexes, skippedIndexes };
+        return { status: "RATE_LIMITED", processed, sent, confirmedIndexes, confirmations, skippedIndexes };
       }
       throw error;
     }
-    const reconciliation = reconcileChunk({ signatureStatus: await confirm(signed.signature, policy.confirmationTimeoutMs, signed, chunk), chunkMatches: await readChunkMatches(chunk), expired: false });
+    const confirmationStartedAtMs = monotonicNow();
+    const signatureStatus = await confirm(signed.signature, policy.confirmationTimeoutMs, signed, chunk);
+    const confirmationFinishedAtMs = monotonicNow();
+    if (!Number.isFinite(confirmationStartedAtMs) || !Number.isFinite(confirmationFinishedAtMs) || confirmationFinishedAtMs < confirmationStartedAtMs) {
+      throw new Error("confirmation monotonic clock regression");
+    }
+    const reconciliation = reconcileChunk({ signatureStatus, chunkMatches: await readChunkMatches(chunk), expired: false });
     const persistedStatus = reconciliation === "CONFIRMED_FAILURE" ? "FAILED" : reconciliation;
-    await persist({ status: persistedStatus, index: chunk.index, signature: signed.signature });
-    if (reconciliation === "CONFIRMED_FAILURE" || reconciliation === "UNKNOWN") return { status: reconciliation, processed, sent, confirmedIndexes, skippedIndexes };
-    sent += 1; processed += 1; confirmedIndexes.push(chunk.index);
+    const confirmationDurationMs = Math.ceil(confirmationFinishedAtMs - confirmationStartedAtMs);
+    if (!Number.isSafeInteger(confirmationDurationMs)) throw new Error("confirmation duration is invalid");
+    await persist({
+      status: persistedStatus,
+      index: chunk.index,
+      signature: signed.signature,
+      ...(reconciliation === "CONFIRMED" ? { confirmationDurationMs } : {}),
+    });
+    if (reconciliation === "CONFIRMED_FAILURE" || reconciliation === "UNKNOWN") return { status: reconciliation, processed, sent, confirmedIndexes, confirmations, skippedIndexes };
+    sent += 1; processed += 1; confirmedIndexes.push(chunk.index); confirmations.push({ chunkIndex: chunk.index, confirmationDurationMs });
     await sleep(policy.minimumDelayMs);
   }
-  return { status: "COMPLETE", processed, sent, confirmedIndexes, skippedIndexes };
+  return { status: "COMPLETE", processed, sent, confirmedIndexes, confirmations, skippedIndexes };
 }
 
 export function createPlanFingerprint({ program, buffer, authority, allocation, binarySha256, maxPayload, chunks }) {
@@ -129,6 +144,7 @@ export async function runPersistedSequentialUpload({
   confirm,
   readChunkMatches,
   sleep,
+  monotonicNow,
   onEvent = () => {},
 }) {
   let state = loadUploaderCheckpoint(statePath, checkpoint);
@@ -146,6 +162,7 @@ export async function runPersistedSequentialUpload({
     assertChunkTransition(record.status, event.status);
     record.status = event.status;
     record.signature = event.signature ?? record.signature ?? null;
+    if (event.confirmationDurationMs !== undefined) record.confirmationDurationMs = event.confirmationDurationMs;
     validateChunkRecords(records);
     saveStateAtomic(statePath, state);
     onEvent(structuredClone(event));
@@ -161,7 +178,7 @@ export async function runPersistedSequentialUpload({
       throw new Error("confirmed snapshot status mismatch");
     }
     if (record.status === "FAILED") {
-      return { status: "CONFIRMED_FAILURE", processed: 0, sent: 0, confirmedIndexes: [], skippedIndexes: [] };
+      return { status: "CONFIRMED_FAILURE", processed: 0, sent: 0, confirmedIndexes: [], confirmations: [], skippedIndexes: [] };
     }
     if (record.status === "SENT" || record.status === "UNKNOWN") {
       const signatureStatus = record.signature
@@ -176,10 +193,10 @@ export async function runPersistedSequentialUpload({
       }
       if (reconciliation === "CONFIRMED_FAILURE") {
         await persist({ status: "FAILED", index: chunk.index, signature: record.signature });
-        return { status: "CONFIRMED_FAILURE", processed: 0, sent: 0, confirmedIndexes: [], skippedIndexes: [] };
+        return { status: "CONFIRMED_FAILURE", processed: 0, sent: 0, confirmedIndexes: [], confirmations: [], skippedIndexes: [] };
       }
       await persist({ status: "UNKNOWN", index: chunk.index, signature: record.signature });
-      return { status: "UNKNOWN", processed: 0, sent: 0, confirmedIndexes: [], skippedIndexes: [] };
+      return { status: "UNKNOWN", processed: 0, sent: 0, confirmedIndexes: [], confirmations: [], skippedIndexes: [] };
     }
     if (record.status === "CONFIRMED") {
       if (!confirmedSnapshotIndexes.has(chunk.index)) throw new Error("confirmed chunk snapshot evidence missing");
@@ -203,5 +220,6 @@ export async function runPersistedSequentialUpload({
     confirm,
     readChunkMatches,
     sleep,
+    monotonicNow,
   });
 }

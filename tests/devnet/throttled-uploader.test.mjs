@@ -85,6 +85,79 @@ test("reconciliation does not blind-replace an uncertain transaction", () => {
   assert.equal(reconcileChunk({ signatureStatus: null, chunkMatches: false, expired: true }), "UNKNOWN");
 });
 
+test("finalized confirmation duration uses the injected monotonic boundary", async () => {
+  let now = 100;
+  const result = await runSequentialUpload({
+    chunks: [{ index: 0, exactMatch: false }],
+    policy: {},
+    persist: async () => {},
+    sign: async () => ({ signature: "public-signature" }),
+    send: async () => {},
+    confirm: async () => {
+      now = 12_101;
+      return { err: null, confirmationStatus: "finalized" };
+    },
+    readChunkMatches: async () => true,
+    sleep: async () => {},
+    monotonicNow: () => now,
+  });
+
+  assert.deepEqual(result.confirmations, [{ chunkIndex: 0, confirmationDurationMs: 12_001 }]);
+});
+
+test("immediate finalized confirmation records zero without claiming failed or ambiguous durations", async () => {
+  const finalized = await runSequentialUpload({
+    chunks: [{ index: 0, exactMatch: false }],
+    policy: {},
+    persist: async () => {},
+    sign: async () => ({ signature: "finalized-signature" }),
+    send: async () => {},
+    confirm: async () => ({ err: null, confirmationStatus: "finalized" }),
+    readChunkMatches: async () => true,
+    sleep: async () => {},
+    monotonicNow: () => 500,
+  });
+  assert.deepEqual(finalized.confirmations, [{ chunkIndex: 0, confirmationDurationMs: 0 }]);
+
+  for (const scenario of [
+    { status: null, matches: false, expected: "UNKNOWN" },
+    { status: { err: { InstructionError: [0, "InvalidAccountData"] } }, matches: false, expected: "CONFIRMED_FAILURE" },
+    { status: { err: null, confirmationStatus: "finalized" }, matches: false, expected: "UNKNOWN" },
+  ]) {
+    let now = 0;
+    const result = await runSequentialUpload({
+      chunks: [{ index: 0, exactMatch: false }],
+      policy: {},
+      persist: async () => {},
+      sign: async () => ({ signature: "nonfinal-signature" }),
+      send: async () => {},
+      confirm: async () => { now = 10; return scenario.status; },
+      readChunkMatches: async () => scenario.matches,
+      sleep: async () => {},
+      monotonicNow: () => now,
+    });
+    assert.equal(result.status, scenario.expected);
+    assert.deepEqual(result.confirmations, []);
+  }
+});
+
+test("confirmation duration fails closed on non-finite or regressing monotonic clocks", async () => {
+  for (const readings of [[10, 9], [10, Number.NaN]]) {
+    const clock = [...readings];
+    await assert.rejects(runSequentialUpload({
+      chunks: [{ index: 0, exactMatch: false }],
+      policy: {},
+      persist: async () => {},
+      sign: async () => ({ signature: "public-signature" }),
+      send: async () => {},
+      confirm: async () => ({ err: null, confirmationStatus: "finalized" }),
+      readChunkMatches: async () => true,
+      sleep: async () => {},
+      monotonicNow: () => clock.shift(),
+    }), /monotonic clock regression/);
+  }
+});
+
 test("persists a public signature before send and stops on first 429", async () => {
   const events = [];
   const result = await runSequentialUpload({
@@ -126,6 +199,7 @@ test("ledger-wrapped send 429 preserves the RATE_LIMITED result contract without
 
   assert.equal(result.status, "RATE_LIMITED");
   assert.equal(sends, 1);
+  assert.deepEqual(result.confirmations, []);
 });
 
 test("exact skipped chunks do not consume the bounded send window", async () => {
