@@ -59,15 +59,16 @@ reference hash is stored in the escrow account.
 
 ## Current verification
 
-The sole R4I five-chunk window finalized chunks 244-248, leaving 249
-`CONFIRMED`, 142 `PLANNED`, and zero `SENT` or `UNKNOWN` chunks. Chunk 249
+The sole R4J five-chunk window finalized chunks 249-253, leaving 254
+`CONFIRMED`, 137 `PLANNED`, and zero `SENT` or `UNKNOWN` chunks. Chunk 254
 remains `PLANNED` with a null signature, and the program remains absent. Fresh
 reconciliation returned `SAFE_TO_RELEASE` with `releaseReady: true` and zero
 proposed transitions, so apply was not called; lease release then returned
-`ARCHIVED/RELEASED`, leaving no active lease. R4I did not finalize or deploy
-the program. See the [R4I checkpoint](docs/PHASE_2_R4I_CHECKPOINT_2026-07-22.md).
+`ARCHIVED/RELEASED`, leaving no active lease. R4J did not finalize or deploy
+the program. See the [R4J checkpoint](docs/PHASE_2_R4J_CHECKPOINT_2026-07-22.md).
 
 Earlier recovery history remains available in the
+[R4I checkpoint](docs/PHASE_2_R4I_CHECKPOINT_2026-07-22.md),
 [R4H checkpoint](docs/PHASE_2_R4H_CHECKPOINT_2026-07-22.md),
 [R4G checkpoint](docs/PHASE_2_R4G_CHECKPOINT_2026-07-22.md),
 [R4F checkpoint](docs/PHASE_2_R4F_CHECKPOINT_2026-07-20.md),
