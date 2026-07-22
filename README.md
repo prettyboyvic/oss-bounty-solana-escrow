@@ -59,15 +59,16 @@ reference hash is stored in the escrow account.
 
 ## Current verification
 
-The sole R4G five-chunk window finalized chunks 234-238, leaving 239
-`CONFIRMED`, 152 `PLANNED`, and zero `SENT` or `UNKNOWN` chunks. Chunk 239
+The sole R4H five-chunk window finalized chunks 239-243, leaving 244
+`CONFIRMED`, 147 `PLANNED`, and zero `SENT` or `UNKNOWN` chunks. Chunk 244
 remains `PLANNED` with a null signature, and the program remains absent. Fresh
 reconciliation returned `SAFE_TO_RELEASE` with `releaseReady: true` and zero
 proposed transitions, so apply was not called; lease release then returned
-`ARCHIVED/RELEASED`, leaving no active lease. R4G did not finalize or deploy
-the program. See the [R4G checkpoint](docs/PHASE_2_R4G_CHECKPOINT_2026-07-22.md).
+`ARCHIVED/RELEASED`, leaving no active lease. R4H did not finalize or deploy
+the program. See the [R4H checkpoint](docs/PHASE_2_R4H_CHECKPOINT_2026-07-22.md).
 
 Earlier recovery history remains available in the
+[R4G checkpoint](docs/PHASE_2_R4G_CHECKPOINT_2026-07-22.md),
 [R4F checkpoint](docs/PHASE_2_R4F_CHECKPOINT_2026-07-20.md),
 [sanitized R4B checkpoint](docs/PHASE_2_R4B_BLOCKED_2026-07-19.md) and
 [R4B-R1 recovery design](docs/superpowers/specs/2026-07-19-r4b-r1-reconciliation-recovery-design.md).
