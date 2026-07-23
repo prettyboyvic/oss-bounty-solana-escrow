@@ -59,15 +59,22 @@ reference hash is stored in the escrow account.
 
 ## Current verification
 
-The sole R4J five-chunk window finalized chunks 249-253, leaving 254
-`CONFIRMED`, 137 `PLANNED`, and zero `SENT` or `UNKNOWN` chunks. Chunk 254
+The sole R4K five-chunk window finalized chunks 254-258, leaving 259
+`CONFIRMED`, 132 `PLANNED`, and zero `SENT` or `UNKNOWN` chunks. Chunk 259
 remains `PLANNED` with a null signature, and the program remains absent. Fresh
 reconciliation returned `SAFE_TO_RELEASE` with `releaseReady: true` and zero
 proposed transitions, so apply was not called; lease release then returned
-`ARCHIVED/RELEASED`, leaving no active lease. R4J did not finalize or deploy
-the program. See the [R4J checkpoint](docs/PHASE_2_R4J_CHECKPOINT_2026-07-22.md).
+`ARCHIVED/RELEASED`, leaving no active lease.
+
+R4K's on-chain window and local reconciliation/release succeeded, but its
+success-checkpoint publication is blocked because required literal live timing
+telemetry was not persisted. Those missing measurements are unavailable and
+must not be reconstructed. No second invocation was permitted or performed,
+replay is denied, and R4K did not finalize or deploy the program. See the
+[R4K evidence-blocked report](docs/PHASE_2_R4K_BLOCKED_2026-07-22.md).
 
 Earlier recovery history remains available in the
+[R4J checkpoint](docs/PHASE_2_R4J_CHECKPOINT_2026-07-22.md),
 [R4I checkpoint](docs/PHASE_2_R4I_CHECKPOINT_2026-07-22.md),
 [R4H checkpoint](docs/PHASE_2_R4H_CHECKPOINT_2026-07-22.md),
 [R4G checkpoint](docs/PHASE_2_R4G_CHECKPOINT_2026-07-22.md),
