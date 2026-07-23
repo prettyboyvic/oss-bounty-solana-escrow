@@ -50,6 +50,54 @@ test("ledger records only the closed safe schema with monotonic timing", async (
   assert.equal(Object.isFrozen(ledger.debugSafeEntries()[0]), true);
 });
 
+test("completed-entry subscriptions receive immutable safe records and can unsubscribe", async () => {
+  const observed = [];
+  const ledger = createRpcRequestLedger({ monotonicNow: clock([10, 20, 30, 40]) });
+  const unsubscribe = ledger.subscribe((value) => observed.push(value));
+  const metadata = {
+    methodClass: "GET_ACCOUNT_INFO",
+    retryNumber: 0,
+    signaturePersisted: false,
+    mutationCapability: "read",
+  };
+  await ledger.record(metadata, async () => null);
+  unsubscribe();
+  await ledger.record(metadata, async () => null);
+
+  assert.equal(observed.length, 1);
+  assert.deepEqual(observed[0], ledger.debugSafeEntries()[0]);
+  assert.equal(Object.isFrozen(observed[0]), true);
+  assert.throws(() => ledger.subscribe(null), /subscriber/);
+});
+
+test("invocation-start subscriptions run before operation dispatch and retain safe context", async () => {
+  const order = [];
+  const starts = [];
+  const ledger = createRpcRequestLedger({ monotonicNow: clock([10, 20]) });
+  const unsubscribe = ledger.subscribeInvocationStarts((value) => {
+    order.push("start");
+    starts.push(value);
+  });
+  await ledger.record({
+    methodClass: "GET_SIGNATURE_STATUSES",
+    retryNumber: 0,
+    signaturePersisted: true,
+    mutationCapability: "read",
+  }, async () => { order.push("operation"); });
+  unsubscribe();
+
+  assert.deepEqual(order, ["start", "operation"]);
+  assert.deepEqual(starts, [{
+    sequence: 1,
+    methodClass: "GET_SIGNATURE_STATUSES",
+    startMonotonicMs: 10,
+    retryNumber: 0,
+    signaturePersisted: true,
+    mutationCapability: "read",
+  }]);
+  assert.equal(Object.isFrozen(starts[0]), true);
+});
+
 test("scheduler-supplied invocation clock assigns sequence and ledger start at operation call", async () => {
   const starts = [];
   const order = [];

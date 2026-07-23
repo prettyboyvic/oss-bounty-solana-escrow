@@ -179,8 +179,14 @@ export function createRpcRequestScheduler({
       if (active !== 0 || queue.length !== 0) throw new Error("RPC scheduler must be idle before cool-off");
       if (lastRequestCompletionMs === null) throw new Error("RPC scheduler cool-off requires a completed RPC request");
       if (aborted) throw abortError;
-      await waitUntil(lastRequestCompletionMs + minimumCoolOffMs);
+      const startedMonotonicMs = lastRequestCompletionMs;
+      const finishedMonotonicMs = await waitUntil(startedMonotonicMs + minimumCoolOffMs);
       if (aborted) throw abortError;
+      return Object.freeze({
+        startedMonotonicMs,
+        finishedMonotonicMs,
+        elapsedMs: finishedMonotonicMs - startedMonotonicMs,
+      });
     },
     async close() {
       closed = true;

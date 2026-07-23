@@ -25,13 +25,17 @@ import {
   normalizeRatePolicy,
   runPersistedSequentialUpload,
 } from "./throttled-uploader.mjs";
-import { acquireUploadLease } from "./upload-execution-lease.mjs";
+import {
+  acquireUploadLease,
+  leasePaths,
+} from "./upload-execution-lease.mjs";
 import { LIVE_UPLOAD_ACKNOWLEDGEMENT } from "./upload-execution-contract.mjs";
 import { planBufferUpload } from "./upload-plan.mjs";
 import {
   createConfirmedValidationSnapshot,
   validateConfirmedValidationSnapshot,
 } from "./upload-validation-snapshot.mjs";
+import { createUploadTelemetryStore } from "./upload-execution-telemetry.mjs";
 
 const BUFFER_METADATA_LENGTH = 37;
 const PROGRAM_ACCOUNT_LENGTH = 36;
@@ -480,6 +484,10 @@ function classifyTerminalError(statePath, error) {
 }
 
 export async function executeUploadWindow(request, adapters) {
+  const monotonicNow = adapters.monotonicNow ?? (() => performance.now());
+  const executionId = (adapters.executionId ?? randomUUID)();
+  const startedAt = (adapters.now ?? (() => new Date().toISOString()))();
+  const startedMonotonicMs = monotonicNow();
   const preflight = await preflightUploadExecution(request, adapters);
   const currentStateSha256 = sha256(readFileSync(request.statePath));
   const currentLocalBytes = readFileSync(request.binaryPath);
@@ -489,10 +497,8 @@ export async function executeUploadWindow(request, adapters) {
     chunks: preflight.plan.chunks,
     records: preflight.state.deployment.buffer.chunks,
     localBytes: currentLocalBytes,
-    nowMonotonicMs: (adapters.monotonicNow ?? (() => performance.now()))(),
+    nowMonotonicMs: monotonicNow(),
   });
-  const executionId = (adapters.executionId ?? randomUUID)();
-  const startedAt = (adapters.now ?? (() => new Date().toISOString()))();
   acquireUploadLease({
     statePath: request.statePath,
     executionId,
@@ -504,6 +510,53 @@ export async function executeUploadWindow(request, adapters) {
     planFingerprint: preflight.expected.planFingerprint,
     stateSha256: preflight.stateSha256,
   });
+  const schedulerPolicy = adapters.rpcRequestScheduler?.policy?.();
+  const telemetryStore = createUploadTelemetryStore({
+    directory: leasePaths(request.statePath).activeDirectory,
+    executionId,
+    startedAt,
+    startMonotonicMs: startedMonotonicMs,
+    policy: {
+      preSignCooldownMs: 3_000,
+      globalRequestStartGapMs:
+        adapters.rpcRequestPolicy?.globalRequestStartGapMs ??
+        schedulerPolicy?.minimumRequestStartGapMs ??
+        500,
+      confirmationPollIntervalMs:
+        adapters.rpcRequestPolicy?.confirmationPollIntervalMs ??
+        CONFIRMATION_POLL_INTERVAL_MS,
+      rateLimitRetryScheduleMs:
+        adapters.rpcRequestPolicy?.rateLimitRetryScheduleMs ??
+        schedulerPolicy?.retryBackoffMs ??
+        [2_000, 5_000],
+      interChunkDelayMs: request.delayMs,
+    },
+  });
+  let activeConfirmationChunkIndex = null;
+  const recordTelemetryStart = (entry) => telemetryStore.recordRpcStart(entry, {
+    confirmationChunkIndex:
+      entry.methodClass === "GET_SIGNATURE_STATUSES"
+        ? activeConfirmationChunkIndex
+        : null,
+  });
+  const recordTelemetryEntry = (entry) => telemetryStore.recordRpcEntry(entry);
+  if (adapters.rpcRequestLedger && adapters.monotonicNow) {
+    for (const entry of adapters.rpcRequestLedger.debugSafeEntries()) {
+      recordTelemetryEntry(entry);
+    }
+  }
+  const unsubscribeTelemetry =
+    adapters.rpcRequestLedger && adapters.monotonicNow
+      ? adapters.rpcRequestLedger.subscribe(recordTelemetryEntry)
+      : () => {};
+  const unsubscribeTelemetryStarts =
+    adapters.rpcRequestLedger && adapters.monotonicNow
+      ? adapters.rpcRequestLedger.subscribeInvocationStarts(recordTelemetryStart)
+      : () => {};
+  const unsubscribeTelemetryObservers = () => {
+    unsubscribeTelemetryStarts();
+    unsubscribeTelemetry();
+  };
 
   const chunks = preflight.plan.chunks.map((chunk) => ({
     ...chunk,
@@ -512,10 +565,26 @@ export async function executeUploadWindow(request, adapters) {
   let authority;
   let preSignCoolOffComplete = false;
   const sign = async (chunk) => {
-    if (!preSignCoolOffComplete && adapters.rpcRequestScheduler) {
-      await adapters.rpcRequestScheduler.waitForCoolOff(3000);
+    let coolOff;
+    const coolOffRequired = !preSignCoolOffComplete;
+    if (coolOffRequired && adapters.rpcRequestScheduler) {
+      coolOff = await adapters.rpcRequestScheduler.waitForCoolOff(3000);
       preSignCoolOffComplete = true;
+    } else {
+      const boundary = monotonicNow();
+      coolOff = {
+        startedMonotonicMs: boundary,
+        finishedMonotonicMs: boundary,
+        elapsedMs: 0,
+      };
     }
+    if (coolOffRequired) preSignCoolOffComplete = true;
+    telemetryStore.recordPreSignCooldown({
+      chunkIndex: chunk.index,
+      required: coolOffRequired,
+      startedMonotonicMs: coolOff.startedMonotonicMs,
+      finishedMonotonicMs: coolOff.finishedMonotonicMs,
+    });
     authority ??= await adapters.loadAuthorityKeypair(request.authorityPath);
     if (authority?.publicKey?.toBase58() !== preflight.expected.authority) {
       throw new Error("buffer authority signer mismatch");
@@ -544,10 +613,37 @@ export async function executeUploadWindow(request, adapters) {
       policy: { maxChunksPerWindow: request.maxChunks, minimumDelayMs: request.delayMs },
       sign,
       send: async (signed, chunk) => {
+        telemetryStore.recordSendStart({
+          chunkIndex: chunk.index,
+          monotonicMs: monotonicNow(),
+        });
         liveWriteAttempted = true;
-        return adapters.sendRawTransaction(signed.rawTransaction, chunk);
+        try {
+          const sent = await adapters.sendRawTransaction(signed.rawTransaction, chunk);
+          telemetryStore.recordSendFinish({
+            chunkIndex: chunk.index,
+            monotonicMs: monotonicNow(),
+            outcome: "SUCCESS",
+          });
+          return sent;
+        } catch (error) {
+          telemetryStore.recordSendFinish({
+            chunkIndex: chunk.index,
+            monotonicMs: monotonicNow(),
+            outcome: "ERROR",
+          });
+          throw error;
+        }
       },
-      confirm: adapters.confirmSignature,
+      confirm: async (...args) => {
+        const chunk = args[3];
+        activeConfirmationChunkIndex = chunk?.index ?? null;
+        try {
+          return await adapters.confirmSignature(...args);
+        } finally {
+          activeConfirmationChunkIndex = null;
+        }
+      },
       readChunkMatches: adapters.readChunkMatches,
       sleep: adapters.sleep,
       monotonicNow: adapters.monotonicNow,
@@ -558,25 +654,43 @@ export async function executeUploadWindow(request, adapters) {
       },
     });
   } catch (error) {
+    const finishedAt = (adapters.now ?? (() => new Date().toISOString()))();
+    const telemetryEvidence = telemetryStore.finish({
+      finishedAt,
+      finishedMonotonicMs: monotonicNow(),
+      expectedChunkIndexes: completedConfirmations.map(({ chunkIndex }) => chunkIndex),
+    });
+    unsubscribeTelemetryObservers();
     appendWindowOutcome(request.statePath, {
       executionId,
       status: classifyTerminalError(request.statePath, error),
       terminal: true,
       startedAt,
-      finishedAt: (adapters.now ?? (() => new Date().toISOString()))(),
+      finishedAt,
       maxChunks: request.maxChunks,
       delayMs: request.delayMs,
       confirmedIndexes: completedConfirmations.map(({ chunkIndex }) => chunkIndex),
       confirmations: completedConfirmations,
+      telemetryEvidence: {
+        verdict: telemetryEvidence.verdict,
+        sha256: telemetryEvidence.sha256,
+      },
     });
     throw error;
   }
+  const finishedAt = (adapters.now ?? (() => new Date().toISOString()))();
+  const telemetryEvidence = telemetryStore.finish({
+    finishedAt,
+    finishedMonotonicMs: monotonicNow(),
+    expectedChunkIndexes: result.confirmedIndexes,
+  });
+  unsubscribeTelemetryObservers();
   appendWindowOutcome(request.statePath, {
     executionId,
     status: result.status,
     terminal: true,
     startedAt,
-    finishedAt: (adapters.now ?? (() => new Date().toISOString()))(),
+    finishedAt,
     maxChunks: request.maxChunks,
     delayMs: request.delayMs,
     processed: result.processed,
@@ -584,6 +698,10 @@ export async function executeUploadWindow(request, adapters) {
     confirmedIndexes: result.confirmedIndexes,
     confirmations: result.confirmations,
     skippedIndexes: result.skippedIndexes,
+    telemetryEvidence: {
+      verdict: telemetryEvidence.verdict,
+      sha256: telemetryEvidence.sha256,
+    },
   });
   return {
     command: "upload-buffer-throttled",

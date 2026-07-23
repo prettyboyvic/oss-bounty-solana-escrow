@@ -25,6 +25,7 @@ import {
   leasePaths,
   reconcileUploadLease,
 } from "../../scripts/devnet/upload-execution-lease.mjs";
+import { readUploadTelemetry } from "../../scripts/devnet/upload-execution-telemetry.mjs";
 
 const RPC = "https://api.devnet.solana.com";
 const GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
@@ -412,6 +413,50 @@ test("production execution enforces the 3000ms pre-sign cool-off before blockhas
   const finalPreflight = entries.filter(({ methodClass }) => methodClass === "GET_RENT_EXEMPTION").at(-1);
   assert.ok(blockhashStartedAt - finalPreflight.endMonotonicMs >= 3000);
   assert.ok(runtime.schedulerSleeps.includes(3000));
+  await runtime.dependencies.rpcRequestScheduler.close();
+});
+
+test("production execution persists complete five-chunk timing evidence and only its verdict/hash in state", async () => {
+  const input = fixture({ chunks: 5 });
+  let statusCalls = 0;
+  const runtime = productionRuntime(input, {
+    getSignatureStatuses: async () => {
+      statusCalls += 1;
+      return {
+        value: [{
+          err: null,
+          confirmationStatus: statusCalls % 2 === 0 ? "finalized" : "confirmed",
+        }],
+      };
+    },
+  });
+  runtime.dependencies.readChunkMatches = async () => true;
+  const result = await executeUploadWindow(input.request, {
+    ...runtime.dependencies,
+    executionId: () => "complete-five-chunk-telemetry",
+    pid: 8100,
+    hostname: "test-host",
+    now: () => "2026-07-23T00:00:00.000Z",
+  });
+
+  const directory = leasePaths(input.statePath).activeDirectory;
+  const telemetry = readUploadTelemetry(directory);
+  assert.equal(result.status, "COMPLETE");
+  assert.equal(telemetry.verdict, "COMPLETE");
+  assert.equal(telemetry.snapshot.sends.length, 5);
+  assert.equal(telemetry.snapshot.sends[0].preSignCooldownRequired, true);
+  assert.ok(telemetry.snapshot.sends[0].preSignCooldownMs >= 3_000);
+  assert.ok(telemetry.snapshot.minimumRpcRequestGapMs >= 500);
+  assert.ok(telemetry.snapshot.minimumConfirmationPollGapMs >= 2_000);
+  assert.equal(statusCalls, 10);
+
+  const state = JSON.parse(readFileSync(input.statePath, "utf8"));
+  assert.deepEqual(state.deployment.buffer.uploadWindows[0].telemetryEvidence, {
+    verdict: "COMPLETE",
+    sha256: telemetry.sha256,
+  });
+  assert.deepEqual(Object.keys(state.deployment.buffer.uploadWindows[0].telemetryEvidence).sort(), ["sha256", "verdict"]);
+  assert.doesNotMatch(readFileSync(join(directory, "telemetry.json"), "utf8"), /rawTransaction|signedTransaction|authorization|https?:\/\//i);
   await runtime.dependencies.rpcRequestScheduler.close();
 });
 
@@ -908,6 +953,13 @@ test("completed confirmation telemetry survives a later chunk error", async () =
   assert.deepEqual(state.deployment.buffer.uploadWindows[0].confirmedIndexes, [0]);
   assert.deepEqual(state.deployment.buffer.uploadWindows[0].confirmations, expected);
   assert.equal(state.deployment.buffer.uploadWindows[0].status, "RPC_OUTCOME_UNKNOWN");
+  const telemetry = readUploadTelemetry(leasePaths(input.statePath).activeDirectory);
+  assert.equal(telemetry.verdict, "INCOMPLETE");
+  assert.equal(telemetry.snapshot.sends.length, 2);
+  assert.equal(telemetry.snapshot.sends[0].outcome, "SUCCESS");
+  assert.equal(telemetry.snapshot.sends[1].outcome, "SUCCESS");
+  assert.equal(telemetry.snapshot.sends[1].sendDurationMs, 0);
+  assert.equal(state.deployment.buffer.uploadWindows[0].telemetryEvidence.sha256, telemetry.sha256);
 });
 
 test("five-chunk ceiling is absolute and exact skipped chunks do not consume it", async () => {

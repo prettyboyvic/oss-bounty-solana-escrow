@@ -21,6 +21,10 @@ import {
   reconcileUploadLease,
   releaseUploadLease,
 } from "../../scripts/devnet/upload-execution-lease.mjs";
+import {
+  createUploadTelemetryStore,
+  readUploadTelemetry,
+} from "../../scripts/devnet/upload-execution-telemetry.mjs";
 
 const PROGRAM = "6UoYT4jtiS23rCU1zARqnn181BxwuJ9waS1sv35gRg1Z";
 const BUFFER = "CT1DGjkt9t926L6SoFxiYJmzc18nMowpdw1WcZgWwbbW";
@@ -163,6 +167,36 @@ function reconcileInput(input) {
     expected: input.expected,
     observations: input.observations,
   };
+}
+
+function telemetryStore(directory) {
+  return createUploadTelemetryStore({
+    directory,
+    executionId: EXECUTION_ID,
+    startedAt: "2026-07-01T00:00:00.000Z",
+    startMonotonicMs: 0,
+    policy: {
+      preSignCooldownMs: 3_000,
+      globalRequestStartGapMs: 500,
+      confirmationPollIntervalMs: 2_000,
+      rateLimitRetryScheduleMs: [2_000, 5_000],
+      interChunkDelayMs: 3_000,
+    },
+  });
+}
+
+function bindTelemetryToTerminalState(input, store) {
+  const state = JSON.parse(readFileSync(input.statePath, "utf8"));
+  const evidence = store.evidence();
+  state.deployment.buffer.uploadWindows[0].startedAt = evidence.snapshot.startedAt;
+  state.deployment.buffer.uploadWindows[0].finishedAt = evidence.snapshot.finishedAt;
+  state.deployment.buffer.uploadWindows[0].telemetryEvidence = {
+    verdict: evidence.verdict,
+    sha256: evidence.sha256,
+  };
+  writeFileSync(input.statePath, `${JSON.stringify(state, null, 2)}\n`);
+  input.expected.stateSha256 = sha256(readFileSync(input.statePath));
+  return evidence;
 }
 
 test("atomic acquisition rejects contention and stores public metadata only", () => {
@@ -488,6 +522,132 @@ test("release archives atomically, preserves audit evidence and replays idempote
   assert.equal(existsSync(`${input.statePath}.upload-lease-operation-lock`), false);
   const second = releaseUploadLease(request, { processIsActive: () => false });
   assert.deepEqual(second, { command: "release-upload-lease", lifecycle: "ARCHIVED/RELEASED", executionId: EXECUTION_ID, evidenceHash: safe.evidenceHash, idempotent: true, stateMutation: false, onchainWrite: false });
+});
+
+test("release verifies existing telemetry bytes and canonical hash survive the archive rename", () => {
+  const input = fixture();
+  acquire(input);
+  const activeDirectory = leasePaths(input.statePath).activeDirectory;
+  const store = telemetryStore(activeDirectory);
+  const before = bindTelemetryToTerminalState(input, store);
+  const beforeBytes = readFileSync(join(activeDirectory, "telemetry.json"));
+  const safe = reconcileUploadLease(reconcileInput(input), { processIsActive: () => false });
+  const request = { ...reconcileInput(input), reconciliationHash: safe.evidenceHash, acknowledgement: "R4_RELEASE_UPLOAD_LEASE" };
+  releaseUploadLease(request, { processIsActive: () => false });
+
+  const archiveDirectory = leasePaths(input.statePath, EXECUTION_ID, safe.evidenceHash).archiveDirectory;
+  const after = readUploadTelemetry(archiveDirectory);
+  assert.equal(after.sha256, before.sha256);
+  assert.deepEqual(readFileSync(join(archiveDirectory, "telemetry.json")), beforeBytes);
+  assert.equal(store.evidence().verdict, "INCOMPLETE");
+});
+
+test("release fails closed if telemetry changes during the archive boundary", () => {
+  const input = fixture();
+  acquire(input);
+  const store = telemetryStore(leasePaths(input.statePath).activeDirectory);
+  bindTelemetryToTerminalState(input, store);
+  const safe = reconcileUploadLease(reconcileInput(input), { processIsActive: () => false });
+  const request = { ...reconcileInput(input), reconciliationHash: safe.evidenceHash, acknowledgement: "R4_RELEASE_UPLOAD_LEASE" };
+
+  assert.throws(() => releaseUploadLease(request, {
+    processIsActive: () => false,
+    renameSync(source, destination) {
+      renameSync(source, destination);
+      telemetryStore(destination).recordRpcEntry({
+        sequence: 1,
+        methodClass: "GET_ACCOUNT_INFO",
+        startMonotonicMs: 0,
+        endMonotonicMs: 10,
+        durationMs: 10,
+        outcome: "SUCCESS",
+        retryNumber: 0,
+        signaturePersisted: false,
+        mutationCapability: "read",
+      });
+    },
+  }), /telemetry.*archive|archive.*telemetry/i);
+});
+
+test("idempotent release fails closed when archived telemetry no longer matches terminal state", () => {
+  const input = fixture();
+  acquire(input);
+  const activeDirectory = leasePaths(input.statePath).activeDirectory;
+  const store = telemetryStore(activeDirectory);
+  bindTelemetryToTerminalState(input, store);
+  const safe = reconcileUploadLease(reconcileInput(input), { processIsActive: () => false });
+  const request = { ...reconcileInput(input), reconciliationHash: safe.evidenceHash, acknowledgement: "R4_RELEASE_UPLOAD_LEASE" };
+  releaseUploadLease(request, { processIsActive: () => false });
+
+  const archiveDirectory = leasePaths(input.statePath, EXECUTION_ID, safe.evidenceHash).archiveDirectory;
+  telemetryStore(archiveDirectory).recordRpcEntry({
+    sequence: 1,
+    methodClass: "GET_ACCOUNT_INFO",
+    startMonotonicMs: 0,
+    endMonotonicMs: 10,
+    durationMs: 10,
+    outcome: "SUCCESS",
+    retryNumber: 0,
+    signaturePersisted: false,
+    mutationCapability: "read",
+  });
+  assert.throws(
+    () => releaseUploadLease(request, { processIsActive: () => false }),
+    /telemetry.*state|state.*telemetry/i,
+  );
+});
+
+test("release rejects telemetry from a different execution or lease start", () => {
+  for (const scenario of [
+    { executionId: "foreign-execution", startedAt: "2026-07-01T00:00:00.000Z" },
+    { executionId: EXECUTION_ID, startedAt: "2026-07-02T00:00:00.000Z" },
+  ]) {
+    const input = fixture();
+    acquire(input);
+    const store = createUploadTelemetryStore({
+      directory: leasePaths(input.statePath).activeDirectory,
+      executionId: scenario.executionId,
+      startedAt: scenario.startedAt,
+      startMonotonicMs: 0,
+      policy: {
+        preSignCooldownMs: 3_000,
+        globalRequestStartGapMs: 500,
+        confirmationPollIntervalMs: 2_000,
+        rateLimitRetryScheduleMs: [2_000, 5_000],
+        interChunkDelayMs: 3_000,
+      },
+    });
+    bindTelemetryToTerminalState(input, store);
+    const safe = reconcileUploadLease(reconcileInput(input), { processIsActive: () => false });
+    assert.throws(() => releaseUploadLease({
+      ...reconcileInput(input),
+      reconciliationHash: safe.evidenceHash,
+      acknowledgement: "R4_RELEASE_UPLOAD_LEASE",
+    }, { processIsActive: () => false }), /telemetry.*execution|telemetry.*start|state binding/i);
+  }
+});
+
+test("release rejects telemetry with a terminal finish timestamp different from state", () => {
+  const input = fixture();
+  acquire(input);
+  const store = telemetryStore(leasePaths(input.statePath).activeDirectory);
+  store.finish({
+    finishedAt: "2026-07-01T00:00:01.000Z",
+    finishedMonotonicMs: 1_000,
+    expectedChunkIndexes: [],
+  });
+  bindTelemetryToTerminalState(input, store);
+  const state = JSON.parse(readFileSync(input.statePath, "utf8"));
+  state.deployment.buffer.uploadWindows[0].finishedAt = "2026-07-01T00:00:02.000Z";
+  writeFileSync(input.statePath, `${JSON.stringify(state, null, 2)}\n`);
+  input.expected.stateSha256 = sha256(readFileSync(input.statePath));
+
+  const safe = reconcileUploadLease(reconcileInput(input), { processIsActive: () => false });
+  assert.throws(() => releaseUploadLease({
+    ...reconcileInput(input),
+    reconciliationHash: safe.evidenceHash,
+    acknowledgement: "R4_RELEASE_UPLOAD_LEASE",
+  }, { processIsActive: () => false }), /telemetry.*finish|terminal.*timestamp/i);
 });
 
 test("release writes a matching audit receipt before the single atomic directory move", () => {

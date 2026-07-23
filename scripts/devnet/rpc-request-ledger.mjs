@@ -99,6 +99,8 @@ export function createRpcRequestLedger({ capacity = 256, monotonicNow = () => pe
   let nextSequence = 0;
   let completed = 0;
   let dropped = 0;
+  const subscribers = new Set();
+  const invocationStartSubscribers = new Set();
   const countsByOutcome = Object.fromEntries(RPC_OUTCOMES.map((outcome) => [outcome, 0]));
   const countsByMethod = Object.fromEntries(RPC_METHOD_CLASSES.map((method) => [method, 0]));
 
@@ -126,6 +128,7 @@ export function createRpcRequestLedger({ capacity = 256, monotonicNow = () => pe
       entries.shift();
       dropped += 1;
     }
+    for (const subscriber of subscribers) subscriber(entry);
     return entry;
   }
 
@@ -148,6 +151,19 @@ export function createRpcRequestLedger({ capacity = 256, monotonicNow = () => pe
       const startMonotonicMs = (options.invocationMonotonicNow ?? monotonicNow)();
       if (!Number.isFinite(startMonotonicMs)) throw new Error("RPC ledger monotonic clock is invalid");
       const boundary = Object.freeze({ sequence: requestSequence, startMonotonicMs, retryNumber: metadata.retryNumber });
+      const invocationStart = Object.freeze({
+        sequence: requestSequence,
+        methodClass: metadata.methodClass,
+        startMonotonicMs,
+        retryNumber: metadata.retryNumber,
+        signaturePersisted: metadata.signaturePersisted,
+        mutationCapability: metadata.mutationCapability,
+      });
+      try {
+        for (const subscriber of invocationStartSubscribers) subscriber(invocationStart);
+      } catch {
+        throw new Error("RPC ledger invocation-start subscriber failed");
+      }
       let pending;
       let synchronousError;
       try {
@@ -176,6 +192,16 @@ export function createRpcRequestLedger({ capacity = 256, monotonicNow = () => pe
     },
     debugSafeEntries() {
       return Object.freeze([...entries]);
+    },
+    subscribe(subscriber) {
+      if (typeof subscriber !== "function") throw new Error("RPC ledger subscriber is invalid");
+      subscribers.add(subscriber);
+      return () => subscribers.delete(subscriber);
+    },
+    subscribeInvocationStarts(subscriber) {
+      if (typeof subscriber !== "function") throw new Error("RPC ledger invocation-start subscriber is invalid");
+      invocationStartSubscribers.add(subscriber);
+      return () => invocationStartSubscribers.delete(subscriber);
     },
     summary() {
       return Object.freeze({

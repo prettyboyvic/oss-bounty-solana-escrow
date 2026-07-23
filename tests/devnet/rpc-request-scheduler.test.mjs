@@ -273,13 +273,18 @@ test("pre-sign cool-off waits at least 3000ms after the final preflight RPC", as
     clock.advance(25);
   });
   const finalReadCompletedAt = clock.now();
-  await scheduler.waitForCoolOff(3000);
+  const measurement = await scheduler.waitForCoolOff(3000);
   let blockhashStartedAt = -1;
   await scheduler.schedule(readMetadata("GET_LATEST_BLOCKHASH"), async () => {
     blockhashStartedAt = clock.now();
   });
   assert.ok(blockhashStartedAt - finalReadCompletedAt >= 3000);
   assert.deepEqual(clock.sleeps, [3000]);
+  assert.deepEqual(measurement, {
+    startedMonotonicMs: finalReadCompletedAt,
+    finishedMonotonicMs: finalReadCompletedAt + 3000,
+    elapsedMs: 3000,
+  });
   await scheduler.close();
 });
 

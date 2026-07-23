@@ -17,6 +17,7 @@ import {
 import { saveStateAtomic, validateChunkRecords } from "./state.mjs";
 import { createPlanFingerprint } from "./throttled-uploader.mjs";
 import { deriveMaxWritePayload } from "./upload-plan.mjs";
+import { readUploadTelemetry } from "./upload-execution-telemetry.mjs";
 
 const RECONCILIATION_PROOF_VERSION = "UPLOAD_LEASE_RECONCILIATION_V2";
 const ONCHAIN_PROOF_VERSION = "UPLOAD_LEASE_ONCHAIN_V1";
@@ -739,6 +740,37 @@ function completeReleaseReceipt(receipt, input, fresh) {
     receipt.leaseSha256 === fresh.leaseSha256;
 }
 
+function verifyTelemetryStateBinding(statePath, directory, executionId) {
+  const state = readJson(statePath);
+  const outcome = uniqueTerminalOutcome(state, executionId);
+  if (!outcome) throw new Error("telemetry terminal state is missing");
+  const evidence = readUploadTelemetry(directory);
+  const reference = outcome.telemetryEvidence;
+  if (reference === undefined) {
+    if (evidence.availability === "UNAVAILABLE") return evidence;
+    throw new Error("telemetry state reference is missing");
+  }
+  if (!exactKeys(reference, ["sha256", "verdict"]) ||
+      !["COMPLETE", "INCOMPLETE"].includes(reference.verdict) ||
+      !HEX_64.test(reference.sha256) ||
+      evidence.availability !== "AVAILABLE" ||
+      evidence.verdict !== reference.verdict ||
+      evidence.sha256 !== reference.sha256) {
+    throw new Error("telemetry state binding is invalid");
+  }
+  const lease = readJson(join(directory, "lease.json"));
+  if (evidence.snapshot.executionId !== executionId ||
+      evidence.snapshot.executionId !== lease.executionId ||
+      evidence.snapshot.startedAt !== outcome.startedAt ||
+      evidence.snapshot.startedAt !== lease.startedAt) {
+    throw new Error("telemetry execution/start binding is invalid");
+  }
+  if ((evidence.snapshot.finishedAt ?? null) !== (outcome.finishedAt ?? null)) {
+    throw new Error("telemetry terminal finish timestamp binding is invalid");
+  }
+  return evidence;
+}
+
 export function releaseUploadLease(input, adapters = {}) {
   if (input.acknowledgement !== RELEASE_LEASE_ACKNOWLEDGEMENT) {
     throw new Error("explicit lease-release acknowledgement is required");
@@ -761,6 +793,11 @@ export function releaseUploadLease(input, adapters = {}) {
     if (!fresh.releaseReady || fresh.proposedTransitions.length !== 0) {
       throw new Error("reconciliation transitions must be applied before lease release; evidence is not release-ready");
     }
+    const telemetryBefore = verifyTelemetryStateBinding(
+      input.statePath,
+      directory,
+      input.executionId,
+    );
     if (!activeExists) {
       let receipt;
       try {
@@ -809,11 +846,34 @@ export function releaseUploadLease(input, adapters = {}) {
     }
 
     const rename = adapters.renameSync ?? nodeRenameSync;
+    const telemetryBytesBefore = telemetryBefore.availability === "AVAILABLE"
+      ? readFileSync(join(paths.activeDirectory, "telemetry.json"))
+      : null;
     try {
       rename(paths.activeDirectory, paths.archiveDirectory);
     } catch {
       throw new Error("atomic lease archive failed");
     }
+    if (telemetryBefore.availability === "AVAILABLE") {
+      let telemetryAfter;
+      let telemetryBytesAfter;
+      try {
+        telemetryAfter = readUploadTelemetry(paths.archiveDirectory);
+        telemetryBytesAfter = readFileSync(join(paths.archiveDirectory, "telemetry.json"));
+      } catch {
+        throw new Error("telemetry archive integrity verification failed");
+      }
+      if (telemetryAfter.availability !== "AVAILABLE" ||
+          telemetryAfter.sha256 !== telemetryBefore.sha256 ||
+          !telemetryBytesAfter.equals(telemetryBytesBefore)) {
+        throw new Error("telemetry archive integrity verification failed");
+      }
+    }
+    verifyTelemetryStateBinding(
+      input.statePath,
+      paths.archiveDirectory,
+      input.executionId,
+    );
     return {
       command: "release-upload-lease",
       lifecycle: "ARCHIVED/RELEASED",
