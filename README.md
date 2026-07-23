@@ -59,9 +59,10 @@ reference hash is stored in the escrow account.
 
 ## Current verification
 
-The sole R4L five-chunk window finalized chunks 259-263, leaving 264
-`CONFIRMED`, 127 `PLANNED`, and zero `SENT` or `UNKNOWN` chunks. Chunk 264
-remains `PLANNED` with a null signature, and the program remains absent.
+The sole R4L five-chunk window finalized chunks 259-263. A total of 264 chunks
+are `CONFIRMED` and 127 are `PLANNED`, with zero `SENT` or `UNKNOWN` chunks.
+Chunk index 264 remains `PLANNED` with a null signature, and the program
+remains absent.
 Live telemetry was `COMPLETE`: its canonical hash matched the terminal state,
 measured pacing policies passed, and the artifact was preserved byte-for-byte
 through archive. Fresh reconciliation returned `SAFE_TO_RELEASE` with
@@ -71,6 +72,13 @@ lease release returned `ARCHIVED/RELEASED`, leaving no active lease.
 R4L used exactly one uploader invocation and did not retry, replay, finalize,
 deploy, or close the buffer. See the
 [R4L checkpoint](docs/PHASE_2_R4L_CHECKPOINT_2026-07-23.md).
+
+R4M is permanently blocked as `R4M_POST_INVOCATION_BLOCKED_PRE_LEASE_NOOP`.
+Its sole uploader invocation was terminated at the external execution boundary
+before lease acquisition, signing, sending, or telemetry creation. State and
+buffer evidence remained unchanged, R4M replay is forbidden, and any future
+live window requires a separately authorized R4N gate. See the
+[R4M blocked report](docs/PHASE_2_R4M_BLOCKED_2026-07-23.md).
 
 R4K remains permanently evidence-blocked even though its on-chain window and
 local reconciliation/release succeeded. Its missing timing measurements remain
