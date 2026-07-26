@@ -20,16 +20,23 @@ const UPLOAD_ARGS = [
   "--authority", "IGNORED_TEST_AUTHORITY_PATH",
   "--max-chunks", "5",
   "--delay-ms", "3000",
+  "--rpc-request-timeout-ms", "15000",
   "--acknowledge-devnet-write", "R4_BUFFER_UPLOAD",
 ];
 
-function supervisorArgs(timeoutMs = 120_000) {
-  return ["--timeout-ms", String(timeoutMs), "--", ...UPLOAD_ARGS];
+function supervisorArgs(timeoutMs = 120_000, cleanupTimeoutMs = 5_000) {
+  return [
+    "--timeout-ms", String(timeoutMs),
+    "--cleanup-timeout-ms", String(cleanupTimeoutMs),
+    "--",
+    ...UPLOAD_ARGS,
+  ];
 }
 
 test("parses an explicit millisecond timeout without unit conversion", () => {
   const parsed = parseUploadProcessSupervisorArgs(supervisorArgs(120_000));
   assert.equal(parsed.timeoutMs, 120_000);
+  assert.equal(parsed.cleanupTimeoutMs, 5_000);
   assert.deepEqual(parsed.uploaderArgs, UPLOAD_ARGS);
 });
 
@@ -37,7 +44,7 @@ test("rejects invalid timeout values before uploader invocation", async () => {
   for (const value of ["", "0", "-1", "1.5", "1000", "2147483648", "10s"]) {
     let invocations = 0;
     await assert.rejects(
-      superviseUploadProcess(["--timeout-ms", value, "--", ...UPLOAD_ARGS], {
+      superviseUploadProcess(["--timeout-ms", value, "--cleanup-timeout-ms", "5000", "--", ...UPLOAD_ARGS], {
         runProcess: async () => {
           invocations += 1;
           return { timedOut: false, exitCode: 0, signal: null };
@@ -50,12 +57,43 @@ test("rejects invalid timeout values before uploader invocation", async () => {
   assert.equal(MIN_UPLOAD_PROCESS_TIMEOUT_MS, 3_000);
 });
 
+test("cleanup timeout is explicit, positive and bound to the owned process call", async () => {
+  for (const value of ["", "0", "-1", "1.5", "2147483648"]) {
+    await assert.rejects(
+      superviseUploadProcess([
+        "--timeout-ms", "120000",
+        "--cleanup-timeout-ms", value,
+        "--",
+        ...UPLOAD_ARGS,
+      ], { runProcess: async () => assert.fail("must not spawn") }),
+      /cleanup timeout/i,
+    );
+  }
+  let processInput;
+  await superviseUploadProcess(supervisorArgs(120_000, 4_321), {
+    runProcess: async (input) => {
+      processInput = input;
+      return {
+        timedOut: false,
+        exitCode: 0,
+        signal: null,
+        cleanupCompleted: true,
+        runtimeElapsedMs: 1,
+        cleanupElapsedMs: 0,
+      };
+    },
+  });
+  assert.equal(processInput.timeoutMs, 120_000);
+  assert.equal(processInput.cleanupTimeoutMs, 4_321);
+});
+
 test("allows a valid child to initialize for more than one second", async () => {
   const started = performance.now();
   const result = await runOwnedProcess({
     command: process.execPath,
     args: ["-e", "setTimeout(() => process.exit(0), 1200)"],
     timeoutMs: 4_000,
+    cleanupTimeoutMs: 1_000,
   });
   const elapsedMs = performance.now() - started;
   assert.equal(result.timedOut, false);
@@ -71,6 +109,7 @@ test("a real timeout remains bounded and invokes the owned process once", async 
     command: process.execPath,
     args: ["-e", "setTimeout(() => process.exit(0), 10000)"],
     timeoutMs: 250,
+    cleanupTimeoutMs: 1_000,
     onSpawn: () => { invocations += 1; },
   });
   const elapsedMs = performance.now() - started;
@@ -99,6 +138,7 @@ test("timeout cleanup terminates the owned process tree", async () => {
       command: process.execPath,
       args: [childScript],
       timeoutMs: 500,
+      cleanupTimeoutMs: 1_000,
     });
     assert.equal(result.timedOut, true);
     const grandchildPid = Number(readFileSync(pidPath, "utf8"));
@@ -133,6 +173,12 @@ test("pre-lease timeout is blocked without fabricated execution evidence or retr
     perChunkResults: [],
     childExitCode: null,
     childSignal: "SIGTERM",
+    innerRuntimeTimeoutMs: 120_000,
+    innerCleanupTimeoutMs: 5_000,
+    timerOrigin: "IMMEDIATELY_BEFORE_CHILD_SPAWN",
+    runtimeElapsedMs: null,
+    cleanupElapsedMs: null,
+    cleanupCompleted: true,
   });
 });
 
@@ -168,10 +214,17 @@ test("successful child behavior is preserved without a second invocation", async
   assert.match(processInput.args[0], /upload-buffer-cli\.mjs$/);
   assert.deepEqual(processInput.args.slice(1), UPLOAD_ARGS);
   assert.equal(processInput.timeoutMs, 120_000);
+  assert.equal(processInput.cleanupTimeoutMs, 5_000);
   assert.deepEqual(result, {
     classification: "UPLOAD_PROCESS_EXITED",
     uploaderInvocationCount: 1,
     childExitCode: 0,
     childSignal: null,
+    innerRuntimeTimeoutMs: 120_000,
+    innerCleanupTimeoutMs: 5_000,
+    timerOrigin: "IMMEDIATELY_BEFORE_CHILD_SPAWN",
+    runtimeElapsedMs: null,
+    cleanupElapsedMs: null,
+    cleanupCompleted: true,
   });
 });

@@ -322,3 +322,109 @@ test("bounded queue rejects overflow without starting the rejected request", asy
   await Promise.all([active, queued]);
   await scheduler.close();
 });
+
+test("request timeout configuration rejects zero, negative, fractional and unsafe values", () => {
+  for (const requestTimeoutMs of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(
+      () => createRpcRequestScheduler({ requestTimeoutMs }),
+      /request timeout/i,
+    );
+  }
+});
+
+test("hanging retry-safe reads time out distinctly and retain the bounded retry schedule", { timeout: 2_000 }, async () => {
+  const starts = [];
+  let aborts = 0;
+  const scheduler = createRpcRequestScheduler({
+    requestTimeoutMs: 20,
+    minimumRequestStartGapMs: 0,
+    retryBackoffMs: [1, 1],
+  });
+  await assert.rejects(
+    scheduler.schedule(readMetadata("GET_ACCOUNT_INFO"), ({ signal }) => {
+      starts.push(performance.now());
+      signal.addEventListener("abort", () => { aborts += 1; }, { once: true });
+      return new Promise(() => {});
+    }),
+    (error) => error.classification === "RPC_REQUEST_TIMEOUT" &&
+      error.methodClass === "GET_ACCOUNT_INFO",
+  );
+  assert.equal(starts.length, 3);
+  assert.equal(aborts, 3);
+  assert.deepEqual(
+    scheduler.ledger.debugSafeEntries().map(({ outcome, retryNumber }) => ({ outcome, retryNumber })),
+    [
+      { outcome: "RPC_REQUEST_TIMEOUT", retryNumber: 0 },
+      { outcome: "RPC_REQUEST_TIMEOUT", retryNumber: 1 },
+      { outcome: "RPC_REQUEST_TIMEOUT", retryNumber: 2 },
+    ],
+  );
+  await scheduler.close();
+});
+
+test("remaining operation deadline blocks an impossible attempt before invocation", async () => {
+  let invoked = false;
+  const scheduler = createRpcRequestScheduler({
+    requestTimeoutMs: 100,
+    monotonicNow: () => 1_000,
+    sleep: async () => {},
+  });
+  await assert.rejects(
+    scheduler.schedule(readMetadata(), async () => { invoked = true; }, {
+      deadlineMonotonicMs: 1_149,
+      requiredCleanupMs: 50,
+    }),
+    (error) => error.classification === "RPC_DEADLINE_EXHAUSTED",
+  );
+  assert.equal(invoked, false);
+  assert.equal(scheduler.ledger.summary().totalRecorded, 0);
+  await scheduler.close();
+});
+
+test("send timeout is ambiguous and never triggers an automatic resend", { timeout: 2_000 }, async () => {
+  let sends = 0;
+  const scheduler = createRpcRequestScheduler({
+    requestTimeoutMs: 20,
+    minimumRequestStartGapMs: 0,
+  });
+  await assert.rejects(
+    scheduler.schedule({
+      methodClass: "SEND_RAW_TRANSACTION",
+      mutationCapability: "write",
+      signaturePersisted: true,
+    }, () => {
+      sends += 1;
+      return new Promise(() => {});
+    }),
+    (error) => error.classification === "RPC_REQUEST_TIMEOUT" &&
+      error.signaturePersisted === true,
+  );
+  assert.equal(sends, 1);
+  assert.equal(scheduler.ledger.summary().countsByOutcome.RPC_REQUEST_TIMEOUT, 1);
+  await scheduler.close();
+});
+
+test("success, rate limiting and transport failure remain distinct from timeout", async () => {
+  const scheduler = createRpcRequestScheduler({
+    requestTimeoutMs: 100,
+    minimumRequestStartGapMs: 0,
+    retryBackoffMs: [1, 1],
+  });
+  assert.equal(await scheduler.schedule(readMetadata(), async () => 42), 42);
+  await assert.rejects(
+    scheduler.schedule(readMetadata(), async () => {
+      throw Object.assign(new Error("rate limited"), { status: 429 });
+    }),
+    (error) => error.classification === "RPC_RATE_LIMITED",
+  );
+  await assert.rejects(
+    scheduler.schedule(readMetadata(), async () => { throw new Error("transport down"); }),
+    (error) => error.classification === "RPC_ERROR",
+  );
+  const outcomes = scheduler.ledger.summary().countsByOutcome;
+  assert.equal(outcomes.SUCCESS, 1);
+  assert.equal(outcomes.RPC_RATE_LIMITED, 3);
+  assert.equal(outcomes.RPC_ERROR, 1);
+  assert.equal(outcomes.RPC_REQUEST_TIMEOUT, 0);
+  await scheduler.close();
+});

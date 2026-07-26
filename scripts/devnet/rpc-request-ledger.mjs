@@ -13,7 +13,12 @@ export const RPC_METHOD_CLASSES = Object.freeze([
   "SEND_RAW_TRANSACTION",
 ]);
 
-export const RPC_OUTCOMES = Object.freeze(["SUCCESS", "RPC_RATE_LIMITED", "RPC_ERROR"]);
+export const RPC_OUTCOMES = Object.freeze([
+  "SUCCESS",
+  "RPC_RATE_LIMITED",
+  "RPC_REQUEST_TIMEOUT",
+  "RPC_ERROR",
+]);
 
 const METHOD_SET = new Set(RPC_METHOD_CLASSES);
 const METADATA_KEYS = ["methodClass", "mutationCapability", "retryNumber", "signaturePersisted"];
@@ -58,7 +63,11 @@ function validateMetadata(metadata) {
 
 class SafeRpcRequestError extends Error {
   constructor(entry) {
-    super(entry.outcome === "RPC_RATE_LIMITED" ? "RPC rate limited" : "RPC request failed");
+    super(entry.outcome === "RPC_RATE_LIMITED"
+      ? "RPC rate limited"
+      : entry.outcome === "RPC_REQUEST_TIMEOUT"
+        ? "RPC request timed out"
+        : "RPC request failed");
     this.name = "SafeRpcRequestError";
     this.classification = entry.outcome;
     this.methodClass = entry.methodClass;
@@ -182,7 +191,11 @@ export function createRpcRequestLedger({ capacity = 256, monotonicNow = () => pe
         if (synchronousError) throw synchronousError;
         result = await pending;
       } catch (error) {
-        const outcome = containsRateLimit(error) ? "RPC_RATE_LIMITED" : "RPC_ERROR";
+        const outcome = error?.code === "RPC_REQUEST_TIMEOUT"
+          ? "RPC_REQUEST_TIMEOUT"
+          : containsRateLimit(error)
+            ? "RPC_RATE_LIMITED"
+            : "RPC_ERROR";
         const entry = append(requestSequence, metadata, startMonotonicMs, monotonicNow(), outcome);
         throw new SafeRpcRequestError(entry);
       }

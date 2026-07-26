@@ -178,6 +178,7 @@ test("missing acknowledgement fails before config, signer, blockhash or send acc
       "--authority", ".devnet/authority.json",
       "--max-chunks", "5",
       "--delay-ms", "1000",
+      "--rpc-request-timeout-ms", "15000",
     ], dependencies),
     /acknowledgement/,
   );
@@ -270,6 +271,7 @@ test("successful resume output preserves sixteen or more public skipped chunk in
     "--authority", ".devnet/authority.json",
     "--max-chunks", "5",
     "--delay-ms", "1000",
+    "--rpc-request-timeout-ms", "15000",
     "--acknowledge-devnet-write", "R4_BUFFER_UPLOAD",
   ], {
     repoRoot: join(tmpdir(), "upload-cli-resume-root"),
@@ -299,6 +301,7 @@ test("upload output exposes only the closed sanitized RPC timing policy", async 
     globalRequestStartGapMs: 500,
     confirmationPollIntervalMs: 2000,
     rateLimitRetryScheduleMs: [2000, 5000],
+    requestTimeoutMs: 15000,
   };
   const result = await main([
     "upload-buffer-throttled",
@@ -309,6 +312,7 @@ test("upload output exposes only the closed sanitized RPC timing policy", async 
     "--authority", ".devnet/authority.json",
     "--max-chunks", "3",
     "--delay-ms", "3000",
+    "--rpc-request-timeout-ms", "15000",
     "--acknowledge-devnet-write", "R4_BUFFER_UPLOAD",
   ], {
     repoRoot: join(tmpdir(), "upload-cli-policy-root"),

@@ -19,6 +19,7 @@ const LIVE_KEYS = new Set([
   "authority",
   "max-chunks",
   "delay-ms",
+  "rpc-request-timeout-ms",
   "acknowledge-devnet-write",
 ]);
 const INSPECT_KEYS = new Set(["state", "binary"]);
@@ -78,6 +79,12 @@ export function parseUploadCommand(argv) {
     authority: values.authority,
     maxChunks: parseInteger(values["max-chunks"], "maxChunks", 1, MAX_UPLOAD_CHUNKS),
     delayMs: parseInteger(values["delay-ms"], "delayMs", MIN_UPLOAD_DELAY_MS),
+    requestTimeoutMs: parseInteger(
+      values["rpc-request-timeout-ms"],
+      "requestTimeoutMs",
+      1,
+      2_147_483_647,
+    ),
     acknowledgement: values["acknowledge-devnet-write"],
   };
 }
@@ -191,12 +198,19 @@ const UPLOAD_RESULT_KEYS = [
 ];
 const CONFIRMATION_KEYS = ["chunkIndex", "confirmationDurationMs"];
 const UPLOAD_RESULT_STATUSES = new Set(["COMPLETE", "WINDOW_LIMIT", "RATE_LIMITED", "CONFIRMED_FAILURE", "UNKNOWN"]);
-const RPC_REQUEST_POLICY_KEYS = ["confirmationPollIntervalMs", "globalRequestStartGapMs", "rateLimitRetryScheduleMs"];
+const RPC_REQUEST_POLICY_KEYS = [
+  "confirmationPollIntervalMs",
+  "globalRequestStartGapMs",
+  "rateLimitRetryScheduleMs",
+  "requestTimeoutMs",
+];
 
 function isSafeRpcRequestPolicy(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) &&
     Object.keys(value).sort().join("\0") === [...RPC_REQUEST_POLICY_KEYS].sort().join("\0") &&
     value.globalRequestStartGapMs === 500 &&
+    Number.isSafeInteger(value.requestTimeoutMs) &&
+    value.requestTimeoutMs > 0 &&
     value.confirmationPollIntervalMs === 2_000 &&
     Array.isArray(value.rateLimitRetryScheduleMs) &&
     value.rateLimitRetryScheduleMs.length === 2 &&

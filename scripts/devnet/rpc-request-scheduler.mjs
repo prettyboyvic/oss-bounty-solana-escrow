@@ -4,6 +4,7 @@ import { createRpcRequestLedger } from "./rpc-request-ledger.mjs";
 
 const DEFAULT_REQUEST_START_GAP_MS = 500;
 const DEFAULT_RETRY_BACKOFF_MS = Object.freeze([2000, 5000]);
+export const DEFAULT_RPC_REQUEST_TIMEOUT_MS = 15_000;
 
 function defaultSleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -20,8 +21,11 @@ export function createRpcRequestScheduler({
   ledgerCapacity = 256,
   minimumRequestStartGapMs = DEFAULT_REQUEST_START_GAP_MS,
   retryBackoffMs = DEFAULT_RETRY_BACKOFF_MS,
+  requestTimeoutMs = DEFAULT_RPC_REQUEST_TIMEOUT_MS,
   monotonicNow = () => performance.now(),
   sleep = defaultSleep,
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
   ledger,
 } = {}) {
   validateDelay(queueCapacity, "RPC scheduler queue capacity");
@@ -31,8 +35,13 @@ export function createRpcRequestScheduler({
     throw new Error("RPC scheduler retry policy is invalid");
   }
   retryBackoffMs.forEach((delay) => validateDelay(delay, "RPC scheduler retry delay"));
-  if (typeof monotonicNow !== "function" || typeof sleep !== "function") {
-    throw new Error("RPC scheduler clock and sleeper are required");
+  validateDelay(requestTimeoutMs, "RPC scheduler request timeout");
+  if (requestTimeoutMs > 2_147_483_647) {
+    throw new Error("RPC scheduler request timeout is invalid");
+  }
+  if (typeof monotonicNow !== "function" || typeof sleep !== "function" ||
+      typeof setTimer !== "function" || typeof clearTimer !== "function") {
+    throw new Error("RPC scheduler clock, sleeper and timers are required");
   }
 
   const requestLedger = ledger ?? createRpcRequestLedger({ capacity: ledgerCapacity, monotonicNow });
@@ -107,9 +116,40 @@ export function createRpcRequestScheduler({
         retryNumber === 0 ? item.notBeforeMonotonicMs : undefined,
       );
       if (aborted) throw abortError;
+      const attemptReadyAt = readMonotonic();
+      if (
+        item.deadlineMonotonicMs !== undefined &&
+        attemptReadyAt + requestTimeoutMs + item.requiredCleanupMs > item.deadlineMonotonicMs
+      ) {
+        const error = new Error("RPC operation deadline cannot accommodate another request attempt");
+        error.classification = "RPC_DEADLINE_EXHAUSTED";
+        error.methodClass = item.metadata.methodClass;
+        error.signaturePersisted = item.metadata.signaturePersisted;
+        throw error;
+      }
       let observerError = null;
       try {
-        const result = await requestLedger.record({ ...item.metadata, retryNumber }, item.operation, {
+        const result = await requestLedger.record({ ...item.metadata, retryNumber }, () => {
+          const controller = new AbortController();
+          let timer;
+          const timeout = new Promise((resolve, reject) => {
+            timer = setTimer(() => {
+              controller.abort();
+              const error = new Error("RPC request attempt timed out");
+              error.code = "RPC_REQUEST_TIMEOUT";
+              reject(error);
+            }, requestTimeoutMs);
+          });
+          let operation;
+          try {
+            operation = Promise.resolve(item.operation(Object.freeze({
+              signal: controller.signal,
+            })));
+          } catch (error) {
+            operation = Promise.reject(error);
+          }
+          return Promise.race([operation, timeout]).finally(() => clearTimer(timer));
+        }, {
           invocationMonotonicNow: readMonotonic,
           onInvocationStart(boundary) {
             lastRequestStartMs = boundary.startMonotonicMs;
@@ -132,7 +172,12 @@ export function createRpcRequestScheduler({
           markAborted(observerError);
           throw observerError;
         }
-        if (!retryAllowed || error?.classification !== "RPC_RATE_LIMITED" || retryNumber >= retryBackoffMs.length || aborted) {
+        if (
+          !retryAllowed ||
+          !["RPC_RATE_LIMITED", "RPC_REQUEST_TIMEOUT"].includes(error?.classification) ||
+          retryNumber >= retryBackoffMs.length ||
+          aborted
+        ) {
           throw error;
         }
         await waitUntil(lastRequestCompletionMs + retryBackoffMs[retryNumber]);
@@ -163,14 +208,32 @@ export function createRpcRequestScheduler({
 
   return Object.freeze({
     ledger: requestLedger,
-    schedule(metadata, operation, { beforeAttempt, notBeforeMonotonicMs, onInvocationStart } = {}) {
+    schedule(metadata, operation, {
+      beforeAttempt,
+      deadlineMonotonicMs,
+      notBeforeMonotonicMs,
+      onInvocationStart,
+      requiredCleanupMs = 0,
+    } = {}) {
       if (closed || aborted) return Promise.reject(abortError ?? new Error("RPC scheduler is closed"));
       if (typeof operation !== "function") return Promise.reject(new Error("RPC scheduler operation is required"));
       if (beforeAttempt !== undefined && typeof beforeAttempt !== "function") return Promise.reject(new Error("RPC scheduler before-attempt guard is invalid"));
       if (notBeforeMonotonicMs !== undefined && !Number.isFinite(notBeforeMonotonicMs)) return Promise.reject(new Error("RPC scheduler not-before time is invalid"));
+      if (deadlineMonotonicMs !== undefined && !Number.isFinite(deadlineMonotonicMs)) return Promise.reject(new Error("RPC scheduler deadline is invalid"));
+      if (!Number.isSafeInteger(requiredCleanupMs) || requiredCleanupMs < 0) return Promise.reject(new Error("RPC scheduler required cleanup allowance is invalid"));
       if (onInvocationStart !== undefined && typeof onInvocationStart !== "function") return Promise.reject(new Error("RPC scheduler invocation observer is invalid"));
       if (queue.length >= queueCapacity) return Promise.reject(new Error("RPC scheduler queue capacity exceeded"));
-      const promise = new Promise((resolve, reject) => queue.push({ metadata, operation, beforeAttempt, notBeforeMonotonicMs, onInvocationStart, resolve, reject }));
+      const promise = new Promise((resolve, reject) => queue.push({
+        metadata,
+        operation,
+        beforeAttempt,
+        deadlineMonotonicMs,
+        notBeforeMonotonicMs,
+        onInvocationStart,
+        requiredCleanupMs,
+        resolve,
+        reject,
+      }));
       void pump();
       return promise;
     },
@@ -205,6 +268,7 @@ export function createRpcRequestScheduler({
         queueCapacity,
         ledgerCapacity,
         minimumRequestStartGapMs,
+        requestTimeoutMs,
         retryBackoffMs: Object.freeze([...retryBackoffMs]),
       });
     },

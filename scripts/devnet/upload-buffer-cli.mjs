@@ -99,7 +99,9 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
       binaryPath: resolve(repoRoot, "target", "sbf-solana-solana", "release", "oss_bounty_escrow.so"),
     };
     const execute = dependencies.executeUploadWindow ?? executeUploadWindow;
-    const runtime = dependencies.executionDependencies ?? createProductionUploadDependencies(parsed.url);
+    const runtime = dependencies.executionDependencies ?? createProductionUploadDependencies(parsed.url, {
+      requestTimeoutMs: parsed.requestTimeoutMs,
+    });
     try {
       return sanitizeExecutionOutput(await execute(request, runtime));
     } catch (error) {

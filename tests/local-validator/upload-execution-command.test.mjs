@@ -402,6 +402,7 @@ test("production entrypoint covers scheduler pacing, injected 429 recovery and c
     assert.equal(normalResult.status, "COMPLETE");
     assert.deepEqual(normalResult.rpcRequestPolicy, {
       globalRequestStartGapMs: 500,
+      requestTimeoutMs: 15_000,
       confirmationPollIntervalMs: 2000,
       rateLimitRetryScheduleMs: [2000, 5000],
     });

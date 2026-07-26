@@ -19,21 +19,26 @@ invocation of either the uploader or inner supervisor is forbidden:
 ```text
 node scripts/devnet/upload-window-host.mjs \
   --execution-id <separately-authorized-single-use-id> \
-  --outer-timeout-ms <explicitly-authorized-outer-milliseconds> \
-  --cleanup-allowance-ms <explicitly-authorized-cleanup-milliseconds> \
+  --child-lifecycle-timeout-ms <authorized-child-lifecycle-milliseconds> \
+  --outer-cleanup-allowance-ms <authorized-outer-cleanup-milliseconds> \
+  --finalization-timeout-ms <authorized-finalization-milliseconds> \
+  --host-total-timeout-ms <authorized-total-host-milliseconds> \
   --result-root .devnet/upload-window-host-results \
   --expected-repository-sha <exact-authorized-commit> \
   --expected-state-sha <fresh-state-sha256> \
   --expected-buffer-sha <fresh-finalized-buffer-sha256> \
   --expected-binary-sha <fresh-binary-sha256> \
   --expected-plan-fingerprint <fresh-plan-fingerprint> \
+  --expected-candidate-evidence-sha <R4_CANDIDATE_EVIDENCE_V1-sha256> \
   --expected-candidates <fresh-inclusive-range> \
   --expected-invocations 1 \
   -- \
   <exact-node-executable> scripts/devnet/upload-process-supervisor.mjs \
     --timeout-ms <explicitly-authorized-inner-milliseconds> \
+    --cleanup-timeout-ms <explicitly-authorized-inner-cleanup-milliseconds> \
     -- \
-    upload-buffer-throttled <exact-R4N-uploader-arguments>
+    upload-buffer-throttled <exact-R4N-uploader-arguments> \
+      --rpc-request-timeout-ms <authorized-per-attempt-milliseconds>
 ```
 
 The host verifies the immutable manifest before child spawn, requires
@@ -43,11 +48,19 @@ ID is consumed permanently once that directory is created, including after
 host failure or crash. The host never retries, resumes, respawns, or starts a
 replacement child.
 
-The outer timeout is enforced by repository code using a monotonic timer. It
-must be strictly greater than the inner timeout plus the explicit cleanup
-allowance. All values have no live default and must be selected by the later
-authorization in integer milliseconds. The earlier `879500`, `5000`, and
-`889500` values remain unapproved proposals and are not embedded in the host.
+The nested command itself binds inner runtime, inner cleanup, and RPC request
+timeout. The host separately binds child lifecycle, outer cleanup, durable
+finalization, and total-host values. Before spawn, code requires:
+
+```text
+CHILD_LIFECYCLE > INNER_RUNTIME + INNER_CLEANUP
+HOST_TOTAL > CHILD_LIFECYCLE + OUTER_CLEANUP + FINALIZATION
+HOST_TOTAL > INNER_RUNTIME + INNER_CLEANUP + OUTER_CLEANUP + FINALIZATION
+```
+
+The absolute monotonic host timeline begins immediately before the authorized
+child spawn. Repository verification, authorization persistence, and final
+local revalidation are explicitly pre-spawn and outside that timeline.
 
 Durable host evidence is outside the upload-lease lifecycle:
 
@@ -62,6 +75,54 @@ Durable host evidence is outside the upload-lease lifecycle:
 `.devnet/state.json.upload-lease/telemetry.json` is not the durable host
 result. `host-result.json` is written atomically only after child cleanup and
 both log streams close.
+
+Log closure, terminal parsing, log hashing, atomic result persistence,
+file/directory flush, and preparation of the pre-emission terminal envelope
+are covered by the finalization allowance. Node synchronous filesystem calls
+cannot be cancelled mid-call; the host checks the monotonic deadline
+immediately before and after each call and overwrites provisional success
+fail-closed with `HOST_FINALIZATION_TIMEOUT`. The persisted result is the
+pre-emission state; stdout emission occurs only afterward.
+
+## Canonical candidate evidence
+
+The future manifest must use repository-produced
+`R4_CANDIDATE_EVIDENCE_V1`. Canonical JSON has exact top-level order `schema`,
+`stateSha256`, `binarySha256`, `planFingerprint`, `candidateCount`,
+`candidates`. Candidate fields are exactly `index`, `offset`, `length`,
+`payloadSha256`, `serializedTransactionBytes`, `expectedState`,
+`expectedSignature`, in ascending index order. Integers use base-10 JSON
+integer syntax; null is literal `null`; there is no whitespace or newline.
+SHA-256 input is UTF-8 `R4_CANDIDATE_EVIDENCE_V1`, one NUL byte, then the
+canonical JSON bytes. Duplicate, malformed, unsorted, missing, or extra fields
+fail closed.
+
+The historical digest
+`6554cbe1ad09b9e621a709dde9c4fb2f59404a8d2a8551a133552fe2ef345180`
+is `LEGACY_NON_REPRODUCIBLE` and must not be used by R4N. The
+repository-generated digest for the unchanged baseline candidates 264-268 is
+`9b77aa9af1f5885f20eb914f5fed6fb352f1b58e68767e2ed85ee5b85ed8ad44`.
+This is non-authorizing repair evidence only and must be recomputed after the
+repair commit.
+
+## RPC timeout and retry safety
+
+The live uploader CLI requires `--rpc-request-timeout-ms`. Every scheduler
+attempt has a finite monotonic duration bound and receives an `AbortSignal`;
+transports that support it terminate the underlying request. Timeout is
+`RPC_REQUEST_TIMEOUT`, distinct from rate limiting and other RPC/transport
+errors. Retry-safe reads retain the existing two retries and 2000/5000 ms
+backoffs. An attempt cannot start if its timeout plus required cleanup does not
+fit the supplied operation deadline.
+
+Web3 transports that do not accept an abort signal can settle later in the
+background; the scheduler still stops awaiting them at the bound. A write in
+that state is ambiguous and is never treated as cancelled or safe to resend.
+
+`SEND_RAW_TRANSACTION` is never retried after timeout. Its persisted signature
+remains an ambiguous outcome eligible only for the existing read-only
+reconciliation path. Telemetry V2 retains per-request duration and the derived
+`requestTimeoutCount`; legacy V1 telemetry remains readable.
 
 ## R4N gate
 
@@ -80,8 +141,8 @@ A separately authorized R4N session must:
 6. Select exactly chunks 264-268 only if state still contains 264 confirmed
    chunks, 127 planned chunks, zero `SENT`, zero `UNKNOWN`, and chunk index 264
    remains `PLANNED` with a null signature. Otherwise stop before signer load.
-7. Record explicit inner-supervisor and outer-host timeout values in
-   milliseconds and prove the outer boundary outlives the inner boundary.
+7. Record all six host/supervisor timeout components plus the RPC request
+   timeout and prove the complete arithmetic above.
 8. Invoke the outer host exactly once with a new single-use execution ID. The
    host may spawn the inner supervisor at most once. Never retry, replay,
    re-sign, resend, or start a second child after success, error, timeout, rate
@@ -115,6 +176,10 @@ Before `READY_FOR_SEPARATE_AUTHORIZATION`:
   cooldown/funding fact, and exact timeout value against that commit.
 
 The later R4N authorization must additionally supply the exact supervisor and
-outer-host timeout values, cleanup allowance, execution ID, result root, and
+outer-host timeout values, both cleanup allowances, finalization allowance,
+total deadline, request timeout, canonical candidate digest, execution ID,
+result root, and
 approve the one bounded live invocation. This plan and implementation supply
 no such authorization.
+
+This repair does not authorize R4N.

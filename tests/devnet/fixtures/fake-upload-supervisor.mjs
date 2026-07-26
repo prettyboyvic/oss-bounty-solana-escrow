@@ -25,6 +25,12 @@ if (mode === "host-deadline-probe") {
     uploaderInvocationCount: 1,
     childExitCode: 0,
     childSignal: null,
+    innerRuntimeTimeoutMs: 10_000,
+    innerCleanupTimeoutMs: 500,
+    timerOrigin: "IMMEDIATELY_BEFORE_CHILD_SPAWN",
+    runtimeElapsedMs: 1,
+    cleanupElapsedMs: 0,
+    cleanupCompleted: true,
   }, null, 2)}\n`);
 } else if (mode === "hang") {
   setInterval(() => {}, 1_000);

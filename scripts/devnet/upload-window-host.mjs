@@ -24,6 +24,11 @@ import { Connection, PublicKey } from "@solana/web3.js";
 import {
   PLAN_UPLOAD_IDENTITIES,
 } from "./plan-upload-command.mjs";
+import {
+  CANDIDATE_EVIDENCE_SCHEMA,
+  buildCandidateEvidenceFromUploadInputs,
+  candidateEvidenceSha256,
+} from "./candidate-evidence.mjs";
 import { createRpcRequestScheduler } from "./rpc-request-scheduler.mjs";
 import {
   DEVNET_GENESIS_HASH,
@@ -35,7 +40,9 @@ import {
 import {
   parseUploadProcessSupervisorArgs,
 } from "./upload-process-supervisor.mjs";
-import { planBufferUpload } from "./upload-plan.mjs";
+import {
+  planBufferUpload,
+} from "./upload-plan.mjs";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const SUPERVISOR_PATH = resolve(REPO_ROOT, "scripts/devnet/upload-process-supervisor.mjs");
@@ -43,8 +50,8 @@ const BINARY_PATH = resolve(REPO_ROOT, "target/sbf-solana-solana/release/oss_bou
 const BUFFER_METADATA_LENGTH = 37;
 const MAX_TIMER_MS = 2_147_483_647;
 const MAX_TERMINAL_TAIL_BYTES = 64 * 1024;
-const HOST_SCHEMA_VERSION = "UPLOAD_WINDOW_HOST_RESULT_V1";
-const AUTHORIZATION_SCHEMA_VERSION = "UPLOAD_WINDOW_HOST_AUTHORIZATION_V1";
+const HOST_SCHEMA_VERSION = "UPLOAD_WINDOW_HOST_RESULT_V2";
+const AUTHORIZATION_SCHEMA_VERSION = "UPLOAD_WINDOW_HOST_AUTHORIZATION_V2";
 const INVOCATION_SCHEMA_VERSION = "UPLOAD_WINDOW_HOST_INVOCATION_V1";
 const EXECUTION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const WINDOWS_RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
@@ -53,14 +60,17 @@ const HEX_64 = /^[a-f0-9]{64}$/;
 
 const HOST_KEYS = new Set([
   "execution-id",
-  "outer-timeout-ms",
-  "cleanup-allowance-ms",
+  "child-lifecycle-timeout-ms",
+  "outer-cleanup-allowance-ms",
+  "finalization-timeout-ms",
+  "host-total-timeout-ms",
   "result-root",
   "expected-repository-sha",
   "expected-state-sha",
   "expected-buffer-sha",
   "expected-binary-sha",
   "expected-plan-fingerprint",
+  "expected-candidate-evidence-sha",
   "expected-candidates",
   "expected-invocations",
 ]);
@@ -76,6 +86,7 @@ export const HOST_EXIT_CODES = Object.freeze({
   INTERRUPTED: 70,
   CLEANUP_FAILURE: 71,
   PERSISTENCE_FAILURE: 72,
+  FINALIZATION_TIMEOUT: 73,
 });
 
 function sha256(bytes) {
@@ -173,8 +184,22 @@ export function parseUploadWindowHostArgs(argv, { repoRoot = REPO_ROOT } = {}) {
   }
 
   assertSafeExecutionId(values["execution-id"]);
-  const outerTimeoutMs = parsePositiveInteger(values["outer-timeout-ms"], "outer timeout");
-  const cleanupAllowanceMs = parsePositiveInteger(values["cleanup-allowance-ms"], "cleanup allowance", { allowZero: true });
+  const childLifecycleTimeoutMs = parsePositiveInteger(
+    values["child-lifecycle-timeout-ms"],
+    "child lifecycle timeout",
+  );
+  const outerCleanupAllowanceMs = parsePositiveInteger(
+    values["outer-cleanup-allowance-ms"],
+    "outer cleanup allowance",
+  );
+  const finalizationTimeoutMs = parsePositiveInteger(
+    values["finalization-timeout-ms"],
+    "finalization timeout",
+  );
+  const hostTotalTimeoutMs = parsePositiveInteger(
+    values["host-total-timeout-ms"],
+    "total host timeout",
+  );
   const expectedInvocations = parsePositiveInteger(values["expected-invocations"], "expected-invocations");
   if (expectedInvocations !== 1) throw new Error("expected-invocations must equal exactly one");
 
@@ -187,8 +212,20 @@ export function parseUploadWindowHostArgs(argv, { repoRoot = REPO_ROOT } = {}) {
     throw new Error("inner supervisor path is invalid");
   }
   const parsedSupervisor = parseUploadProcessSupervisorArgs(innerArgs.slice(1));
-  if (outerTimeoutMs <= parsedSupervisor.timeoutMs + cleanupAllowanceMs) {
-    throw new Error("outer timeout must outlive inner timeout plus cleanup allowance");
+  if (childLifecycleTimeoutMs <= parsedSupervisor.timeoutMs + parsedSupervisor.cleanupTimeoutMs) {
+    throw new Error("child lifecycle timeout must outlive inner runtime and cleanup");
+  }
+  const minimumCompleteBudget =
+    parsedSupervisor.timeoutMs +
+    parsedSupervisor.cleanupTimeoutMs +
+    outerCleanupAllowanceMs +
+    finalizationTimeoutMs;
+  if (
+    hostTotalTimeoutMs <= minimumCompleteBudget ||
+    hostTotalTimeoutMs <=
+      childLifecycleTimeoutMs + outerCleanupAllowanceMs + finalizationTimeoutMs
+  ) {
+    throw new Error("total host timeout arithmetic is invalid");
   }
 
   const hashes = {
@@ -197,6 +234,7 @@ export function parseUploadWindowHostArgs(argv, { repoRoot = REPO_ROOT } = {}) {
     buffer: values["expected-buffer-sha"],
     binary: values["expected-binary-sha"],
     planFingerprint: values["expected-plan-fingerprint"],
+    candidateEvidence: values["expected-candidate-evidence-sha"],
   };
   if (!HEX_40.test(hashes.repository)) throw new Error("expected repository SHA is invalid");
   for (const [label, value] of Object.entries(hashes).filter(([key]) => key !== "repository")) {
@@ -220,14 +258,17 @@ export function parseUploadWindowHostArgs(argv, { repoRoot = REPO_ROOT } = {}) {
 
   return Object.freeze({
     executionId: values["execution-id"],
-    outerTimeoutMs,
-    cleanupAllowanceMs,
+    childLifecycleTimeoutMs,
+    outerCleanupAllowanceMs,
+    finalizationTimeoutMs,
+    hostTotalTimeoutMs,
     resultRoot,
     resolvedResultRoot,
     expectedInvocations,
     innerCommand: process.execPath,
     innerArgs: Object.freeze([...innerArgs]),
-    innerTimeoutMs: parsedSupervisor.timeoutMs,
+    innerRuntimeTimeoutMs: parsedSupervisor.timeoutMs,
+    innerCleanupTimeoutMs: parsedSupervisor.cleanupTimeoutMs,
     supervisorRequest: parsedSupervisor,
     manifest: Object.freeze({
       expectedRepositorySha: hashes.repository,
@@ -235,6 +276,7 @@ export function parseUploadWindowHostArgs(argv, { repoRoot = REPO_ROOT } = {}) {
       expectedBufferSha: hashes.buffer,
       expectedBinarySha: hashes.binary,
       expectedPlanFingerprint: hashes.planFingerprint,
+      expectedCandidateEvidenceSha: hashes.candidateEvidence,
       expectedCandidates,
       expectedInvocations,
     }),
@@ -313,8 +355,8 @@ async function retainedProcessCountProduction({ statePath, stateArgument, progra
   }).length;
 }
 
-async function verifyFinalizedBufferProduction() {
-  const scheduler = createRpcRequestScheduler();
+async function verifyFinalizedBufferProduction({ requestTimeoutMs } = {}) {
+  const scheduler = createRpcRequestScheduler({ requestTimeoutMs });
   const connection = new Connection(DEVNET_RPC_URL, {
     commitment: "finalized",
     disableRetryOnRateLimit: true,
@@ -411,8 +453,32 @@ export async function verifyAuthorizationManifest(parsed, adapters = {}) {
     }
   }
 
+  const buildCandidateDigest = adapters.buildCandidateEvidenceDigest ??
+    ((input) => {
+      const evidence = buildCandidateEvidenceFromUploadInputs(input);
+      return {
+        schema: CANDIDATE_EVIDENCE_SCHEMA,
+        sha256: candidateEvidenceSha256(evidence),
+      };
+    });
+  const candidateEvidence = buildCandidateDigest({
+    stateBytes,
+    binaryBytes,
+    candidateIndexes: expected,
+    buffer: PLAN_UPLOAD_IDENTITIES.buffer,
+    authority: PLAN_UPLOAD_IDENTITIES.authority,
+  });
+  if (
+    candidateEvidence?.schema !== CANDIDATE_EVIDENCE_SCHEMA ||
+    candidateEvidence?.sha256 !== parsed.manifest.expectedCandidateEvidenceSha
+  ) {
+    throw new Error("candidate evidence digest mismatch");
+  }
+
   const verifyFinalizedBuffer = adapters.verifyFinalizedBuffer ?? verifyFinalizedBufferProduction;
-  const finalized = await verifyFinalizedBuffer();
+  const finalized = await verifyFinalizedBuffer({
+    requestTimeoutMs: parsed.supervisorRequest.requestTimeoutMs,
+  });
   if (finalized.sha256 !== parsed.manifest.expectedBufferSha) throw new Error("buffer SHA mismatch");
   if (finalized.data) {
     if (finalized.owner !== PLAN_UPLOAD_IDENTITIES.loader) throw new Error("buffer owner mismatch");
@@ -453,6 +519,7 @@ export async function verifyAuthorizationManifest(parsed, adapters = {}) {
     statePath: relative(repoRoot, statePath).replaceAll("\\", "/"),
     binaryPath: relative(repoRoot, binaryPath).replaceAll("\\", "/"),
     candidateIndexes: Object.freeze([...expected]),
+    candidateEvidence: Object.freeze({ ...candidateEvidence }),
     finalizedBufferRpcSummary: finalized.rpcSummary ?? null,
     verifiedAt: new Date().toISOString(),
   });
@@ -575,6 +642,7 @@ export function runOwnedHostChild({
   stderrPath,
   outerTimeoutMs,
   cleanupAllowanceMs,
+  finalizationTimeoutMs = outerTimeoutMs,
   shell = false,
   onSpawn = () => {},
   terminateOwnedTree = defaultTerminateOwnedTree,
@@ -582,6 +650,7 @@ export function runOwnedHostChild({
   createLogWriteStream = createWriteStream,
   setTimer = setTimeout,
   clearTimer = clearTimeout,
+  monotonicNow = () => performance.now(),
 }) {
   return new Promise((resolvePromise, rejectPromise) => {
     let stdoutDescriptor = null;
@@ -599,6 +668,7 @@ export function runOwnedHostChild({
     }
     const stdoutFile = createLogWriteStream(stdoutPath, { fd: stdoutDescriptor, autoClose: true });
     const stderrFile = createLogWriteStream(stderrPath, { fd: stderrDescriptor, autoClose: true });
+    const childLifecycleStartedMonotonicMs = monotonicNow();
     let child;
     try {
       child = spawnProcess(command, args, {
@@ -636,6 +706,7 @@ export function runOwnedHostChild({
     let childClosed = false;
     let childExitCode = null;
     let childSignal = null;
+    let childClosedMonotonicMs = null;
     let terminationStarted = false;
     let logPersistenceFailed = false;
     let invocationEvidenceFailed = false;
@@ -645,6 +716,9 @@ export function runOwnedHostChild({
     let settled = false;
     let finishing = false;
     let cleanupDeadlineExpired = false;
+    let cleanupStartedMonotonicMs = null;
+    let logClosureElapsedMs = 0;
+    let finalizationTimedOut = false;
 
     child.stdout.pipe(stdoutFile);
     child.stderr.pipe(stderrFile);
@@ -673,13 +747,33 @@ export function runOwnedHostChild({
 
     const finish = async ({ cleanupCompleted, forceCloseLogs = false } = {}) => {
       if (settled) return;
+      if (childClosed) clearLifecycle();
       closeLogStreams({ force: forceCloseLogs });
       if (finishing) return;
       finishing = true;
-      await Promise.allSettled([
+      const logClosureStartedMonotonicMs = monotonicNow();
+      const closure = Promise.allSettled([
         waitForWritableClose(stdoutFile),
         waitForWritableClose(stderrFile),
       ]);
+      let logDeadlineTimer;
+      const logDeadline = new Promise((resolveDeadline) => {
+        logDeadlineTimer = setTimer(
+          () => resolveDeadline("TIMEOUT"),
+          finalizationTimeoutMs,
+        );
+        logDeadlineTimer.unref?.();
+      });
+      if (await Promise.race([closure.then(() => "CLOSED"), logDeadline]) === "TIMEOUT") {
+        finalizationTimedOut = true;
+        closeLogStreams({ force: true });
+        await closure;
+      }
+      clearTimer(logDeadlineTimer);
+      logClosureElapsedMs = Math.max(
+        0,
+        monotonicNow() - logClosureStartedMonotonicMs,
+      );
       if (settled) return;
       settled = true;
       clearLifecycle();
@@ -694,13 +788,26 @@ export function runOwnedHostChild({
         cleanupCompleted: cleanupCompleted && !cleanupDeadlineExpired,
         logPersistenceFailed,
         invocationEvidenceFailed,
+        finalizationTimedOut,
         errorSummary: childError ? safeErrorSummary(childError) : null,
+        stageElapsedMs: Object.freeze({
+          childLifecycleMs: Math.max(
+            0,
+            (cleanupStartedMonotonicMs ?? childClosedMonotonicMs ?? monotonicNow()) -
+              childLifecycleStartedMonotonicMs,
+          ),
+          outerCleanupMs: cleanupStartedMonotonicMs === null
+            ? 0
+            : Math.max(0, monotonicNow() - cleanupStartedMonotonicMs),
+          stdoutStderrClosureMs: logClosureElapsedMs,
+        }),
       });
     };
 
     const beginTermination = (reason) => {
       if (settled || terminationStarted) return;
       terminationStarted = true;
+      cleanupStartedMonotonicMs = monotonicNow();
       if (reason === "timeout") outerTimedOut = true;
       else if (reason === "interrupt") interrupted = true;
       const escalationDelayMs = Math.floor(cleanupAllowanceMs / 2);
@@ -775,6 +882,7 @@ export function runOwnedHostChild({
     child.once("close", (exitCode, signal) => {
       if (settled) return;
       childClosed = true;
+      childClosedMonotonicMs = monotonicNow();
       childExitCode = exitCode;
       childSignal = signal;
       void finish({ cleanupCompleted: true });
@@ -805,10 +913,18 @@ function isValidSupervisorTerminal(value) {
   if (value.classification === "UPLOAD_PROCESS_EXITED") {
     return hasExactKeys(value, [
       "classification", "uploaderInvocationCount", "childExitCode", "childSignal",
+      "innerRuntimeTimeoutMs", "innerCleanupTimeoutMs", "timerOrigin",
+      "runtimeElapsedMs", "cleanupElapsedMs", "cleanupCompleted",
     ]) &&
       value.uploaderInvocationCount === 1 &&
       (value.childExitCode === null || Number.isSafeInteger(value.childExitCode)) &&
-      (value.childSignal === null || typeof value.childSignal === "string");
+      (value.childSignal === null || typeof value.childSignal === "string") &&
+      Number.isSafeInteger(value.innerRuntimeTimeoutMs) &&
+      Number.isSafeInteger(value.innerCleanupTimeoutMs) &&
+      value.timerOrigin === "IMMEDIATELY_BEFORE_CHILD_SPAWN" &&
+      (value.runtimeElapsedMs === null || Number.isFinite(value.runtimeElapsedMs)) &&
+      (value.cleanupElapsedMs === null || Number.isFinite(value.cleanupElapsedMs)) &&
+      typeof value.cleanupCompleted === "boolean";
   }
   if (
     value.classification === "UPLOAD_TIMEOUT_ACTIVE_LEASE_BLOCKED" ||
@@ -818,6 +934,8 @@ function isValidSupervisorTerminal(value) {
       "classification", "terminal", "retryable", "replayAllowed",
       "uploaderInvocationCount", "executionId", "lease", "telemetry",
       "perChunkResults", "childExitCode", "childSignal",
+      "innerRuntimeTimeoutMs", "innerCleanupTimeoutMs", "timerOrigin",
+      "runtimeElapsedMs", "cleanupElapsedMs", "cleanupCompleted",
     ]) &&
       value.terminal === true &&
       value.retryable === false &&
@@ -829,7 +947,13 @@ function isValidSupervisorTerminal(value) {
       Array.isArray(value.perChunkResults) &&
       value.perChunkResults.length === 0 &&
       (value.childExitCode === null || Number.isSafeInteger(value.childExitCode)) &&
-      (value.childSignal === null || typeof value.childSignal === "string");
+      (value.childSignal === null || typeof value.childSignal === "string") &&
+      Number.isSafeInteger(value.innerRuntimeTimeoutMs) &&
+      Number.isSafeInteger(value.innerCleanupTimeoutMs) &&
+      value.timerOrigin === "IMMEDIATELY_BEFORE_CHILD_SPAWN" &&
+      (value.runtimeElapsedMs === null || Number.isFinite(value.runtimeElapsedMs)) &&
+      (value.cleanupElapsedMs === null || Number.isFinite(value.cleanupElapsedMs)) &&
+      typeof value.cleanupCompleted === "boolean";
   }
   return false;
 }
@@ -885,6 +1009,9 @@ function preSpawnEnvelope(verdict, exitCode, errorSummary) {
 function classifyHostResult(child, terminal) {
   if (child.logPersistenceFailed || child.invocationEvidenceFailed) {
     return ["HOST_RESULT_PERSISTENCE_FAILED", HOST_EXIT_CODES.PERSISTENCE_FAILURE];
+  }
+  if (child.finalizationTimedOut) {
+    return ["HOST_FINALIZATION_TIMEOUT", HOST_EXIT_CODES.FINALIZATION_TIMEOUT];
   }
   if (!child.cleanupCompleted) return ["HOST_CLEANUP_FAILED", HOST_EXIT_CODES.CLEANUP_FAILURE];
   if (child.interrupted) return ["HOST_INTERRUPTED", HOST_EXIT_CODES.INTERRUPTED];
@@ -953,9 +1080,12 @@ export async function runUploadWindowHost(argv, adapters = {}) {
     consumedAt: startedAt,
     hostPid,
     expectedManifest: verified,
-    outerTimeoutMs: parsed.outerTimeoutMs,
-    cleanupAllowanceMs: parsed.cleanupAllowanceMs,
-    innerTimeoutMs: parsed.innerTimeoutMs,
+    childLifecycleTimeoutMs: parsed.childLifecycleTimeoutMs,
+    outerCleanupAllowanceMs: parsed.outerCleanupAllowanceMs,
+    finalizationTimeoutMs: parsed.finalizationTimeoutMs,
+    hostTotalTimeoutMs: parsed.hostTotalTimeoutMs,
+    innerRuntimeTimeoutMs: parsed.innerRuntimeTimeoutMs,
+    innerCleanupTimeoutMs: parsed.innerCleanupTimeoutMs,
     innerCommand: process.execPath,
     sanitizedArguments: sanitizedArgs,
     expectedInvocations: 1,
@@ -1013,9 +1143,32 @@ export async function runUploadWindowHost(argv, adapters = {}) {
       startedAt,
       finishedAt,
       monotonicDurationMs: Math.ceil(monotonicNow() - startedMonotonicMs),
-      outerTimeoutMs: parsed.outerTimeoutMs,
-      cleanupAllowanceMs: parsed.cleanupAllowanceMs,
-      innerTimeoutMs: parsed.innerTimeoutMs,
+      executionOriginMonotonicMs: null,
+      timeoutContract: {
+        innerRuntimeTimeoutMs: parsed.innerRuntimeTimeoutMs,
+        innerCleanupTimeoutMs: parsed.innerCleanupTimeoutMs,
+        childLifecycleTimeoutMs: parsed.childLifecycleTimeoutMs,
+        outerCleanupAllowanceMs: parsed.outerCleanupAllowanceMs,
+        finalizationTimeoutMs: parsed.finalizationTimeoutMs,
+        hostTotalTimeoutMs: parsed.hostTotalTimeoutMs,
+      },
+      stageElapsedMs: {
+        childLifecycleMs: 0,
+        outerCleanupMs: 0,
+        stdoutStderrClosureMs: 0,
+        terminalParsingMs: 0,
+        logHashingMs: 0,
+        resultPersistenceMs: 0,
+        directoryFlushMs: 0,
+        finalizationMs: 0,
+        totalHostMs: 0,
+      },
+      childLifecycleTimeoutMs: parsed.childLifecycleTimeoutMs,
+      outerCleanupAllowanceMs: parsed.outerCleanupAllowanceMs,
+      finalizationTimeoutMs: parsed.finalizationTimeoutMs,
+      hostTotalTimeoutMs: parsed.hostTotalTimeoutMs,
+      innerRuntimeTimeoutMs: parsed.innerRuntimeTimeoutMs,
+      innerCleanupTimeoutMs: parsed.innerCleanupTimeoutMs,
       innerCommand: parsed.innerCommand,
       sanitizedArguments: sanitizedArgs,
       childExitCode: null,
@@ -1055,6 +1208,10 @@ export async function runUploadWindowHost(argv, adapters = {}) {
   let childPid = null;
   let child;
   const runChild = adapters.runChild ?? runOwnedHostChild;
+  // Authorization persistence and final local revalidation are deliberately
+  // pre-spawn. The absolute host timeline begins at the last boundary before
+  // the sole authorized child creation.
+  const executionOriginMonotonicMs = monotonicNow();
   try {
     child = await runChild({
       command: parsed.innerCommand,
@@ -1062,8 +1219,10 @@ export async function runUploadWindowHost(argv, adapters = {}) {
       cwd: repoRoot,
       stdoutPath,
       stderrPath,
-      outerTimeoutMs: parsed.outerTimeoutMs,
-      cleanupAllowanceMs: parsed.cleanupAllowanceMs,
+      outerTimeoutMs: parsed.childLifecycleTimeoutMs,
+      cleanupAllowanceMs: parsed.outerCleanupAllowanceMs,
+      finalizationTimeoutMs: parsed.finalizationTimeoutMs,
+      monotonicNow,
       shell: false,
       onSpawn({ pid }) {
         childSpawnCount += 1;
@@ -1101,6 +1260,37 @@ export async function runUploadWindowHost(argv, adapters = {}) {
     childPid = child.pid;
   }
 
+  const childFinishedMonotonicMs = monotonicNow();
+  const observedLogClosureMs = child.stageElapsedMs?.stdoutStderrClosureMs ?? 0;
+  const finalizationStartedMonotonicMs = Math.max(
+    executionOriginMonotonicMs,
+    childFinishedMonotonicMs - observedLogClosureMs,
+  );
+  const timeoutContract = Object.freeze({
+    innerRuntimeTimeoutMs: parsed.innerRuntimeTimeoutMs,
+    innerCleanupTimeoutMs: parsed.innerCleanupTimeoutMs,
+    childLifecycleTimeoutMs: parsed.childLifecycleTimeoutMs,
+    outerCleanupAllowanceMs: parsed.outerCleanupAllowanceMs,
+    finalizationTimeoutMs: parsed.finalizationTimeoutMs,
+    hostTotalTimeoutMs: parsed.hostTotalTimeoutMs,
+  });
+  const stageElapsedMs = {
+    childLifecycleMs: child.stageElapsedMs?.childLifecycleMs ??
+      Math.max(0, childFinishedMonotonicMs - executionOriginMonotonicMs),
+    outerCleanupMs: child.stageElapsedMs?.outerCleanupMs ?? 0,
+    stdoutStderrClosureMs: observedLogClosureMs,
+    terminalParsingMs: 0,
+    logHashingMs: 0,
+    resultPersistenceMs: 0,
+    directoryFlushMs: 0,
+    finalizationMs: 0,
+    totalHostMs: 0,
+  };
+  const finalizationExpired = () => {
+    const current = monotonicNow();
+    return current - finalizationStartedMonotonicMs >= parsed.finalizationTimeoutMs ||
+      current - executionOriginMonotonicMs >= parsed.hostTotalTimeoutMs;
+  };
   let terminal = { status: "MISSING", value: null };
   let stdout;
   let stderr;
@@ -1108,11 +1298,17 @@ export async function runUploadWindowHost(argv, adapters = {}) {
     const flushLogFile = adapters.fsyncFile ?? fsyncFile;
     flushLogFile(stdoutPath);
     flushLogFile(stderrPath);
-    terminal = parseInnerTerminal(stdoutPath);
+    const parseTerminal = adapters.parseInnerTerminal ?? parseInnerTerminal;
+    const parseStarted = monotonicNow();
+    terminal = await parseTerminal(stdoutPath);
+    stageElapsedMs.terminalParsingMs = Math.max(0, monotonicNow() - parseStarted);
+    const collectLogEvidence = adapters.logEvidence ?? logEvidence;
+    const hashStarted = monotonicNow();
     [stdout, stderr] = await Promise.all([
-      logEvidence(stdoutPath),
-      logEvidence(stderrPath),
+      collectLogEvidence(stdoutPath),
+      collectLogEvidence(stderrPath),
     ]);
+    stageElapsedMs.logHashingMs = Math.max(0, monotonicNow() - hashStarted);
   } catch (error) {
     child.logPersistenceFailed = true;
     child.errorSummary ??= safeErrorSummary(error);
@@ -1124,7 +1320,11 @@ export async function runUploadWindowHost(argv, adapters = {}) {
     stdout = unavailableLog(stdoutPath);
     stderr = unavailableLog(stderrPath);
   }
-  const [verdict, exitCode] = classifyHostResult(child, terminal);
+  let [verdict, exitCode] = classifyHostResult(child, terminal);
+  if (finalizationExpired()) {
+    verdict = "HOST_FINALIZATION_TIMEOUT";
+    exitCode = HOST_EXIT_CODES.FINALIZATION_TIMEOUT;
+  }
   const finishedAt = now();
   const durationMs = Math.ceil(monotonicNow() - startedMonotonicMs);
   const durableResult = {
@@ -1137,9 +1337,15 @@ export async function runUploadWindowHost(argv, adapters = {}) {
     startedAt,
     finishedAt,
     monotonicDurationMs: durationMs,
-    outerTimeoutMs: parsed.outerTimeoutMs,
-    cleanupAllowanceMs: parsed.cleanupAllowanceMs,
-    innerTimeoutMs: parsed.innerTimeoutMs,
+    executionOriginMonotonicMs,
+    timeoutContract,
+    stageElapsedMs,
+    childLifecycleTimeoutMs: parsed.childLifecycleTimeoutMs,
+    outerCleanupAllowanceMs: parsed.outerCleanupAllowanceMs,
+    finalizationTimeoutMs: parsed.finalizationTimeoutMs,
+    hostTotalTimeoutMs: parsed.hostTotalTimeoutMs,
+    innerRuntimeTimeoutMs: parsed.innerRuntimeTimeoutMs,
+    innerCleanupTimeoutMs: parsed.innerCleanupTimeoutMs,
     innerCommand: parsed.innerCommand,
     sanitizedArguments: sanitizedArgs,
     childExitCode: child.exitCode,
@@ -1158,8 +1364,46 @@ export async function runUploadWindowHost(argv, adapters = {}) {
     durableResultPersisted: true,
     retryOccurred: false,
   };
+  const applyFinalizationTimeout = () => {
+    durableResult.verdict = "HOST_FINALIZATION_TIMEOUT";
+    durableResult.exitCode = HOST_EXIT_CODES.FINALIZATION_TIMEOUT;
+    durableResult.errorSummary = "durable finalization exceeded its authorized allowance";
+  };
   try {
+    const persistStarted = monotonicNow();
     atomicWrite(resultPath, durableResult);
+    stageElapsedMs.resultPersistenceMs += Math.max(0, monotonicNow() - persistStarted);
+    const flushResultDirectory = adapters.fsyncDirectory ?? fsyncDirectory;
+    const flushStarted = monotonicNow();
+    flushResultDirectory(executionDirectory);
+    stageElapsedMs.directoryFlushMs += Math.max(0, monotonicNow() - flushStarted);
+    if (finalizationExpired()) applyFinalizationTimeout();
+    stageElapsedMs.finalizationMs = Math.max(
+      0,
+      monotonicNow() - finalizationStartedMonotonicMs,
+    );
+    stageElapsedMs.totalHostMs = Math.max(
+      0,
+      monotonicNow() - executionOriginMonotonicMs,
+    );
+    const finalPersistStarted = monotonicNow();
+    atomicWrite(resultPath, durableResult);
+    stageElapsedMs.resultPersistenceMs += Math.max(
+      0,
+      monotonicNow() - finalPersistStarted,
+    );
+    if (finalizationExpired()) {
+      applyFinalizationTimeout();
+      stageElapsedMs.finalizationMs = Math.max(
+        0,
+        monotonicNow() - finalizationStartedMonotonicMs,
+      );
+      stageElapsedMs.totalHostMs = Math.max(
+        0,
+        monotonicNow() - executionOriginMonotonicMs,
+      );
+      atomicWrite(resultPath, durableResult);
+    }
   } catch {
     const failed = {
       ...durableResult,

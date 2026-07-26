@@ -12,20 +12,22 @@ import {
   RPC_OUTCOMES,
 } from "./rpc-request-ledger.mjs";
 
-const VERSION = "UPLOAD_EXECUTION_TELEMETRY_V1";
+const VERSION = "UPLOAD_EXECUTION_TELEMETRY_V2";
+const LEGACY_VERSION = "UPLOAD_EXECUTION_TELEMETRY_V1";
 const SAFE_EXECUTION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const HEX_64 = /^[a-f0-9]{64}$/;
 const METHOD_SET = new Set(RPC_METHOD_CLASSES);
 const OUTCOME_SET = new Set(RPC_OUTCOMES);
 const MUTATION_SET = new Set(["read", "write"]);
 const SEND_OUTCOME_SET = new Set(["SUCCESS", "ERROR"]);
-const POLICY_KEYS = [
+const LEGACY_POLICY_KEYS = [
   "confirmationPollIntervalMs",
   "globalRequestStartGapMs",
   "interChunkDelayMs",
   "preSignCooldownMs",
   "rateLimitRetryScheduleMs",
 ];
+const POLICY_KEYS = [...LEGACY_POLICY_KEYS, "requestTimeoutMs"];
 const LEDGER_ENTRY_KEYS = [
   "durationMs",
   "endMonotonicMs",
@@ -79,7 +81,7 @@ const POLL_KEYS = [
   "startedAt",
   "startedElapsedMs",
 ];
-const SNAPSHOT_KEYS = [
+const LEGACY_SNAPSHOT_KEYS = [
   "confirmationPolls",
   "executionId",
   "expectedChunkIndexes",
@@ -95,6 +97,7 @@ const SNAPSHOT_KEYS = [
   "verdict",
   "version",
 ];
+const SNAPSHOT_KEYS = [...LEGACY_SNAPSHOT_KEYS, "requestTimeoutCount"];
 
 function exactKeys(value, keys) {
   return value !== null && typeof value === "object" && !Array.isArray(value) &&
@@ -127,9 +130,11 @@ function validIndexes(value) {
 }
 
 function validatePolicy(policy) {
-  if (!exactKeys(policy, POLICY_KEYS) ||
+  const legacy = exactKeys(policy, LEGACY_POLICY_KEYS);
+  if ((!legacy && !exactKeys(policy, POLICY_KEYS)) ||
       !Number.isSafeInteger(policy.preSignCooldownMs) || policy.preSignCooldownMs < 0 ||
       !Number.isSafeInteger(policy.globalRequestStartGapMs) || policy.globalRequestStartGapMs < 0 ||
+      (!legacy && (!Number.isSafeInteger(policy.requestTimeoutMs) || policy.requestTimeoutMs < 1)) ||
       !Number.isSafeInteger(policy.confirmationPollIntervalMs) || policy.confirmationPollIntervalMs < 1 ||
       !Number.isSafeInteger(policy.interChunkDelayMs) || policy.interChunkDelayMs < 1 ||
       !Array.isArray(policy.rateLimitRetryScheduleMs) ||
@@ -298,8 +303,9 @@ function computeMissing(snapshot) {
 }
 
 function validateSnapshot(snapshot) {
-  if (!exactKeys(snapshot, SNAPSHOT_KEYS) ||
-      snapshot.version !== VERSION ||
+  const legacy = snapshot?.version === LEGACY_VERSION;
+  if (!exactKeys(snapshot, legacy ? LEGACY_SNAPSHOT_KEYS : SNAPSHOT_KEYS) ||
+      (!legacy && snapshot.version !== VERSION) ||
       !SAFE_EXECUTION_ID.test(snapshot.executionId ?? "") ||
       !validIso(snapshot.startedAt) ||
       !nullableIso(snapshot.finishedAt) ||
@@ -312,6 +318,8 @@ function validateSnapshot(snapshot) {
       !nullableFiniteNonnegative(snapshot.minimumConfirmationPollGapMs) ||
       !Array.isArray(snapshot.missing) ||
       snapshot.missing.some((item) => typeof item !== "string" || item.length === 0) ||
+      (!legacy && (!Number.isSafeInteger(snapshot.requestTimeoutCount) ||
+        snapshot.requestTimeoutCount < 0)) ||
       !["COMPLETE", "INCOMPLETE"].includes(snapshot.verdict)) {
     throw new Error("telemetry snapshot schema is invalid");
   }
@@ -320,6 +328,10 @@ function validateSnapshot(snapshot) {
   for (const request of snapshot.requests) {
     validateRequest(request, previousSequence);
     previousSequence = request.sequence;
+  }
+  if (!legacy && snapshot.requestTimeoutCount !==
+      snapshot.requests.filter(({ outcome }) => outcome === "RPC_REQUEST_TIMEOUT").length) {
+    throw new Error("telemetry request timeout count is invalid");
   }
   let previousChunk = -1;
   for (const send of snapshot.sends) {
@@ -381,6 +393,10 @@ function refreshComputed(snapshot) {
   snapshot.minimumConfirmationPollGapMs = computedMinimumConfirmationGap(
     snapshot.confirmationPolls,
   );
+  if (Object.hasOwn(snapshot, "requestTimeoutCount")) {
+    snapshot.requestTimeoutCount = snapshot.requests
+      .filter(({ outcome }) => outcome === "RPC_REQUEST_TIMEOUT").length;
+  }
   snapshot.missing = computeMissing(snapshot);
   snapshot.verdict = snapshot.missing.length === 0 ? "COMPLETE" : "INCOMPLETE";
 }
@@ -400,6 +416,7 @@ function extensionValue(previous, next, path) {
     }
     for (const [key, item] of Object.entries(previous)) {
       if (key === "missing" || key === "minimumRpcRequestGapMs" ||
+          key === "requestTimeoutCount" ||
           key === "minimumConfirmationPollGapMs" || key === "verdict") continue;
       extensionValue(item, next[key], `${path}.${key}`);
     }
@@ -520,6 +537,7 @@ export function createUploadTelemetryStore({
       confirmationPolls: [],
       minimumRpcRequestGapMs: null,
       minimumConfirmationPollGapMs: null,
+      requestTimeoutCount: 0,
       expectedChunkIndexes: [],
       verdict: "INCOMPLETE",
       missing: ["terminal"],

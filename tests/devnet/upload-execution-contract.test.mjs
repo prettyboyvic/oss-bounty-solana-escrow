@@ -51,6 +51,7 @@ function argv(overrides = {}) {
     authority: ".devnet/authority.json",
     "max-chunks": "5",
     "delay-ms": "1000",
+    "rpc-request-timeout-ms": "15000",
     "acknowledge-devnet-write": "R4_BUFFER_UPLOAD",
     ...overrides,
   };
@@ -68,15 +69,22 @@ test("requires the complete explicit live-upload contract and literal acknowledg
   assert.equal(parsed.buffer, BUFFER);
   assert.equal(parsed.maxChunks, 5);
   assert.equal(parsed.delayMs, 1000);
+  assert.equal(parsed.requestTimeoutMs, 15000);
   assert.equal(parsed.acknowledgement, LIVE_UPLOAD_ACKNOWLEDGEMENT);
 
-  for (const key of ["url", "program", "buffer", "state", "authority", "max-chunks", "delay-ms", "acknowledge-devnet-write"]) {
+  for (const key of ["url", "program", "buffer", "state", "authority", "max-chunks", "delay-ms", "rpc-request-timeout-ms", "acknowledge-devnet-write"]) {
     const input = argv();
     input.splice(input.indexOf(`--${key}`), 2);
     assert.throws(() => parseUploadCommand(input), /required|acknowledgement/);
   }
   assert.throws(() => parseUploadCommand(argv({ "acknowledge-devnet-write": "yes" })), /acknowledgement/);
   assert.throws(() => parseUploadCommand([...argv(), "--hidden-enable", "1"]), /unknown argument/);
+  for (const value of ["0", "-1", "1.5", "2147483648", "unsafe"]) {
+    assert.throws(
+      () => parseUploadCommand(argv({ "rpc-request-timeout-ms": value })),
+      /requestTimeoutMs/,
+    );
+  }
 });
 
 test("parses only the approved public migration and lease commands", () => {
@@ -250,6 +258,7 @@ test("rejects every secret-bearing output shape instead of redacting it ambiguou
       globalRequestStartGapMs: 500,
       confirmationPollIntervalMs: 2000,
       rateLimitRetryScheduleMs: [2000, 5000],
+      requestTimeoutMs: 15000,
       rawMethod: "CANARY",
     },
   };

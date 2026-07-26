@@ -37,6 +37,7 @@ const SHA = {
 const INNER_ARGS = [
   "scripts/devnet/upload-process-supervisor.mjs",
   "--timeout-ms", "10000",
+  "--cleanup-timeout-ms", "500",
   "--",
   "upload-buffer-throttled",
   "--url", "https://api.devnet.solana.com",
@@ -46,20 +47,24 @@ const INNER_ARGS = [
   "--authority", ".devnet/deployment-authority.devnet-keypair.json",
   "--max-chunks", "5",
   "--delay-ms", "3000",
+  "--rpc-request-timeout-ms", "15000",
   "--acknowledge-devnet-write", "R4_BUFFER_UPLOAD",
 ];
 
 function hostArgs(resultRoot, overrides = {}) {
   const values = {
     "execution-id": "r4-test-001",
-    "outer-timeout-ms": "12000",
-    "cleanup-allowance-ms": "1000",
+    "child-lifecycle-timeout-ms": "11000",
+    "outer-cleanup-allowance-ms": "1000",
+    "finalization-timeout-ms": "2000",
+    "host-total-timeout-ms": "15000",
     "result-root": resultRoot,
     "expected-repository-sha": SHA.repository,
     "expected-state-sha": SHA.state,
     "expected-buffer-sha": SHA.buffer,
     "expected-binary-sha": SHA.binary,
     "expected-plan-fingerprint": SHA.plan,
+    "expected-candidate-evidence-sha": "6".repeat(64),
     "expected-candidates": "264-268",
     "expected-invocations": "1",
     ...overrides,
@@ -93,6 +98,12 @@ function terminalResult(classification = "UPLOAD_PROCESS_EXITED") {
     uploaderInvocationCount: 1,
     childExitCode: 0,
     childSignal: null,
+    innerRuntimeTimeoutMs: 10_000,
+    innerCleanupTimeoutMs: 500,
+    timerOrigin: "IMMEDIATELY_BEFORE_CHILD_SPAWN",
+    runtimeElapsedMs: 1,
+    cleanupElapsedMs: 0,
+    cleanupCompleted: true,
   };
 }
 
@@ -130,7 +141,7 @@ async function runFixture(root, overrides = {}) {
       ];
       return () => values.shift() ?? "2026-07-26T00:00:01.000Z";
     })(),
-    monotonicNow: (() => {
+    monotonicNow: overrides.monotonicNow ?? (() => {
       const values = [100, 1100];
       return () => values.shift() ?? 1100;
     })(),
@@ -139,14 +150,20 @@ async function runFixture(root, overrides = {}) {
     writeJsonAtomic: overrides.writeJsonAtomic,
     fsyncDirectory: overrides.fsyncDirectory,
     fsyncFile: overrides.fsyncFile,
+    parseInnerTerminal: overrides.parseInnerTerminal,
+    logEvidence: overrides.logEvidence,
   });
 }
 
 test("parses the closed outer-host contract and exact-one invocation", () => {
   const parsed = parseUploadWindowHostArgs(hostArgs(".devnet/upload-host-results"));
   assert.equal(parsed.executionId, "r4-test-001");
-  assert.equal(parsed.outerTimeoutMs, 12000);
-  assert.equal(parsed.cleanupAllowanceMs, 1000);
+  assert.equal(parsed.childLifecycleTimeoutMs, 11000);
+  assert.equal(parsed.outerCleanupAllowanceMs, 1000);
+  assert.equal(parsed.finalizationTimeoutMs, 2000);
+  assert.equal(parsed.hostTotalTimeoutMs, 15000);
+  assert.equal(parsed.innerRuntimeTimeoutMs, 10000);
+  assert.equal(parsed.innerCleanupTimeoutMs, 500);
   assert.equal(parsed.manifest.expectedInvocations, 1);
   assert.deepEqual(parsed.manifest.expectedCandidates, [264, 265, 266, 267, 268]);
   assert.equal(parsed.innerCommand, process.execPath);
@@ -171,19 +188,24 @@ test("rejects unsafe execution IDs and path traversal", () => {
   }
 });
 
-test("rejects invalid timeout values and a non-outliving outer boundary", () => {
+test("rejects invalid timeout values and invalid complete host arithmetic", () => {
   for (const value of ["0", "-1", "1.5", "10s", "2147483648"]) {
     assert.throws(
-      () => parseUploadWindowHostArgs(hostArgs(".devnet/results", { "outer-timeout-ms": value })),
+      () => parseUploadWindowHostArgs(hostArgs(".devnet/results", { "host-total-timeout-ms": value })),
       /timeout/i,
     );
   }
   assert.throws(
     () => parseUploadWindowHostArgs(hostArgs(".devnet/results", {
-      "outer-timeout-ms": "11000",
-      "cleanup-allowance-ms": "1000",
+      "host-total-timeout-ms": "13500",
     })),
-    /outlive/i,
+    /total host timeout|arithmetic/i,
+  );
+  assert.throws(
+    () => parseUploadWindowHostArgs(hostArgs(".devnet/results", {
+      "child-lifecycle-timeout-ms": "10500",
+    })),
+    /child lifecycle|outlive/i,
   );
 });
 
@@ -227,7 +249,7 @@ test("execution marker and completed logs are flushed before durable result", as
       },
     });
     assert.equal(result.verdict, "HOST_CHILD_SUCCEEDED");
-    assert.deepEqual(flushedDirectories, [root]);
+    assert.deepEqual(flushedDirectories, [root, join(root, "r4-test-001")]);
     assert.deepEqual(flushedFiles.sort(), [
       join(root, "r4-test-001", "supervisor-stderr.log"),
       join(root, "r4-test-001", "supervisor-stdout.log"),
@@ -546,6 +568,151 @@ test("host result is written only after child completion and log closure", async
   }
 });
 
+test("configured timeout components and actual stage durations are durable", async () => {
+  const root = tempRoot();
+  try {
+    const result = await runFixture(root);
+    assert.deepEqual(result.timeoutContract, {
+      innerRuntimeTimeoutMs: 10_000,
+      innerCleanupTimeoutMs: 500,
+      childLifecycleTimeoutMs: 11_000,
+      outerCleanupAllowanceMs: 1_000,
+      finalizationTimeoutMs: 2_000,
+      hostTotalTimeoutMs: 15_000,
+    });
+    for (const value of Object.values(result.stageElapsedMs)) {
+      assert.ok(Number.isFinite(value) && value >= 0);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("absolute host timer origin is immediately pre-spawn and excludes pre-spawn verification", async () => {
+  const root = tempRoot();
+  let monotonicMs = 0;
+  let observedAtChildCall;
+  try {
+    const result = await runUploadWindowHost(hostArgs(root), {
+      repoRoot: "C:/repo",
+      monotonicNow: () => monotonicMs,
+      verifyManifest: async (parsed) => {
+        monotonicMs += 10_000;
+        return verifiedManifest(parsed);
+      },
+      revalidateManifest: async () => {
+        monotonicMs += 20_000;
+      },
+      runChild: async (input) => {
+        observedAtChildCall = monotonicMs;
+        input.onSpawn({ pid: 4321 });
+        writeFileSync(input.stdoutPath, `${JSON.stringify(terminalResult())}\n`);
+        writeFileSync(input.stderrPath, "");
+        monotonicMs += 100;
+        return {
+          pid: 4321,
+          exitCode: 0,
+          signal: null,
+          outerTimedOut: false,
+          interrupted: false,
+          cleanupCompleted: true,
+        };
+      },
+      now: () => "2026-07-26T00:00:00.000Z",
+      emitFinal: () => {},
+    });
+    assert.equal(observedAtChildCall, 30_000);
+    assert.equal(result.executionOriginMonotonicMs, 30_000);
+    assert.ok(result.stageElapsedMs.totalHostMs < 30_000);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("terminal parsing, log hashing, persistence and directory flush overrun fail closed", async (t) => {
+  for (const stage of ["parse", "hash", "persist", "directoryFlush"]) {
+    await t.test(stage, async () => {
+      const root = tempRoot();
+      let monotonicMs = 0;
+      const advance = () => { monotonicMs += 2_001; };
+      try {
+        const result = await runFixture(root, {
+          monotonicNow: () => monotonicMs,
+          runChild: async (input) => {
+            const value = await successChild(input);
+            monotonicMs = 100;
+            return value;
+          },
+          ...(stage === "parse" ? {
+            parseInnerTerminal() {
+              advance();
+              return { status: "VALID", value: terminalResult() };
+            },
+          } : {}),
+          ...(stage === "hash" ? {
+            async logEvidence(path) {
+              advance();
+              const bytes = readFileSync(path);
+              return { path: resolve(path), bytes: bytes.length, sha256: "a".repeat(64) };
+            },
+          } : {}),
+          ...(stage === "persist" ? {
+            writeJsonAtomic(path, value) {
+              writeJsonAtomic(path, value);
+              if (path.endsWith("host-result.json")) advance();
+            },
+          } : {}),
+          ...(stage === "directoryFlush" ? {
+            fsyncDirectory(path) {
+              if (path.endsWith("r4-test-001")) advance();
+            },
+          } : {}),
+        });
+        assert.equal(result.verdict, "HOST_FINALIZATION_TIMEOUT");
+        assert.equal(result.exitCode, HOST_EXIT_CODES.FINALIZATION_TIMEOUT);
+        assert.notEqual(
+          JSON.parse(readFileSync(join(root, "r4-test-001", "host-result.json"))).verdict,
+          "HOST_CHILD_SUCCEEDED",
+        );
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("finalization failure takes precedence over cleanup and child failure", async () => {
+  const root = tempRoot();
+  let monotonicMs = 0;
+  try {
+    const result = await runFixture(root, {
+      monotonicNow: () => monotonicMs,
+      runChild: async ({ stdoutPath, stderrPath, onSpawn }) => {
+        onSpawn({ pid: 4444 });
+        writeFileSync(stdoutPath, "");
+        writeFileSync(stderrPath, "");
+        monotonicMs = 100;
+        return {
+          pid: 4444,
+          exitCode: 7,
+          signal: null,
+          outerTimedOut: true,
+          interrupted: false,
+          cleanupCompleted: false,
+        };
+      },
+      parseInnerTerminal() {
+        monotonicMs += 2_001;
+        return { status: "MISSING", value: null };
+      },
+    });
+    assert.equal(result.verdict, "HOST_FINALIZATION_TIMEOUT");
+    assert.equal(result.exitCode, HOST_EXIT_CODES.FINALIZATION_TIMEOUT);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("atomic JSON persistence leaves no temporary final file", () => {
   const root = tempRoot();
   try {
@@ -803,6 +970,10 @@ test("manifest verifier validates candidates without reading the authority file"
     readBinaryBytes: () => binary,
     sha256: (bytes) => bytes === binary ? "b".repeat(64) : "a".repeat(64),
     verifyFinalizedBuffer: async () => ({ sha256: SHA.buffer }),
+    buildCandidateEvidenceDigest: () => ({
+      schema: "R4_CANDIDATE_EVIDENCE_V1",
+      sha256: "6".repeat(64),
+    }),
     pathExists: () => false,
     retainedProcessCount: async (identity) => {
       retainedProcessIdentity = identity;
@@ -984,7 +1155,7 @@ test("a real host process exits after deadline even when its child survives clea
   }
 });
 
-test("outer boundary remains active through stalled log closure", async () => {
+test("stalled log closure is bounded by the explicit finalization allowance", async () => {
   const root = tempRoot("upload-host-log-close-deadline-");
   const child = new EventEmitter();
   child.pid = 780;
@@ -1000,6 +1171,7 @@ test("outer boundary remains active through stalled log closure", async () => {
       stderrPath: join(root, "stderr.log"),
       outerTimeoutMs: 12000,
       cleanupAllowanceMs: 1000,
+      finalizationTimeoutMs: 2000,
       spawnProcess: () => {
         queueMicrotask(() => {
           child.emit("spawn");
@@ -1027,13 +1199,12 @@ test("outer boundary remains active through stalled log closure", async () => {
     });
     await new Promise((resolvePromise) => setImmediate(resolvePromise));
     assert.equal(timers[0].ms, 12000);
-    await timers[0].fn();
-    await new Promise((resolvePromise) => setImmediate(resolvePromise));
-    assert.equal(timers[2].ms, 1000);
-    await timers[2].fn();
+    assert.equal(timers[1].ms, 2000);
+    await timers[1].fn();
     const result = await pending;
-    assert.equal(result.outerTimedOut, true);
-    assert.equal(result.cleanupCompleted, false);
+    assert.equal(result.outerTimedOut, false);
+    assert.equal(result.cleanupCompleted, true);
+    assert.equal(result.finalizationTimedOut, true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

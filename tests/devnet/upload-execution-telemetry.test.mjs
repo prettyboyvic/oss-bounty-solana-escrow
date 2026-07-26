@@ -22,6 +22,7 @@ const STARTED_AT = "2026-07-23T00:00:00.000Z";
 const POLICY = Object.freeze({
   preSignCooldownMs: 3_000,
   globalRequestStartGapMs: 500,
+  requestTimeoutMs: 15_000,
   confirmationPollIntervalMs: 2_000,
   rateLimitRetryScheduleMs: Object.freeze([2_000, 5_000]),
   interChunkDelayMs: 3_000,
@@ -111,6 +112,7 @@ test("complete five-chunk telemetry persists canonical sanitized timing evidence
   assert.equal(result.snapshot.sends.length, 5);
   assert.ok(result.snapshot.sends[0].preSignCooldownMs >= POLICY.preSignCooldownMs);
   assert.equal(result.snapshot.requests.length, 17);
+  assert.equal(result.snapshot.requestTimeoutCount, 0);
   assert.match(result.sha256, /^[a-f0-9]{64}$/);
   assert.equal(canonicalTelemetryHash(result.snapshot), result.sha256);
 
@@ -149,6 +151,19 @@ test("complete five-chunk telemetry persists canonical sanitized timing evidence
     readFileSync(join(directory, "telemetry.json"), "utf8"),
     /private|secret|seed|authorization|https?:\/\/|rawTransaction|signedTransaction/i,
   );
+});
+
+test("request timeout duration and aggregate count persist in sanitized telemetry", () => {
+  const { directory } = fixture();
+  const store = storeAt(directory);
+  store.recordRpcEntry({
+    ...entry(1, "GET_ACCOUNT_INFO", 1_000, POLICY.requestTimeoutMs),
+    outcome: "RPC_REQUEST_TIMEOUT",
+  });
+  const telemetry = readUploadTelemetry(directory);
+  assert.equal(telemetry.snapshot.requests[0].durationMs, POLICY.requestTimeoutMs);
+  assert.equal(telemetry.snapshot.requests[0].outcome, "RPC_REQUEST_TIMEOUT");
+  assert.equal(telemetry.snapshot.requestTimeoutCount, 1);
 });
 
 test("partial evidence survives process failure and cannot be overwritten by a shorter snapshot", () => {

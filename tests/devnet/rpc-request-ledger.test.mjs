@@ -150,7 +150,7 @@ test("method, outcome and mutation enums are closed", async () => {
     "GET_TRANSACTION",
     "SEND_RAW_TRANSACTION",
   ]);
-  assert.deepEqual(RPC_OUTCOMES, ["SUCCESS", "RPC_RATE_LIMITED", "RPC_ERROR"]);
+  assert.deepEqual(RPC_OUTCOMES, ["SUCCESS", "RPC_RATE_LIMITED", "RPC_REQUEST_TIMEOUT", "RPC_ERROR"]);
   const ledger = createRpcRequestLedger();
   const valid = {
     methodClass: "GET_BALANCE",
@@ -175,7 +175,7 @@ test("bounded ledger evicts oldest entries and reports aggregate counts only", a
     totalRecorded: 3,
     retained: 2,
     dropped: 1,
-    countsByOutcome: { SUCCESS: 3, RPC_RATE_LIMITED: 0, RPC_ERROR: 0 },
+    countsByOutcome: { SUCCESS: 3, RPC_RATE_LIMITED: 0, RPC_REQUEST_TIMEOUT: 0, RPC_ERROR: 0 },
     countsByMethod: {
       GET_GENESIS_HASH: 1,
       GET_ACCOUNT_INFO: 0,

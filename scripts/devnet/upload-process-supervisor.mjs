@@ -1,7 +1,8 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { performance } from "node:perf_hooks";
 
 import { parseRuntimeCommand } from "./upload-execution-contract.mjs";
 
@@ -13,6 +14,7 @@ const UPLOAD_ENTRY = resolve(REPO_ROOT, "scripts/devnet/upload-buffer-cli.mjs");
 // response is instantaneous. Three seconds is therefore a strict validation
 // floor, not a recommended live-window timeout.
 export const MIN_UPLOAD_PROCESS_TIMEOUT_MS = 3_000;
+export const MIN_UPLOAD_PROCESS_CLEANUP_TIMEOUT_MS = 1;
 
 function parseTimeoutMs(value) {
   if (!/^[1-9]\d*$/.test(value ?? "")) {
@@ -31,35 +33,79 @@ function parseTimeoutMs(value) {
   return timeoutMs;
 }
 
+function parseCleanupTimeoutMs(value) {
+  if (!/^[1-9]\d*$/.test(value ?? "")) {
+    throw new Error("explicit upload process cleanup timeout in milliseconds is required");
+  }
+  const cleanupTimeoutMs = Number(value);
+  if (!Number.isSafeInteger(cleanupTimeoutMs) ||
+      cleanupTimeoutMs < MIN_UPLOAD_PROCESS_CLEANUP_TIMEOUT_MS ||
+      cleanupTimeoutMs > MAX_TIMER_DELAY_MS) {
+    throw new Error(
+      `upload process cleanup timeout must be ${MIN_UPLOAD_PROCESS_CLEANUP_TIMEOUT_MS}..${MAX_TIMER_DELAY_MS} milliseconds`,
+    );
+  }
+  return cleanupTimeoutMs;
+}
+
 export function parseUploadProcessSupervisorArgs(argv) {
   if (
     !Array.isArray(argv) ||
-    argv.length < 4 ||
+    argv.length < 6 ||
     argv[0] !== "--timeout-ms" ||
-    argv[2] !== "--"
+    argv[2] !== "--cleanup-timeout-ms" ||
+    argv[4] !== "--"
   ) {
     throw new Error(
-      "usage: upload-process-supervisor --timeout-ms <milliseconds> -- upload-buffer-throttled ...",
+      "usage: upload-process-supervisor --timeout-ms <milliseconds> --cleanup-timeout-ms <milliseconds> -- upload-buffer-throttled ...",
     );
   }
   const timeoutMs = parseTimeoutMs(argv[1]);
-  const uploaderArgs = argv.slice(3);
+  const cleanupTimeoutMs = parseCleanupTimeoutMs(argv[3]);
+  const uploaderArgs = argv.slice(5);
   const parsedUploader = parseRuntimeCommand(uploaderArgs);
   if (parsedUploader.command !== "upload-buffer-throttled") {
     throw new Error("upload process supervisor accepts only upload-buffer-throttled");
   }
   return Object.freeze({
     timeoutMs,
+    cleanupTimeoutMs,
     uploaderArgs: Object.freeze([...uploaderArgs]),
     statePath: parsedUploader.state,
   });
 }
 
-function terminateWindowsProcessTree(pid) {
-  spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
-    stdio: "ignore",
-    windowsHide: true,
-    timeout: 5_000,
+function terminateWindowsProcessTree(pid, force, timeoutMs) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const helper = spawn(
+      "taskkill",
+      ["/PID", String(pid), "/T", ...(force ? ["/F"] : [])],
+      {
+        stdio: "ignore",
+        windowsHide: true,
+      },
+    );
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { helper.kill(); } catch {}
+      rejectPromise(new Error("upload process cleanup helper timed out"));
+    }, timeoutMs);
+    timer.unref?.();
+    helper.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      rejectPromise(error);
+    });
+    helper.once("close", (exitCode) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (exitCode === 0 || exitCode === 128) resolvePromise();
+      else rejectPromise(new Error("upload process cleanup helper failed"));
+    });
   });
 }
 
@@ -75,9 +121,11 @@ export function runOwnedProcess({
   command,
   args,
   timeoutMs,
+  cleanupTimeoutMs,
   cwd = process.cwd(),
   stdio = "ignore",
   onSpawn = () => {},
+  monotonicNow = () => performance.now(),
 }) {
   if (
     typeof command !== "string" ||
@@ -86,12 +134,17 @@ export function runOwnedProcess({
     !Number.isSafeInteger(timeoutMs) ||
     timeoutMs < 1 ||
     timeoutMs > MAX_TIMER_DELAY_MS ||
+    !Number.isSafeInteger(cleanupTimeoutMs) ||
+    cleanupTimeoutMs < MIN_UPLOAD_PROCESS_CLEANUP_TIMEOUT_MS ||
+    cleanupTimeoutMs > MAX_TIMER_DELAY_MS ||
+    typeof monotonicNow !== "function" ||
     typeof onSpawn !== "function"
   ) {
     throw new Error("valid owned process parameters are required");
   }
 
   return new Promise((resolvePromise, rejectPromise) => {
+    const timerOriginMonotonicMs = monotonicNow();
     const child = spawn(command, args, {
       cwd,
       stdio,
@@ -101,26 +154,64 @@ export function runOwnedProcess({
     let timedOut = false;
     let settled = false;
     let forceKillTimer = null;
+    let cleanupDeadlineTimer = null;
+    let cleanupStartedMonotonicMs = null;
+
+    const result = (exitCode, signal, cleanupCompleted) => Object.freeze({
+      timedOut,
+      exitCode,
+      signal,
+      cleanupCompleted,
+      timerOrigin: "IMMEDIATELY_BEFORE_CHILD_SPAWN",
+      runtimeElapsedMs: Math.max(
+        0,
+        (cleanupStartedMonotonicMs ?? monotonicNow()) - timerOriginMonotonicMs,
+      ),
+      cleanupElapsedMs: cleanupStartedMonotonicMs === null
+        ? 0
+        : Math.max(0, monotonicNow() - cleanupStartedMonotonicMs),
+    });
 
     const timeout = setTimeout(() => {
       timedOut = true;
+      cleanupStartedMonotonicMs = monotonicNow();
+      const forceDelayMs = Math.max(1, Math.floor(cleanupTimeoutMs / 2));
       if (process.platform === "win32") {
-        terminateWindowsProcessTree(child.pid);
+        void terminateWindowsProcessTree(child.pid, false, forceDelayMs).catch(() => {});
+        forceKillTimer = setTimeout(
+          () => {
+            void terminateWindowsProcessTree(
+              child.pid,
+              true,
+              Math.max(1, cleanupTimeoutMs - forceDelayMs),
+            ).catch(() => {});
+          },
+          forceDelayMs,
+        );
+        forceKillTimer.unref();
       } else {
         signalPosixProcessTree(child.pid, "SIGTERM");
         forceKillTimer = setTimeout(
           () => signalPosixProcessTree(child.pid, "SIGKILL"),
-          1_000,
+          forceDelayMs,
         );
         forceKillTimer.unref();
       }
-    }, timeoutMs);
+      cleanupDeadlineTimer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        child.unref?.();
+        resolvePromise(result(null, null, false));
+      }, cleanupTimeoutMs);
+      cleanupDeadlineTimer.unref?.();
+    }, Math.max(1, timeoutMs - Math.max(0, monotonicNow() - timerOriginMonotonicMs)));
 
     child.once("error", (error) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
       if (forceKillTimer) clearTimeout(forceKillTimer);
+      if (cleanupDeadlineTimer) clearTimeout(cleanupDeadlineTimer);
       rejectPromise(error);
     });
     child.once("close", (exitCode, signal) => {
@@ -128,14 +219,17 @@ export function runOwnedProcess({
       settled = true;
       clearTimeout(timeout);
       if (forceKillTimer) clearTimeout(forceKillTimer);
-      resolvePromise(Object.freeze({ timedOut, exitCode, signal }));
+      if (cleanupDeadlineTimer) clearTimeout(cleanupDeadlineTimer);
+      resolvePromise(result(exitCode, signal, true));
     });
 
     try {
       onSpawn(Object.freeze({ pid: child.pid }));
     } catch (error) {
       clearTimeout(timeout);
-      if (process.platform === "win32") terminateWindowsProcessTree(child.pid);
+      if (process.platform === "win32") {
+        void terminateWindowsProcessTree(child.pid, true, cleanupTimeoutMs).catch(() => {});
+      }
       else signalPosixProcessTree(child.pid, "SIGKILL");
       rejectPromise(error);
     }
@@ -156,8 +250,21 @@ export async function superviseUploadProcess(
     command: process.execPath,
     args: [UPLOAD_ENTRY, ...parsed.uploaderArgs],
     timeoutMs: parsed.timeoutMs,
+    cleanupTimeoutMs: parsed.cleanupTimeoutMs,
     cwd: repoRoot,
     stdio: "inherit",
+  });
+  const timing = Object.freeze({
+    innerRuntimeTimeoutMs: parsed.timeoutMs,
+    innerCleanupTimeoutMs: parsed.cleanupTimeoutMs,
+    timerOrigin: result.timerOrigin ?? "IMMEDIATELY_BEFORE_CHILD_SPAWN",
+    runtimeElapsedMs: Number.isFinite(result.runtimeElapsedMs)
+      ? result.runtimeElapsedMs
+      : null,
+    cleanupElapsedMs: Number.isFinite(result.cleanupElapsedMs)
+      ? result.cleanupElapsedMs
+      : null,
+    cleanupCompleted: result.cleanupCompleted ?? true,
   });
 
   if (!result.timedOut) {
@@ -166,6 +273,7 @@ export async function superviseUploadProcess(
       uploaderInvocationCount: 1,
       childExitCode: result.exitCode,
       childSignal: result.signal,
+      ...timing,
     });
   }
 
@@ -184,6 +292,7 @@ export async function superviseUploadProcess(
     perChunkResults: Object.freeze([]),
     childExitCode: result.exitCode,
     childSignal: result.signal,
+    ...timing,
   });
 }
 

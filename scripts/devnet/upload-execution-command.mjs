@@ -12,7 +12,10 @@ import {
 
 import { inspectUpgradeableBuffer } from "./live-deployment.mjs";
 import { makeLoaderV3WriteInstruction } from "./loader-v3-codec.mjs";
-import { createRpcRequestScheduler } from "./rpc-request-scheduler.mjs";
+import {
+  DEFAULT_RPC_REQUEST_TIMEOUT_MS,
+  createRpcRequestScheduler,
+} from "./rpc-request-scheduler.mjs";
 import {
   calculateFunding,
   PLAN_UPLOAD_IDENTITIES,
@@ -522,6 +525,10 @@ export async function executeUploadWindow(request, adapters) {
         adapters.rpcRequestPolicy?.globalRequestStartGapMs ??
         schedulerPolicy?.minimumRequestStartGapMs ??
         500,
+      requestTimeoutMs:
+        adapters.rpcRequestPolicy?.requestTimeoutMs ??
+        schedulerPolicy?.requestTimeoutMs ??
+        DEFAULT_RPC_REQUEST_TIMEOUT_MS,
       confirmationPollIntervalMs:
         adapters.rpcRequestPolicy?.confirmationPollIntervalMs ??
         CONFIRMATION_POLL_INTERVAL_MS,
@@ -746,18 +753,21 @@ export function createProductionUploadDependencies(url, {
   monotonicNow,
   schedulerSleep,
   transactionSleep,
+  requestTimeoutMs = DEFAULT_RPC_REQUEST_TIMEOUT_MS,
 } = {}) {
   const connection = injectedConnection ?? new Connection(url, { commitment: "confirmed", disableRetryOnRateLimit: true });
   const sleep = transactionSleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const requestMonotonicNow = monotonicNow ?? (() => performance.now());
   const rpcRequestScheduler = createRpcRequestScheduler({
     monotonicNow: requestMonotonicNow,
+    requestTimeoutMs,
     ...(schedulerSleep ? { sleep: schedulerSleep } : {}),
   });
   const rpcRequestLedger = rpcRequestScheduler.ledger;
   const schedulerPolicy = rpcRequestScheduler.policy();
   const rpcRequestPolicy = Object.freeze({
     globalRequestStartGapMs: schedulerPolicy.minimumRequestStartGapMs,
+    requestTimeoutMs: schedulerPolicy.requestTimeoutMs,
     confirmationPollIntervalMs: CONFIRMATION_POLL_INTERVAL_MS,
     rateLimitRetryScheduleMs: Object.freeze([...schedulerPolicy.retryBackoffMs]),
   });
@@ -817,18 +827,26 @@ export function createProductionUploadDependencies(url, {
       const deadlineMonotonicMs = requestMonotonicNow() + timeoutMs;
       let lastStatusAttemptStartMs = null;
       while (requestMonotonicNow() < deadlineMonotonicMs) {
-        const response = await rpcRequestScheduler.schedule({
-          methodClass: "GET_SIGNATURE_STATUSES",
-          signaturePersisted: true,
-          mutationCapability: "read",
-        }, () => connection.getSignatureStatuses([signature], { searchTransactionHistory: true }), {
-          ...(lastStatusAttemptStartMs === null ? {} : {
-            notBeforeMonotonicMs: lastStatusAttemptStartMs + CONFIRMATION_POLL_INTERVAL_MS,
-          }),
-          onInvocationStart({ startMonotonicMs }) {
-            lastStatusAttemptStartMs = startMonotonicMs;
-          },
-        });
+        let response;
+        try {
+          response = await rpcRequestScheduler.schedule({
+            methodClass: "GET_SIGNATURE_STATUSES",
+            signaturePersisted: true,
+            mutationCapability: "read",
+          }, () => connection.getSignatureStatuses([signature], { searchTransactionHistory: true }), {
+            deadlineMonotonicMs,
+            requiredCleanupMs: 0,
+            ...(lastStatusAttemptStartMs === null ? {} : {
+              notBeforeMonotonicMs: lastStatusAttemptStartMs + CONFIRMATION_POLL_INTERVAL_MS,
+            }),
+            onInvocationStart({ startMonotonicMs }) {
+              lastStatusAttemptStartMs = startMonotonicMs;
+            },
+          });
+        } catch (error) {
+          if (error?.classification === "RPC_DEADLINE_EXHAUSTED") return null;
+          throw error;
+        }
         const status = response.value[0];
         if (status?.err || status?.confirmationStatus === "finalized") return status;
         if (lastStatusAttemptStartMs + CONFIRMATION_POLL_INTERVAL_MS >= deadlineMonotonicMs) return null;

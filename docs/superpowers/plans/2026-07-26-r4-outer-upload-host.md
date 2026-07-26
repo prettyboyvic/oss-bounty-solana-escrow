@@ -89,3 +89,32 @@
 - [x] Run focused host and supervisor tests, uploader lifecycle/state/plan/identity tests, the complete devnet suite, syntax checks, TypeScript check, Rust tests/formatting, CI YAML parsing, bounded random-port harnesses, `git diff --check`, secret scan, artifact review, and exact changed-path accounting.
 - [x] Recheck state/buffer/binary identities and prove no signer, lease, uploader, or write RPC occurred.
 - [ ] Review the diff, create one commit `feat(devnet): add bounded upload window host`, push a clean fast-forward `main`, and verify exact-SHA GitHub Actions.
+
+---
+
+### Authorization-contract repair addendum
+
+**Goal:** Repair the remaining reproducibility, request-duration, inner
+cleanup, and complete-host-deadline blockers without executing R4N.
+
+- [x] Add RED golden-vector and mutation tests for
+  `R4_CANDIDATE_EVIDENCE_V1`.
+- [x] Implement deterministic bytes, digest verification, strict candidate
+  schema validation, and production host binding.
+- [x] Mark the historical digest `LEGACY_NON_REPRODUCIBLE`.
+- [x] Add RED scheduler tests for hanging reads, bounded retries, deadline
+  exhaustion, distinct outcomes, and one-call ambiguous writes.
+- [x] Implement finite per-attempt timeout, AbortSignal propagation,
+  method-aware retry, deadline admission, duration, and telemetry timeout
+  count.
+- [x] Require live-uploader `--rpc-request-timeout-ms`.
+- [x] Add RED inner-supervisor tests and implement explicit timer origin,
+  runtime, graceful cleanup, halfway escalation, hard cleanup bound,
+  child-close handling, and machine-readable timing evidence.
+- [x] Add RED host tests and implement six timeout components, complete
+  arithmetic, stage timings, finalization timeout, precedence, one child, and
+  permanent execution-ID consumption.
+- [ ] Complete the full safe validation ladder, one intentional repair commit,
+  clean fast-forward push, and exact-SHA CI.
+
+This repair does not authorize R4N.

@@ -217,6 +217,7 @@ test("production dependency set owns one shared scheduler and empty bounded ledg
     queueCapacity: 256,
     ledgerCapacity: 256,
     minimumRequestStartGapMs: 500,
+    requestTimeoutMs: 15000,
     retryBackoffMs: [2000, 5000],
   });
   assert.equal(dependencies.rpcRequestScheduler.ledger, dependencies.rpcRequestLedger);
@@ -224,13 +225,14 @@ test("production dependency set owns one shared scheduler and empty bounded ledg
     globalRequestStartGapMs: 500,
     confirmationPollIntervalMs: 2000,
     rateLimitRetryScheduleMs: [2000, 5000],
+    requestTimeoutMs: 15000,
   });
   assert.deepEqual(dependencies.rpcRequestLedger.summary(), {
     capacity: 256,
     totalRecorded: 0,
     retained: 0,
     dropped: 0,
-    countsByOutcome: { SUCCESS: 0, RPC_RATE_LIMITED: 0, RPC_ERROR: 0 },
+    countsByOutcome: { SUCCESS: 0, RPC_RATE_LIMITED: 0, RPC_REQUEST_TIMEOUT: 0, RPC_ERROR: 0 },
     countsByMethod: {
       GET_GENESIS_HASH: 0,
       GET_ACCOUNT_INFO: 0,

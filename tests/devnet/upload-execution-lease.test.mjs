@@ -180,6 +180,7 @@ function telemetryStore(directory) {
       globalRequestStartGapMs: 500,
       confirmationPollIntervalMs: 2_000,
       rateLimitRetryScheduleMs: [2_000, 5_000],
+      requestTimeoutMs: 15_000,
       interChunkDelayMs: 3_000,
     },
   });
@@ -614,6 +615,7 @@ test("release rejects telemetry from a different execution or lease start", () =
         globalRequestStartGapMs: 500,
         confirmationPollIntervalMs: 2_000,
         rateLimitRetryScheduleMs: [2_000, 5_000],
+        requestTimeoutMs: 15_000,
         interChunkDelayMs: 3_000,
       },
     });

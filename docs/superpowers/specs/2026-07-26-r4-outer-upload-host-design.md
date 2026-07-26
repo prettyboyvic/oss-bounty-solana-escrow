@@ -31,6 +31,68 @@ The host exposes dependency-injection seams for Git/process checks, finalized
 buffer verification, spawning, clocks/timers, cleanup, and filesystem failure
 tests. Production defaults remain closed and fail before spawn.
 
+## Candidate-evidence contract
+
+Canonical evidence uses schema `R4_CANDIDATE_EVIDENCE_V1` and exact top-level
+field order `schema`, `stateSha256`, `binarySha256`, `planFingerprint`,
+`candidateCount`, `candidates`. Each candidate uses exact field order `index`,
+`offset`, `length`, `payloadSha256`, `serializedTransactionBytes`,
+`expectedState`, `expectedSignature` and appears in ascending index order.
+Integers are base-10 JSON integers, a missing signature is JSON `null`, strings
+use JSON escaping, and serialization has no whitespace or trailing newline.
+The hash input is UTF-8 `R4_CANDIDATE_EVIDENCE_V1`, a NUL byte, then canonical
+JSON. Duplicate, unsorted, missing, extra, or malformed fields are rejected.
+
+The historical digest
+`6554cbe1ad09b9e621a709dde9c4fb2f59404a8d2a8551a133552fe2ef345180`
+is `LEGACY_NON_REPRODUCIBLE`; it is not accepted as a new manifest binding.
+
+## Complete deadline contract
+
+The exact components are `innerRuntimeTimeoutMs`, `innerCleanupTimeoutMs`,
+`childLifecycleTimeoutMs`, `outerCleanupAllowanceMs`,
+`finalizationTimeoutMs`, and `hostTotalTimeoutMs`. Inner values are parsed from
+the actual nested supervisor command. Before spawn the host requires:
+
+```text
+childLifecycleTimeoutMs > innerRuntimeTimeoutMs + innerCleanupTimeoutMs
+hostTotalTimeoutMs > childLifecycleTimeoutMs + outerCleanupAllowanceMs + finalizationTimeoutMs
+hostTotalTimeoutMs > innerRuntimeTimeoutMs + innerCleanupTimeoutMs + outerCleanupAllowanceMs + finalizationTimeoutMs
+```
+
+The host timeline begins immediately before its single spawn; verification,
+authorization persistence, and final local revalidation are pre-spawn. The
+child watchdog owns child lifecycle. Outer termination is graceful, escalates
+halfway through the outer cleanup allowance, and fails at its full bound.
+
+The inner supervisor starts its runtime timer immediately before child spawn.
+At timeout it begins graceful owned-tree cleanup, force-escalates halfway
+through its explicit cleanup bound, and emits after child close or the cleanup
+deadline. Configured values, timer origin, actual elapsed times, and cleanup
+verdict are machine-readable.
+
+Finalization covers stdout/stderr closure, terminal parsing, complete log
+hashing, result construction, atomic write/fsync/rename, directory flush, and
+durable preparation of the terminal envelope. The persisted record is
+pre-emission; stdout follows durable persistence. Synchronous Node filesystem
+calls cannot be cancelled mid-call, so each is checked immediately before and
+after against the monotonic deadline. Any observed overrun is overwritten
+fail-closed as `HOST_FINALIZATION_TIMEOUT`.
+
+## RPC request deadline contract
+
+The live command supplies positive integer `rpc-request-timeout-ms`.
+Scheduler attempts preserve the 500 ms request-start gap and existing
+2000/5000 ms retry backoffs. Retry-safe reads may retry rate limits or
+`RPC_REQUEST_TIMEOUT`; other failures do not gain retries. Every operation
+receives an `AbortSignal`, and no attempt begins when the remaining operation
+deadline cannot fit its timeout plus required cleanup. A timed-out write,
+especially `SEND_RAW_TRANSACTION`, is never resent and remains ambiguous for
+read-only reconciliation. Telemetry records duration and a timeout count.
+Solana Web3 methods that do not accept an abort signal may still settle their
+transport promise later; the scheduler stops waiting at the bound and treats a
+write that does so as ambiguous rather than claiming transport cancellation.
+
 ## Durable evidence and outcomes
 
 Every execution that reaches child spawn normally contains:
@@ -61,13 +123,14 @@ cleanup, or result persistence fails.
 The deterministic precedence is:
 
 1. log, invocation-evidence, or durable-result persistence failure;
-2. cleanup failure;
-3. host interruption;
-4. outer timeout;
-5. child-spawn failure;
-6. malformed or missing inner terminal result;
-7. nonzero child result;
-8. successful child with a valid terminal result.
+2. finalization timeout;
+3. cleanup failure;
+4. host interruption;
+5. outer timeout;
+6. child-spawn failure;
+7. malformed or missing inner terminal result;
+8. nonzero child result;
+9. successful child with a valid terminal result.
 
 Manifest failure and execution-ID reuse are pre-spawn outcomes. A safe
 nonzero child exit is retained in evidence, while the host uses distinct
@@ -104,3 +167,5 @@ filesystem seams. A real-process fake supervisor fixture proves streamed logs,
 terminal parsing, timeout cleanup, single-use IDs, and unrelated-process
 isolation without invoking the uploader. Existing uploader and supervisor
 tests remain unchanged.
+
+This repair does not authorize R4N.
