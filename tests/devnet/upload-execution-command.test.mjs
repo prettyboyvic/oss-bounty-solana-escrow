@@ -25,7 +25,11 @@ import {
   leasePaths,
   reconcileUploadLease,
 } from "../../scripts/devnet/upload-execution-lease.mjs";
-import { readUploadTelemetry } from "../../scripts/devnet/upload-execution-telemetry.mjs";
+import {
+  createUploadTelemetryStore,
+  readUploadTelemetry,
+} from "../../scripts/devnet/upload-execution-telemetry.mjs";
+import { readUploadTerminalEvidence } from "../../scripts/devnet/upload-terminal-evidence.mjs";
 
 const RPC = "https://api.devnet.solana.com";
 const GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
@@ -246,6 +250,229 @@ test("production dependency set owns one shared scheduler and empty bounded ledg
       SEND_RAW_TRANSACTION: 0,
     },
   });
+});
+
+test("preflight ledger replay failure terminalizes before every signing and send boundary", async () => {
+  const input = fixture({ chunks: 1 });
+  const runtime = productionRuntime(input);
+  const boundaryCalls = [];
+  let replayed = 0;
+  runtime.dependencies.executionId = () => "window-replay-terminal";
+  runtime.dependencies.pid = 9301;
+  runtime.dependencies.hostname = "test-host";
+  runtime.dependencies.now = () => "2026-07-26T09:20:10.943Z";
+  runtime.dependencies.loadAuthorityKeypair = async () => {
+    boundaryCalls.push("keypair");
+    throw new Error("forbidden keypair access");
+  };
+  runtime.dependencies.getLatestBlockhash = async () => {
+    boundaryCalls.push("blockhash");
+    throw new Error("forbidden blockhash");
+  };
+  runtime.dependencies.buildAndSign = async () => {
+    boundaryCalls.push("sign");
+    throw new Error("forbidden signing");
+  };
+  runtime.dependencies.sendRawTransaction = async () => {
+    boundaryCalls.push("send");
+    throw new Error("forbidden send");
+  };
+  runtime.dependencies.createUploadTelemetryStore = (options) => {
+    const store = createUploadTelemetryStore(options);
+    return {
+      ...store,
+      recordRpcEntry(value, context) {
+        replayed += 1;
+        if (replayed === 2) throw new Error("telemetry request schema is invalid");
+        return store.recordRpcEntry(value, context);
+      },
+    };
+  };
+
+  let error;
+  try {
+    await executeUploadWindow(input.request, runtime.dependencies);
+    assert.fail("expected telemetry replay failure");
+  } catch (caught) {
+    error = caught;
+  }
+  assert.match(error.message, /telemetry request schema is invalid/);
+  assert.equal(error.safeCode, "TELEMETRY_REPLAY_VALIDATION_FAILED");
+  assert.equal(error.safePhase, "TELEMETRY_REPLAY");
+  assert.equal(replayed, 2);
+  assert.deepEqual(boundaryCalls, []);
+  assert.equal(readUploadTelemetry(leasePaths(input.statePath).activeDirectory).snapshot.requests.length, 1);
+  const terminal = readUploadTerminalEvidence(leasePaths(input.statePath).activeDirectory);
+  assert.equal(terminal.record.classification, "FAILED_PRE_SELECTION_STALE_SAFE");
+  assert.equal(terminal.record.primaryError.code, "TELEMETRY_REPLAY_VALIDATION_FAILED");
+  assert.deepEqual(terminal.record.boundaries, {
+    blockhashRequestCount: 0,
+    candidateSelectionCount: 0,
+    keypairAccessCount: 0,
+    sendAttemptCount: 0,
+    signatureRecordedCount: 0,
+    signingAttemptCount: 0,
+  });
+  assert.deepEqual(
+    JSON.parse(readFileSync(input.statePath)).deployment.buffer.chunks.map(
+      ({ status, signature }) => ({ status, signature }),
+    ),
+    [{ status: "PLANNED", signature: null }],
+  );
+});
+
+test("telemetry initialization and subscriber setup failures both terminalize pre-selection", async () => {
+  for (const scenario of [
+    {
+      name: "initialization",
+      expectedCode: "TELEMETRY_INITIALIZATION_FAILED",
+      expectedPhase: "TELEMETRY_INITIALIZATION",
+      configure(runtime) {
+        runtime.dependencies.createUploadTelemetryStore = () => {
+          throw Object.freeze(
+            new Error("injected telemetry initialization failure"),
+          );
+        };
+      },
+    },
+    {
+      name: "post-acquire-policy",
+      expectedCode: "TELEMETRY_INITIALIZATION_FAILED",
+      expectedPhase: "TELEMETRY_INITIALIZATION",
+      configure(runtime) {
+        const scheduler = runtime.dependencies.rpcRequestScheduler;
+        runtime.dependencies.rpcRequestScheduler = new Proxy(scheduler, {
+          get(target, property, receiver) {
+            if (property === "policy") {
+              return () => {
+                throw "injected primitive post-acquire policy failure";
+              };
+            }
+            return Reflect.get(target, property, receiver);
+          },
+        });
+      },
+    },
+    {
+      name: "subscriber",
+      expectedCode: "TELEMETRY_SUBSCRIBER_SETUP_FAILED",
+      expectedPhase: "SUBSCRIBER_SETUP",
+      configure(runtime) {
+        const ledger = runtime.dependencies.rpcRequestLedger;
+        runtime.dependencies.rpcRequestLedger = {
+          ...ledger,
+          subscribe() {
+            throw new Error("injected subscriber setup failure");
+          },
+        };
+      },
+    },
+  ]) {
+    const input = fixture({ chunks: 1 });
+    const runtime = productionRuntime(input);
+    const forbidden = [];
+    runtime.dependencies.executionId = () => `window-${scenario.name}-terminal`;
+    runtime.dependencies.pid = 9310;
+    runtime.dependencies.hostname = "test-host";
+    runtime.dependencies.now = () => "2026-07-26T09:20:10.943Z";
+    runtime.dependencies.loadAuthorityKeypair = async () => forbidden.push("keypair");
+    runtime.dependencies.getLatestBlockhash = async () => forbidden.push("blockhash");
+    runtime.dependencies.buildAndSign = async () => forbidden.push("sign");
+    runtime.dependencies.sendRawTransaction = async () => forbidden.push("send");
+    scenario.configure(runtime);
+
+    let error;
+    try {
+      await executeUploadWindow(input.request, runtime.dependencies);
+      assert.fail(`expected ${scenario.name} failure`);
+    } catch (caught) {
+      error = caught;
+    }
+    assert.equal(error.safeCode, scenario.expectedCode);
+    assert.equal(error.safePhase, scenario.expectedPhase);
+    assert.deepEqual(forbidden, []);
+    const terminal = readUploadTerminalEvidence(leasePaths(input.statePath).activeDirectory);
+    assert.equal(terminal.record.classification, "FAILED_PRE_SELECTION_STALE_SAFE");
+    assert.equal(terminal.record.primaryError.code, scenario.expectedCode);
+  }
+});
+
+test("telemetry finish and fallback persistence failures never hide the primary error", async () => {
+  {
+    const input = fixture({ chunks: 1 });
+    const runtime = productionRuntime(input);
+    runtime.dependencies.executionId = () => "window-primary-precedence";
+    runtime.dependencies.pid = 9320;
+    runtime.dependencies.hostname = "test-host";
+    runtime.dependencies.now = () => "2026-07-26T09:20:10.943Z";
+    runtime.dependencies.loadAuthorityKeypair = async () => {
+      throw new Error("buffer authority signer mismatch");
+    };
+    runtime.dependencies.createUploadTelemetryStore = (options) => {
+      const store = createUploadTelemetryStore(options);
+      return {
+        ...store,
+        finish() {
+          throw new Error("injected telemetry finish failure");
+        },
+      };
+    };
+    let error;
+    try {
+      await executeUploadWindow(input.request, runtime.dependencies);
+      assert.fail("expected primary signer failure");
+    } catch (caught) {
+      error = caught;
+    }
+    assert.match(error.message, /signer mismatch/);
+    assert.equal(error.safeCode, "UPLOAD_EXECUTION_FAILED");
+    assert.ok(error.secondaryErrors.some(
+      ({ code }) => code === "TELEMETRY_PERSISTENCE_FAILED",
+    ));
+    assert.equal(
+      JSON.parse(readFileSync(input.statePath)).deployment.buffer.uploadWindows[0].status,
+      "SIGNER_MISMATCH",
+    );
+  }
+
+  {
+    const input = fixture({ chunks: 1 });
+    const runtime = productionRuntime(input);
+    let replayed = 0;
+    runtime.dependencies.executionId = () => "window-fallback-precedence";
+    runtime.dependencies.pid = 9321;
+    runtime.dependencies.hostname = "test-host";
+    runtime.dependencies.now = () => "2026-07-26T09:20:10.943Z";
+    runtime.dependencies.createUploadTelemetryStore = (options) => {
+      const store = createUploadTelemetryStore(options);
+      return {
+        ...store,
+        recordRpcEntry(value, context) {
+          replayed += 1;
+          if (replayed === 2) throw new Error("telemetry request schema is invalid");
+          return store.recordRpcEntry(value, context);
+        },
+      };
+    };
+    runtime.dependencies.writeUploadTerminalEvidence = () => {
+      throw new Error("injected fallback persistence failure");
+    };
+    let error;
+    try {
+      await executeUploadWindow(input.request, runtime.dependencies);
+      assert.fail("expected replay failure");
+    } catch (caught) {
+      error = caught;
+    }
+    assert.match(error.message, /telemetry request schema is invalid/);
+    assert.ok(error.secondaryErrors.some(
+      ({ code }) => code === "FALLBACK_TERMINAL_PERSISTENCE_FAILED",
+    ));
+    assert.equal(
+      readUploadTerminalEvidence(leasePaths(input.statePath).activeDirectory).availability,
+      "UNAVAILABLE",
+    );
+  }
 });
 
 test("three roughly 13-second finalized confirmations use bounded 2000ms normal polls", async (t) => {

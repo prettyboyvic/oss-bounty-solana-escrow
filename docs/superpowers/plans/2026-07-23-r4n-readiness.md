@@ -5,6 +5,13 @@
 R4N is not executed by this plan. It is a new label and must never be treated
 as an R4M retry or replay.
 
+The separately authorized R4N attempt with outer execution ID
+`6c955b77-a82d-4c0d-b8ae-e85cb28b759a` and inner execution ID
+`c44e7175-9184-4324-8d6e-94f09374434c` is spent and cannot be replayed. It
+failed after lease acquisition but before candidate selection. The preserved
+lease remains active pending a separately authorized recovery; the recovery
+command was not executed by the repair publication.
+
 The inner timeout-hardening gate has passed. The repository now owns the outer
 host implementation, but this implementation does not authorize R4N.
 R4N remains `R4N_NOT_READY` until the outer-host commit is pushed, exact-SHA CI
@@ -211,3 +218,23 @@ R4N preparation requires a new read-only pass, a fresh authorization manifest,
 and a new execution ID.
 
 This repair does not authorize R4N.
+
+## Pre-selection failure repair
+
+The incident retained one incomplete telemetry request and no send/signature
+evidence. Fractional elapsed-duration validation is the probable reproducible
+failure class, but the deliberately sanitized public error cannot prove a
+unique historical cause. The absence of durable terminal evidence and the
+lack of an evidence-bound pre-selection cleanup path were proven defects.
+
+The repair derives telemetry duration from monotonic endpoints with a bounded
+floating representation check, installs a post-acquire lifecycle guard, writes
+whitelisted terminal evidence on failure, and adds separate read-only
+reconciliation and acknowledged archival recovery commands. It does not
+change transaction construction, instruction/account/signer selection,
+pacing, retry, confirmation, or outer-host exactly-once behavior.
+
+Publication of this repair does not authorize recovery, replay, a new R4N
+window, or any devnet write. Recovery must first run the exact read-only
+pre-selection reconciliation command against fresh evidence, then receive
+separate authorization for its returned recovery hash.

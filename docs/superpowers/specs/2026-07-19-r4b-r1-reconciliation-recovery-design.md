@@ -54,6 +54,30 @@ alone never changes a result. `SAFE_TO_RELEASE` with non-empty
 `proposedTransitions` is safe evidence for local reconciliation application,
 but is deliberately not release-ready.
 
+Dead-owner failures proven to precede candidate selection use a separate
+contract. `reconcile-pre-selection-upload-lease` binds the exact active lease
+path and SHA, terminal-or-legacy telemetry evidence SHA, outer and inner
+execution IDs, repository/state/finalized-buffer hashes, public identities,
+candidate indexes, retained-process result, operation-lock absence, and
+explicit zero-send/dead-owner assertions. It is read-only and returns only
+`RECOVERY_ELIGIBLE` or a bounded fail-closed reason.
+
+`recover-pre-selection-upload-lease` requires the exact fresh recovery hash
+and acknowledgement `R4_RECOVER_PRE_SELECTION_LEASE`. It re-evaluates the
+same evidence while owning the shared operation lock, durably persists
+`recovery.json`, atomically renames only the bound lease into
+`history/upload-leases`, and verifies every archived file hash. It does not
+edit deployment state or perform an on-chain write. Archive failure leaves the
+active lease and receipt intact for an exact idempotent retry.
+
+The mutation pass freshly reacquires repository, process, state, and paced
+finalized-buffer observations after lock ownership; it cannot reuse the
+earlier eligibility snapshot. The recovery hash and receipt bind the complete
+pre-recovery lease-file projection, and idempotent replay rejects a missing,
+unexpected, malformed, or hash-drifted archive. `recovery.json` is the durable
+terminal lifecycle marker; the original `lease.json` remains byte-identical
+incident evidence.
+
 ## Reconciliation decision flow
 
 ```mermaid

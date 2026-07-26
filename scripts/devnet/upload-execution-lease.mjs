@@ -3,26 +3,34 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   renameSync as nodeRenameSync,
   rmdirSync,
   writeFileSync,
 } from "node:fs";
 import { hostname as currentHostname } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import {
   APPLY_RECONCILIATION_ACKNOWLEDGEMENT,
+  RECOVER_PRE_SELECTION_LEASE_ACKNOWLEDGEMENT,
   RELEASE_LEASE_ACKNOWLEDGEMENT,
 } from "./upload-execution-contract.mjs";
+import {
+  flushDirectory as flushDirectoryDurably,
+  writeCanonicalJsonAtomic,
+} from "./durable-json.mjs";
 import { saveStateAtomic, validateChunkRecords } from "./state.mjs";
 import { createPlanFingerprint } from "./throttled-uploader.mjs";
 import { deriveMaxWritePayload } from "./upload-plan.mjs";
 import { readUploadTelemetry } from "./upload-execution-telemetry.mjs";
+import { readUploadTerminalEvidence } from "./upload-terminal-evidence.mjs";
 
 const RECONCILIATION_PROOF_VERSION = "UPLOAD_LEASE_RECONCILIATION_V2";
 const ONCHAIN_PROOF_VERSION = "UPLOAD_LEASE_ONCHAIN_V1";
 const APPLY_RECEIPT_VERSION = "UPLOAD_RECONCILIATION_V1";
 const RELEASE_RECEIPT_VERSION = "UPLOAD_LEASE_RELEASE_V1";
+const PRE_SELECTION_RECOVERY_VERSION = "UPLOAD_PRE_SELECTION_RECOVERY_V1";
 const HEX_64 = /^[a-f0-9]{64}$/;
 const SAFE_EXECUTION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
@@ -108,9 +116,17 @@ export function acquireUploadLease(input) {
     stateSha256AtAcquire: input.stateSha256,
   };
   const temporary = join(paths.activeDirectory, "lease.json.tmp");
-  writeFileSync(temporary, `${JSON.stringify(metadata, null, 2)}\n`, { flag: "wx" });
+  const metadataBytes = Buffer.from(`${JSON.stringify(metadata, null, 2)}\n`);
+  writeFileSync(temporary, metadataBytes, { flag: "wx" });
   nodeRenameSync(temporary, paths.metadataPath);
-  return { status: "ACTIVE", executionId: input.executionId, stateMutation: true, onchainWrite: false };
+  return {
+    status: "ACTIVE",
+    executionId: input.executionId,
+    leaseSha256: sha256(metadataBytes),
+    stateSha256AtAcquire: input.stateSha256,
+    stateMutation: true,
+    onchainWrite: false,
+  };
 }
 
 function failure(result, lifecycle = "RECONCILIATION_REQUIRED") {
@@ -632,6 +648,491 @@ function acquireOperationLock(statePath) {
     throw error;
   }
   return lockPath;
+}
+
+function preSelectionFailure(reason) {
+  return {
+    command: "reconcile-pre-selection-upload-lease",
+    result: "RECOVERY_INELIGIBLE",
+    reason,
+    lifecycle: "RECONCILIATION_REQUIRED",
+    stateMutation: false,
+    onchainWrite: false,
+  };
+}
+
+function ownerProcessStatus(lease, adapters) {
+  if (typeof adapters.ownerProcessStatus === "function") {
+    return adapters.ownerProcessStatus(structuredClone(lease));
+  }
+  return defaultProcessIsActive(lease.pid, lease.hostname) ? "LIVE" : "DEAD";
+}
+
+function fileProjection(directory, names) {
+  return Object.fromEntries(names.map((name) => {
+    const bytes = readFileSync(join(directory, name));
+    return [name, { bytes: bytes.length, sha256: sha256(bytes) }];
+  }));
+}
+
+function readOuterPreSelectionEvidence(directory, expected, lease) {
+  const names = [
+    "authorization.json",
+    "host-result.json",
+    "invocation.json",
+    "supervisor-stderr.log",
+    "supervisor-stdout.log",
+  ];
+  if (readdirSync(directory).sort().join("\0") !== names.sort().join("\0")) {
+    throw new Error("outer evidence file set mismatch");
+  }
+  const authorization = readJson(join(directory, "authorization.json"));
+  const invocation = readJson(join(directory, "invocation.json"));
+  const hostResult = readJson(join(directory, "host-result.json"));
+  const stdoutBytes = readFileSync(join(directory, "supervisor-stdout.log"));
+  const stderrBytes = readFileSync(join(directory, "supervisor-stderr.log"));
+  const supervisor = JSON.parse(stdoutBytes.toString("utf8"));
+  const publicError = JSON.parse(stderrBytes.toString("utf8"));
+  const manifest = authorization.expectedManifest;
+  const consumedAt = Date.parse(authorization.consumedAt);
+  const spawnedAt = Date.parse(invocation.spawnedAt);
+  const hostStartedAt = Date.parse(hostResult.startedAt);
+  const leaseStartedAt = Date.parse(lease.startedAt);
+  const hostFinishedAt = Date.parse(hostResult.finishedAt);
+  if (authorization.schemaVersion !== "UPLOAD_WINDOW_HOST_AUTHORIZATION_V2" ||
+      authorization.executionId !== expected.outerExecutionId ||
+      !Number.isSafeInteger(authorization.hostPid) ||
+      authorization.expectedInvocations !== 1 ||
+      authorization.retryAllowed !== false ||
+      manifest?.expectedRepositorySha !== expected.repositorySha ||
+      manifest?.expectedStateSha !== expected.stateSha256 ||
+      manifest?.expectedBufferSha !== expected.bufferSha256 ||
+      manifest?.expectedInvocations !== 1 ||
+      !Array.isArray(manifest.expectedCandidates) ||
+      manifest.expectedCandidates.join("\0") !== expected.candidateIndexes.join("\0") ||
+      invocation.schemaVersion !== "UPLOAD_WINDOW_HOST_INVOCATION_V1" ||
+      invocation.executionId !== expected.outerExecutionId ||
+      invocation.hostPid !== authorization.hostPid ||
+      !Number.isSafeInteger(invocation.childPid) ||
+      invocation.childSpawnCount !== 1 ||
+      invocation.retryOccurred !== false ||
+      ![consumedAt, spawnedAt, hostStartedAt, leaseStartedAt, hostFinishedAt]
+        .every(Number.isFinite) ||
+      consumedAt > spawnedAt ||
+      hostStartedAt > spawnedAt ||
+      spawnedAt > leaseStartedAt ||
+      leaseStartedAt > hostFinishedAt ||
+      hostResult.schemaVersion !== "UPLOAD_WINDOW_HOST_RESULT_V2" ||
+      hostResult.executionId !== expected.outerExecutionId ||
+      hostResult.hostPid !== authorization.hostPid ||
+      hostResult.childPid !== invocation.childPid ||
+      canonicalJson(hostResult.expectedManifest) !== canonicalJson(manifest) ||
+      hostResult.childSpawnCount !== 1 ||
+      hostResult.childExitCode !== 1 ||
+      hostResult.verdict !== "HOST_CHILD_NONZERO" ||
+      hostResult.retryOccurred !== false ||
+      hostResult.innerTerminalStatus !== "VALID" ||
+      hostResult.innerTerminalResult?.classification !== "UPLOAD_PROCESS_EXITED" ||
+      hostResult.innerTerminalResult?.uploaderInvocationCount !== 1 ||
+      supervisor.classification !== "UPLOAD_PROCESS_EXITED" ||
+      supervisor.uploaderInvocationCount !== 1 ||
+      supervisor.childExitCode !== 1 ||
+      supervisor.cleanupCompleted !== true ||
+      hostResult.stdout?.bytes !== stdoutBytes.length ||
+      hostResult.stdout?.sha256 !== sha256(stdoutBytes) ||
+      hostResult.stderr?.bytes !== stderrBytes.length ||
+      hostResult.stderr?.sha256 !== sha256(stderrBytes) ||
+      publicError.terminal !== true ||
+      !["COMMAND_FAILED_SAFE", "TELEMETRY_REPLAY_VALIDATION_FAILED",
+        "TELEMETRY_INITIALIZATION_FAILED", "TELEMETRY_PERSISTENCE_FAILED",
+        "TELEMETRY_SUBSCRIBER_SETUP_FAILED"]
+        .includes(publicError.code)) {
+    throw new Error("outer pre-selection evidence mismatch");
+  }
+  return fileProjection(directory, names);
+}
+
+function completePreSelectionExpected(expected) {
+  return expected !== null && typeof expected === "object" &&
+    resolve(expected.leasePath ?? "") === expected.leasePath &&
+    HEX_64.test(expected.leaseSha256 ?? "") &&
+    HEX_64.test(expected.evidenceSha256 ?? "") &&
+    SAFE_EXECUTION_ID.test(expected.outerExecutionId ?? "") &&
+    SAFE_EXECUTION_ID.test(expected.innerExecutionId ?? "") &&
+    /^[a-f0-9]{40}$/.test(expected.repositorySha ?? "") &&
+    HEX_64.test(expected.stateSha256 ?? "") &&
+    HEX_64.test(expected.bufferSha256 ?? "") &&
+    typeof expected.program === "string" &&
+    typeof expected.buffer === "string" &&
+    typeof expected.authority === "string" &&
+    Array.isArray(expected.candidateIndexes) &&
+    expected.candidateIndexes.length > 0 &&
+    expected.candidateIndexes.every((value, index) =>
+      Number.isSafeInteger(value) && value >= 0 &&
+      (index === 0 || value > expected.candidateIndexes[index - 1])) &&
+    expected.zeroSend === true &&
+    expected.deadOwner === true;
+}
+
+function archiveEvidenceHash(directory, names) {
+  return canonicalHash(
+    "UPLOAD_PRE_SELECTION_ARCHIVE_EVIDENCE_V1",
+    fileProjection(
+      directory,
+      names.filter((name) => name !== "recovery.json"),
+    ),
+  );
+}
+
+function completeRecoveryReceipt(
+  receipt,
+  expected,
+  recoveryHash,
+  expectedArchiveEvidenceSha256,
+) {
+  return exactKeys(receipt, [
+    "archiveEvidenceSha256",
+    "bufferSha256",
+    "evidenceSha256",
+    "innerExecutionId",
+    "leaseSha256",
+    "lifecycle",
+    "outerExecutionId",
+    "recoveredAt",
+    "recoveryHash",
+    "repositorySha",
+    "stateSha256",
+    "version",
+  ]) &&
+    receipt.version === PRE_SELECTION_RECOVERY_VERSION &&
+    receipt.lifecycle === "FAILED_PRE_SELECTION_STALE_SAFE" &&
+    receipt.recoveryHash === recoveryHash &&
+    receipt.archiveEvidenceSha256 === expectedArchiveEvidenceSha256 &&
+    receipt.outerExecutionId === expected.outerExecutionId &&
+    receipt.innerExecutionId === expected.innerExecutionId &&
+    receipt.repositorySha === expected.repositorySha &&
+    receipt.stateSha256 === expected.stateSha256 &&
+    receipt.bufferSha256 === expected.bufferSha256 &&
+    receipt.leaseSha256 === expected.leaseSha256 &&
+    receipt.evidenceSha256 === expected.evidenceSha256 &&
+    typeof receipt.recoveredAt === "string";
+}
+
+export function reconcilePreSelectionUploadLease(input, adapters = {}) {
+  try {
+    const expected = input.expected;
+    if (!completePreSelectionExpected(expected) ||
+        resolve(expected.leasePath) !== resolve(leasePaths(input.statePath).activeDirectory)) {
+      return preSelectionFailure("BINDING_MISMATCH");
+    }
+    if (input.observations?.repositorySha !== expected.repositorySha ||
+        input.observations?.bufferDataSha256 !== expected.bufferSha256 ||
+        input.observations?.programAbsent !== true ||
+        input.observations?.confirmedChunksMatch !== true ||
+        input.observations?.retainedProcessesClear !== true ||
+        input.observations?.operationLockAbsent !== true ||
+        (!adapters.allowOwnedOperationLock &&
+          existsSync(operationLockPath(input.statePath)))) {
+      return preSelectionFailure("OBSERVATION_MISMATCH");
+    }
+    const directory = expected.leasePath;
+    const names = readdirSync(directory).sort();
+    const allowed = new Set(["lease.json", "recovery.json", "telemetry.json", "terminal.json"]);
+    if (names.some((name) => !allowed.has(name)) ||
+        !names.includes("lease.json") ||
+        (!names.includes("telemetry.json") && !names.includes("terminal.json"))) {
+      return preSelectionFailure("LEASE_FILE_SET_MISMATCH");
+    }
+    const leaseBytes = readFileSync(join(directory, "lease.json"));
+    const lease = JSON.parse(leaseBytes.toString("utf8"));
+    if (!completeLease(lease) ||
+        sha256(leaseBytes) !== expected.leaseSha256 ||
+        lease.executionId !== expected.innerExecutionId ||
+        lease.program !== expected.program ||
+        lease.buffer !== expected.buffer ||
+        lease.stateSha256AtAcquire !== expected.stateSha256 ||
+        ownerProcessStatus(lease, adapters) !== "DEAD") {
+      return preSelectionFailure("LEASE_OR_OWNER_MISMATCH");
+    }
+    const stateBytes = readFileSync(input.statePath);
+    const state = JSON.parse(stateBytes.toString("utf8"));
+    const storedBuffer = state?.deployment?.buffer;
+    if (sha256(stateBytes) !== expected.stateSha256 ||
+        state?.identities?.program !== expected.program ||
+        storedBuffer?.publicKey !== expected.buffer ||
+        storedBuffer?.expectedAuthority !== expected.authority ||
+        storedBuffer?.planFingerprint !== lease.planFingerprint ||
+        !Array.isArray(storedBuffer?.chunks)) {
+      return preSelectionFailure("STATE_OR_IDENTITY_MISMATCH");
+    }
+    if (input.observations?.buffer?.address !== expected.buffer ||
+        input.observations?.buffer?.owner !== storedBuffer.expectedOwner ||
+        input.observations?.buffer?.authority !== expected.authority ||
+        input.observations?.buffer?.allocation !== storedBuffer.allocatedLength) {
+      return preSelectionFailure("ONCHAIN_IDENTITY_MISMATCH");
+    }
+    if (storedBuffer.chunks.some((chunk) =>
+      chunk?.status === "SENT" ||
+      chunk?.status === "UNKNOWN" ||
+      (chunk?.status === "PLANNED" && chunk?.signature !== null))) {
+      return preSelectionFailure("STATE_NOT_ZERO_SEND");
+    }
+    for (const index of expected.candidateIndexes) {
+      const chunk = storedBuffer.chunks[index];
+      if (!chunk || chunk.index !== index || chunk.status !== "PLANNED" ||
+          chunk.signature !== null) {
+        return preSelectionFailure("CANDIDATE_NOT_ZERO_SEND");
+      }
+    }
+    let evidenceKind;
+    let evidenceBytes;
+    if (names.includes("terminal.json")) {
+      evidenceKind = "terminal";
+      evidenceBytes = readFileSync(join(directory, "terminal.json"));
+      const terminal = readUploadTerminalEvidence(directory).record;
+      if (terminal.executionId !== expected.innerExecutionId ||
+          terminal.leaseSha256 !== expected.leaseSha256 ||
+          terminal.stateSha256Before !== expected.stateSha256 ||
+          terminal.stateSha256After !== expected.stateSha256 ||
+          terminal.program !== expected.program ||
+          terminal.buffer !== expected.buffer ||
+          terminal.authority !== expected.authority ||
+          terminal.classification !== "FAILED_PRE_SELECTION_STALE_SAFE" ||
+          terminal.zeroSendProven !== true ||
+          terminal.ambiguousWriteOutcome !== false) {
+        return preSelectionFailure("TERMINAL_EVIDENCE_MISMATCH");
+      }
+    } else {
+      evidenceKind = "telemetry";
+      evidenceBytes = readFileSync(join(directory, "telemetry.json"));
+    }
+    if (sha256(evidenceBytes) !== expected.evidenceSha256) {
+      return preSelectionFailure("EVIDENCE_HASH_MISMATCH");
+    }
+    if (names.includes("telemetry.json")) {
+      const telemetry = readUploadTelemetry(directory);
+      if (telemetry.availability !== "AVAILABLE" ||
+          telemetry.snapshot.executionId !== expected.innerExecutionId ||
+          telemetry.snapshot.startedAt !== lease.startedAt ||
+          telemetry.snapshot.sends.length !== 0 ||
+          telemetry.snapshot.requests.some((request) =>
+            request.requestType === "SEND_RAW_TRANSACTION" ||
+            request.mutationCapability === "write" ||
+            request.signaturePersisted) ||
+          (evidenceKind === "telemetry" &&
+            (telemetry.verdict !== "INCOMPLETE" ||
+             telemetry.snapshot.requests.length < 1 ||
+             telemetry.snapshot.expectedChunkIndexes.length !== 0))) {
+        return preSelectionFailure("SEND_OR_TELEMETRY_MISMATCH");
+      }
+    }
+    const outerFiles = readOuterPreSelectionEvidence(
+      input.outerEvidenceDirectory,
+      expected,
+      lease,
+    );
+    const projection = {
+      version: PRE_SELECTION_RECOVERY_VERSION,
+      expected,
+      lease: {
+        executionId: lease.executionId,
+        pid: lease.pid,
+        hostname: lease.hostname,
+        startedAt: lease.startedAt,
+      },
+      evidenceKind,
+      leaseFiles: fileProjection(
+        directory,
+        names.filter((name) => name !== "recovery.json"),
+      ),
+      outerFiles,
+    };
+    const archiveEvidenceSha256 = archiveEvidenceHash(directory, names);
+    const recoveryHash = canonicalHash(
+      PRE_SELECTION_RECOVERY_VERSION,
+      projection,
+    );
+    if (names.includes("recovery.json")) {
+      const stored = readJson(join(directory, "recovery.json"));
+      if (!completeRecoveryReceipt(
+        stored,
+        expected,
+        recoveryHash,
+        archiveEvidenceSha256,
+      )) {
+        return preSelectionFailure("RECOVERY_RECEIPT_MISMATCH");
+      }
+    }
+    return {
+      command: "reconcile-pre-selection-upload-lease",
+      result: "RECOVERY_ELIGIBLE",
+      lifecycle: "FAILED_PRE_SELECTION_STALE_SAFE",
+      outerExecutionId: expected.outerExecutionId,
+      innerExecutionId: expected.innerExecutionId,
+      leaseSha256: expected.leaseSha256,
+      evidenceSha256: expected.evidenceSha256,
+      archiveEvidenceSha256,
+      recoveryHash,
+      stateMutation: false,
+      onchainWrite: false,
+    };
+  } catch {
+    return preSelectionFailure("INSUFFICIENT_EVIDENCE");
+  }
+}
+
+export async function recoverPreSelectionUploadLease(input, adapters = {}) {
+  if (input.acknowledgement !== RECOVER_PRE_SELECTION_LEASE_ACKNOWLEDGEMENT) {
+    throw new Error("explicit pre-selection lease recovery acknowledgement is required");
+  }
+  assertEvidenceHash(input.recoveryHash, "matching pre-selection recovery hash");
+  const paths = leasePaths(
+    input.statePath,
+    input.expected?.innerExecutionId,
+    input.recoveryHash,
+  );
+  const lockPath = acquireOperationLock(input.statePath);
+  try {
+    const activeExists = existsSync(paths.activeDirectory);
+    const archiveExists = existsSync(paths.archiveDirectory);
+    if (activeExists && archiveExists) {
+      throw new Error("ambiguous active and archived pre-selection lease");
+    }
+    if (!activeExists && archiveExists) {
+      const archivedNames = readdirSync(paths.archiveDirectory).sort();
+      const allowed = new Set([
+        "lease.json",
+        "recovery.json",
+        "telemetry.json",
+        "terminal.json",
+      ]);
+      if (archivedNames.some((name) => !allowed.has(name)) ||
+          !archivedNames.includes("lease.json") ||
+          !archivedNames.includes("recovery.json") ||
+          (!archivedNames.includes("telemetry.json") &&
+           !archivedNames.includes("terminal.json"))) {
+        throw new Error("archived pre-selection evidence is invalid");
+      }
+      const archiveEvidenceSha256 = archiveEvidenceHash(
+        paths.archiveDirectory,
+        archivedNames,
+      );
+      const receipt = readJson(join(paths.archiveDirectory, "recovery.json"));
+      const leaseBytes = readFileSync(join(paths.archiveDirectory, "lease.json"));
+      const evidenceName = archivedNames.includes("terminal.json")
+        ? "terminal.json"
+        : "telemetry.json";
+      const evidenceBytes = readFileSync(join(paths.archiveDirectory, evidenceName));
+      if (sha256(leaseBytes) !== input.expected.leaseSha256 ||
+          sha256(evidenceBytes) !== input.expected.evidenceSha256 ||
+          (archivedNames.includes("telemetry.json") &&
+            readUploadTelemetry(paths.archiveDirectory).availability !== "AVAILABLE") ||
+          (archivedNames.includes("terminal.json") &&
+            readUploadTerminalEvidence(paths.archiveDirectory).availability !== "AVAILABLE") ||
+          !completeRecoveryReceipt(
+            receipt,
+            input.expected,
+            input.recoveryHash,
+            archiveEvidenceSha256,
+          )) {
+        throw new Error("archived pre-selection recovery receipt is invalid");
+      }
+      return {
+        command: "recover-pre-selection-upload-lease",
+        lifecycle: "ARCHIVED/RECOVERED",
+        outerExecutionId: input.expected.outerExecutionId,
+        innerExecutionId: input.expected.innerExecutionId,
+        recoveryHash: input.recoveryHash,
+        idempotent: true,
+        stateMutation: false,
+        onchainWrite: false,
+      };
+    }
+    if (!activeExists) throw new Error("matching pre-selection lease was not found");
+    if (typeof adapters.refreshInput !== "function") {
+      throw new Error("fresh under-lock recovery observations are required");
+    }
+    const refreshedInput = await adapters.refreshInput(input);
+    if (refreshedInput?.statePath !== input.statePath ||
+        refreshedInput?.outerEvidenceDirectory !== input.outerEvidenceDirectory ||
+        canonicalJson(refreshedInput?.expected) !== canonicalJson(input.expected)) {
+      throw new Error("fresh recovery bindings changed under lock");
+    }
+    const fresh = reconcilePreSelectionUploadLease(refreshedInput, {
+      ...adapters,
+      allowOwnedOperationLock: true,
+    });
+    if (fresh.result !== "RECOVERY_ELIGIBLE" ||
+        fresh.recoveryHash !== input.recoveryHash) {
+      throw new Error("STATE_HASH_DRIFT_OR_STALE_PRE_SELECTION_EVIDENCE");
+    }
+    mkdirSync(paths.archiveRoot, { recursive: true });
+    const receipt = {
+      version: PRE_SELECTION_RECOVERY_VERSION,
+      lifecycle: "FAILED_PRE_SELECTION_STALE_SAFE",
+      archiveEvidenceSha256: fresh.archiveEvidenceSha256,
+      outerExecutionId: input.expected.outerExecutionId,
+      innerExecutionId: input.expected.innerExecutionId,
+      repositorySha: input.expected.repositorySha,
+      stateSha256: input.expected.stateSha256,
+      bufferSha256: input.expected.bufferSha256,
+      leaseSha256: input.expected.leaseSha256,
+      evidenceSha256: input.expected.evidenceSha256,
+      recoveryHash: input.recoveryHash,
+      recoveredAt: (adapters.now ?? (() => new Date().toISOString()))(),
+    };
+    const receiptPath = join(paths.activeDirectory, "recovery.json");
+    if (existsSync(receiptPath)) {
+      if (!completeRecoveryReceipt(
+        readJson(receiptPath),
+        input.expected,
+        input.recoveryHash,
+        fresh.archiveEvidenceSha256,
+      )) {
+        throw new Error("active pre-selection recovery receipt is invalid");
+      }
+    } else {
+      writeCanonicalJsonAtomic(
+        receiptPath,
+        receipt,
+        adapters.persistenceAdapters,
+      );
+    }
+    const names = readdirSync(paths.activeDirectory).sort();
+    const before = fileProjection(paths.activeDirectory, names);
+    const rename = adapters.renameSync ?? nodeRenameSync;
+    try {
+      rename(paths.activeDirectory, paths.archiveDirectory);
+    } catch {
+      throw new Error("atomic pre-selection lease archive failure");
+    }
+    const flushDirectory = adapters.flushDirectory ?? flushDirectoryDurably;
+    flushDirectory(dirname(paths.activeDirectory));
+    flushDirectory(paths.archiveRoot);
+    const afterNames = readdirSync(paths.archiveDirectory).sort();
+    const after = fileProjection(paths.archiveDirectory, afterNames);
+    if (canonicalJson(before) !== canonicalJson(after) ||
+        !completeRecoveryReceipt(
+          readJson(join(paths.archiveDirectory, "recovery.json")),
+          input.expected,
+          input.recoveryHash,
+          fresh.archiveEvidenceSha256,
+        )) {
+      throw new Error("pre-selection lease archive integrity verification failed");
+    }
+    return {
+      command: "recover-pre-selection-upload-lease",
+      lifecycle: "ARCHIVED/RECOVERED",
+      outerExecutionId: input.expected.outerExecutionId,
+      innerExecutionId: input.expected.innerExecutionId,
+      recoveryHash: input.recoveryHash,
+      idempotent: false,
+      stateMutation: true,
+      onchainWrite: false,
+    };
+  } finally {
+    rmdirSync(lockPath);
+  }
 }
 
 export function applyUploadReconciliation(input, adapters = {}) {

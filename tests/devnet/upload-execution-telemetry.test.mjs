@@ -166,6 +166,48 @@ test("request timeout duration and aggregate count persist in sanitized telemetr
   assert.equal(telemetry.snapshot.requestTimeoutCount, 1);
 });
 
+test("fractional monotonic cancellation derives one canonical request duration", () => {
+  const { directory } = fixture();
+  const origin = 350.7077;
+  const start = 933.0405;
+  const end = 1_218.7274;
+  const ledgerDuration = end - start;
+  const elapsedDuration = (end - origin) - (start - origin);
+  assert.notEqual(ledgerDuration, elapsedDuration);
+
+  const store = createUploadTelemetryStore({
+    directory,
+    executionId: EXECUTION_ID,
+    startedAt: STARTED_AT,
+    startMonotonicMs: origin,
+    policy: POLICY,
+  });
+  store.recordRpcEntry({
+    ...entry(1, "GET_ACCOUNT_INFO", start, ledgerDuration),
+    endMonotonicMs: end,
+  });
+
+  const [request] = readUploadTelemetry(directory).snapshot.requests;
+  assert.equal(request.durationMs, request.endElapsedMs - request.startElapsedMs);
+  assert.equal(request.durationMs, elapsedDuration);
+});
+
+test("materially inconsistent and non-finite request timing remains invalid", () => {
+  for (const mutate of [
+    (value) => { value.durationMs += 0.01; },
+    (value) => { value.durationMs = Number.NaN; },
+    (value) => { value.durationMs = Number.POSITIVE_INFINITY; },
+    (value) => { value.durationMs = -1; },
+    (value) => { value.endMonotonicMs = value.startMonotonicMs - 1; },
+  ]) {
+    const { directory } = fixture();
+    const store = storeAt(directory);
+    const value = entry(1, "GET_ACCOUNT_INFO", 1_000, 10);
+    mutate(value);
+    assert.throws(() => store.recordRpcEntry(value), /timing|duration|schema|monotonic/i);
+  }
+});
+
 test("partial evidence survives process failure and cannot be overwritten by a shorter snapshot", () => {
   const { directory } = fixture();
   const first = storeAt(directory);
@@ -343,6 +385,52 @@ test("canonical hash ignores object insertion order but not evidence order", () 
     () => canonicalTelemetryHash({ ...snapshot, requests: [...snapshot.requests].reverse() }),
     /request schema/,
   );
+});
+
+test("telemetry persistence uses the durable file-flush rename directory-flush boundary", () => {
+  const { directory } = fixture();
+  const events = [];
+  const store = createUploadTelemetryStore({
+    directory,
+    executionId: EXECUTION_ID,
+    startedAt: STARTED_AT,
+    startMonotonicMs: 1_000,
+    policy: POLICY,
+    persistenceAdapters: {
+      fsyncSync(descriptor) {
+        events.push(`fsync:${descriptor}`);
+      },
+    },
+  });
+  store.recordRpcEntry(entry(1, "GET_GENESIS_HASH", 1_000));
+  assert.ok(events.length >= 4);
+});
+
+test("telemetry persistence exposes only a stable failure classification", () => {
+  const { directory } = fixture();
+  let error;
+  try {
+    createUploadTelemetryStore({
+      directory,
+      executionId: EXECUTION_ID,
+      startedAt: STARTED_AT,
+      startMonotonicMs: 1_000,
+      policy: POLICY,
+      persistenceAdapters: {
+        renameSync() {
+          const failure = new Error("C:\\secret\\telemetry.tmp");
+          failure.code = "EIO";
+          throw failure;
+        },
+      },
+    });
+    assert.fail("expected telemetry persistence failure");
+  } catch (caught) {
+    error = caught;
+  }
+  assert.equal(error.classification, "TELEMETRY_PERSISTENCE_FAILED");
+  assert.equal(error.message, "telemetry persistence failed");
+  assert.equal(error.cause?.code, "EIO");
 });
 
 test("whitelist rejects secret-bearing or malformed request records before persistence", () => {

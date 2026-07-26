@@ -59,6 +59,18 @@ reference hash is stored in the escrow account.
 
 ## Current verification
 
+The one R4N invocation failed after acquiring its upload lease but before
+candidate selection. Preserved evidence proves one read-only genesis request,
+zero signing/send evidence, unchanged upload state, and a dead owner; however,
+the historical raw exception was intentionally sanitized, so floating-duration
+validation is a probable reproducible class rather than a proven unique cause.
+The active lease is intentionally untouched. Repository-owned read-only
+pre-selection reconciliation and separately acknowledged recovery are now
+available, but neither command has been run against the incident. R4N replay
+remains forbidden and any recovery or future live window needs separate
+authorization. See the
+[R4N pre-selection failure repair checkpoint](docs/PHASE_2_R4N_PRE_SELECTION_FAILURE_REPAIR_2026-07-26.md).
+
 The sole R4L five-chunk window finalized chunks 259-263. A total of 264 chunks
 are `CONFIRMED` and 127 are `PLANNED`, with zero `SENT` or `UNKNOWN` chunks.
 Chunk index 264 remains `PLANNED` with a null signature, and the program
@@ -102,6 +114,15 @@ acknowledged local-only operation and archives only after fresh zero-transition
 evidence. The commands share a fail-closed local operation lock; neither apply
 nor release performs an on-chain write. Lease age alone is never release
 evidence.
+
+`reconcile-pre-selection-upload-lease` is a distinct fail-closed read-only
+path for an exact dead-owner lease with complete outer/inner identity,
+state/buffer, candidate, process, operation-lock, and zero-send evidence.
+`recover-pre-selection-upload-lease` additionally requires the exact fresh
+recovery hash and `R4_RECOVER_PRE_SELECTION_LEASE`; it rechecks under the
+operation lock, durably writes `recovery.json`, and atomically archives only
+the bound lease. It never edits deployment state or performs an on-chain
+write. Neither pre-selection command is authorized merely by this README.
 
 Verified locally on Windows:
 

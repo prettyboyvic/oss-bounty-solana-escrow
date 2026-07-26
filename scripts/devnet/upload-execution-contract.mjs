@@ -6,6 +6,7 @@ import { isSafeRpcRequestSummary } from "./rpc-request-ledger.mjs";
 
 export const LIVE_UPLOAD_ACKNOWLEDGEMENT = "R4_BUFFER_UPLOAD";
 export const RELEASE_LEASE_ACKNOWLEDGEMENT = "R4_RELEASE_UPLOAD_LEASE";
+export const RECOVER_PRE_SELECTION_LEASE_ACKNOWLEDGEMENT = "R4_RECOVER_PRE_SELECTION_LEASE";
 export const APPLY_RECONCILIATION_ACKNOWLEDGEMENT = "R4_APPLY_UPLOAD_RECONCILIATION";
 export const MIGRATE_STATE_ACKNOWLEDGEMENT = "R4_MIGRATE_STATE_V3";
 export const MAX_UPLOAD_CHUNKS = 5;
@@ -27,6 +28,31 @@ const MIGRATE_KEYS = new Set(["state", "binary", "acknowledge-state-migration"])
 const RECONCILE_KEYS = new Set(["url", "program", "buffer", "state", "binary", "execution-id"]);
 const APPLY_RECONCILIATION_KEYS = new Set([...RECONCILE_KEYS, "reconciliation-hash", "acknowledge-upload-reconciliation"]);
 const RELEASE_KEYS = new Set([...RECONCILE_KEYS, "reconciliation-hash", "acknowledge-lease-release"]);
+const PRE_SELECTION_RECONCILE_KEYS = new Set([
+  "binary",
+  "buffer",
+  "expected-authority",
+  "expected-buffer-sha",
+  "expected-candidates",
+  "expected-dead-owner",
+  "expected-evidence-sha",
+  "expected-inner-execution-id",
+  "expected-lease-sha",
+  "expected-outer-execution-id",
+  "expected-repository-sha",
+  "expected-state-sha",
+  "expected-zero-send",
+  "lease-path",
+  "outer-evidence-directory",
+  "program",
+  "state",
+  "url",
+]);
+const PRE_SELECTION_RECOVER_KEYS = new Set([
+  ...PRE_SELECTION_RECONCILE_KEYS,
+  "acknowledge-pre-selection-recovery",
+  "recovery-hash",
+]);
 
 function parseExactOptions(argv, allowed) {
   const values = {};
@@ -108,6 +134,63 @@ function assertLowercaseReconciliationHash(value) {
   }
 }
 
+function parseCandidateIndexes(value) {
+  if (!/^\d+(?:,\d+)*$/.test(value)) {
+    throw new Error("strict candidate indexes are required");
+  }
+  const indexes = value.split(",").map(Number);
+  if (indexes.some((item, index) =>
+    !Number.isSafeInteger(item) || item < 0 ||
+    (index > 0 && item <= indexes[index - 1]))) {
+    throw new Error("strict candidate indexes are required");
+  }
+  return indexes;
+}
+
+function parsePreSelectionBindings(values) {
+  assertCanonicalLeaseCommand(values);
+  assertSafeExecutionId(values["expected-outer-execution-id"]);
+  assertSafeExecutionId(values["expected-inner-execution-id"]);
+  assertLowercaseReconciliationHash(values["expected-lease-sha"]);
+  assertLowercaseReconciliationHash(values["expected-evidence-sha"]);
+  assertLowercaseReconciliationHash(values["expected-state-sha"]);
+  assertLowercaseReconciliationHash(values["expected-buffer-sha"]);
+  if (!/^[a-f0-9]{40}$/.test(values["expected-repository-sha"])) {
+    throw new Error("lowercase repository SHA is required");
+  }
+  if (values["expected-authority"] !== PLAN_UPLOAD_IDENTITIES.authority) {
+    throw new Error("canonical authority is required");
+  }
+  if (values["expected-zero-send"] !== "true" ||
+      values["expected-dead-owner"] !== "true") {
+    throw new Error("explicit zero-send and dead-owner bindings are required");
+  }
+  return {
+    url: values.url,
+    program: values.program,
+    buffer: values.buffer,
+    state: values.state,
+    binary: values.binary,
+    leasePath: values["lease-path"],
+    outerEvidenceDirectory: values["outer-evidence-directory"],
+    expected: {
+      leaseSha256: values["expected-lease-sha"],
+      evidenceSha256: values["expected-evidence-sha"],
+      outerExecutionId: values["expected-outer-execution-id"],
+      innerExecutionId: values["expected-inner-execution-id"],
+      repositorySha: values["expected-repository-sha"],
+      stateSha256: values["expected-state-sha"],
+      bufferSha256: values["expected-buffer-sha"],
+      program: values.program,
+      buffer: values.buffer,
+      authority: values["expected-authority"],
+      candidateIndexes: parseCandidateIndexes(values["expected-candidates"]),
+      zeroSend: true,
+      deadOwner: true,
+    },
+  };
+}
+
 export function parseRuntimeCommand(argv) {
   switch (argv[0]) {
     case "upload-buffer-throttled":
@@ -165,6 +248,27 @@ export function parseRuntimeCommand(argv) {
         executionId: values["execution-id"],
         reconciliationHash: values["reconciliation-hash"],
         acknowledgement: values["acknowledge-lease-release"],
+      };
+    }
+    case "reconcile-pre-selection-upload-lease": {
+      const values = parseExactOptions(argv, PRE_SELECTION_RECONCILE_KEYS);
+      return {
+        command: argv[0],
+        ...parsePreSelectionBindings(values),
+      };
+    }
+    case "recover-pre-selection-upload-lease": {
+      const values = parseExactOptions(argv, PRE_SELECTION_RECOVER_KEYS);
+      assertLowercaseReconciliationHash(values["recovery-hash"]);
+      if (values["acknowledge-pre-selection-recovery"] !==
+          RECOVER_PRE_SELECTION_LEASE_ACKNOWLEDGEMENT) {
+        throw new Error("explicit pre-selection lease recovery acknowledgement is required");
+      }
+      return {
+        command: argv[0],
+        ...parsePreSelectionBindings(values),
+        recoveryHash: values["recovery-hash"],
+        acknowledgement: values["acknowledge-pre-selection-recovery"],
       };
     }
     default:

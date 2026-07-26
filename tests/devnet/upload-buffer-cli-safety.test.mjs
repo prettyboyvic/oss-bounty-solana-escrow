@@ -207,18 +207,49 @@ test("public command dispatch preserves read-only and local-only authority bound
     reconcileUploadLease: async (request) => { calls.push(["reconcile", request.command, request.binaryPath]); return { stateMutation: false, onchainWrite: false }; },
     applyUploadReconciliation: async (request) => { calls.push(["apply", request.command, request.binaryPath]); return { stateMutation: true, onchainWrite: false }; },
     releaseUploadLease: async (request) => { calls.push(["release", request.command, request.binaryPath]); return { stateMutation: true, onchainWrite: false }; },
+    reconcilePreSelectionUploadLease: async (request) => { calls.push(["preselection-reconcile", request.command, request.expected.innerExecutionId]); return { stateMutation: false, onchainWrite: false }; },
+    recoverPreSelectionUploadLease: async (request) => { calls.push(["preselection-recover", request.command, request.recoveryHash]); return { stateMutation: true, onchainWrite: false }; },
   };
+  const preselectionArgs = [
+    "--url", "https://api.devnet.solana.com",
+    "--program", "6UoYT4jtiS23rCU1zARqnn181BxwuJ9waS1sv35gRg1Z",
+    "--buffer", "CT1DGjkt9t926L6SoFxiYJmzc18nMowpdw1WcZgWwbbW",
+    "--state", ".devnet/state.json",
+    "--binary", "target/program.so",
+    "--lease-path", ".devnet/state.json.upload-lease",
+    "--outer-evidence-directory", ".devnet/upload-window-host-results/outer-fixture",
+    "--expected-lease-sha", "1".repeat(64),
+    "--expected-evidence-sha", "2".repeat(64),
+    "--expected-outer-execution-id", "outer-fixture",
+    "--expected-inner-execution-id", "inner-fixture",
+    "--expected-repository-sha", "a".repeat(40),
+    "--expected-state-sha", "3".repeat(64),
+    "--expected-buffer-sha", "4".repeat(64),
+    "--expected-authority", "Avfvs1k6ttrBtqh83tFw5g3dhWncrjP5hj4D52kGNZGk",
+    "--expected-candidates", "264,265,266,267,268",
+    "--expected-zero-send", "true",
+    "--expected-dead-owner", "true",
+  ];
   await main(["inspect-state-migration", "--state", ".devnet/state.json", "--binary", "target/program.so"], common);
   await main(["migrate-state-v3", "--state", ".devnet/state.json", "--binary", "target/program.so", "--acknowledge-state-migration", "R4_MIGRATE_STATE_V3"], common);
   await main(["reconcile-upload-lease", "--url", "https://api.devnet.solana.com", "--program", "6UoYT4jtiS23rCU1zARqnn181BxwuJ9waS1sv35gRg1Z", "--buffer", "CT1DGjkt9t926L6SoFxiYJmzc18nMowpdw1WcZgWwbbW", "--state", ".devnet/state.json", "--binary", "target/program.so", "--execution-id", "execution-1"], common);
   await main(["apply-upload-reconciliation", "--url", "https://api.devnet.solana.com", "--program", "6UoYT4jtiS23rCU1zARqnn181BxwuJ9waS1sv35gRg1Z", "--buffer", "CT1DGjkt9t926L6SoFxiYJmzc18nMowpdw1WcZgWwbbW", "--state", ".devnet/state.json", "--binary", "target/program.so", "--execution-id", "execution-1", "--reconciliation-hash", "a".repeat(64), "--acknowledge-upload-reconciliation", "R4_APPLY_UPLOAD_RECONCILIATION"], common);
   await main(["release-upload-lease", "--url", "https://api.devnet.solana.com", "--program", "6UoYT4jtiS23rCU1zARqnn181BxwuJ9waS1sv35gRg1Z", "--buffer", "CT1DGjkt9t926L6SoFxiYJmzc18nMowpdw1WcZgWwbbW", "--state", ".devnet/state.json", "--binary", "target/program.so", "--execution-id", "execution-1", "--reconciliation-hash", "a".repeat(64), "--acknowledge-lease-release", "R4_RELEASE_UPLOAD_LEASE"], common);
+  await main(["reconcile-pre-selection-upload-lease", ...preselectionArgs], common);
+  await main([
+    "recover-pre-selection-upload-lease",
+    ...preselectionArgs,
+    "--recovery-hash", "5".repeat(64),
+    "--acknowledge-pre-selection-recovery", "R4_RECOVER_PRE_SELECTION_LEASE",
+  ], common);
   assert.deepEqual(calls, [
     ["inspect", "inspect-state-migration"],
     ["migrate", "migrate-state-v3"],
     ["reconcile", "reconcile-upload-lease", join(repoRoot, "target/program.so")],
     ["apply", "apply-upload-reconciliation", join(repoRoot, "target/program.so")],
     ["release", "release-upload-lease", join(repoRoot, "target/program.so")],
+    ["preselection-reconcile", "reconcile-pre-selection-upload-lease", "inner-fixture"],
+    ["preselection-recover", "recover-pre-selection-upload-lease", "5".repeat(64)],
   ]);
 });
 
@@ -427,6 +458,23 @@ test("fails closed without retaining bodies, headers, credentials, transactions,
     assert.deepEqual(sanitizeCliErrorMessage(error), COMMAND_FAILED);
     assert.doesNotMatch(JSON.stringify(sanitizeCliErrorMessage(error)), /CANARY|mnemonic|rawTransaction|private key/i);
   }
+});
+
+test("sanitizer preserves a whitelisted post-lease safe code and phase", () => {
+  const error = new Error("CANARY secret-bearing internal message");
+  error.safeCode = "TELEMETRY_REPLAY_VALIDATION_FAILED";
+  error.safePhase = "TELEMETRY_REPLAY";
+  error.secondaryErrors = [{
+    code: "TELEMETRY_PERSISTENCE_FAILED",
+    phase: "TERMINALIZATION",
+  }];
+  assert.deepEqual(sanitizeCliErrorMessage(error), {
+    code: "TELEMETRY_REPLAY_VALIDATION_FAILED",
+    phase: "TELEMETRY_REPLAY",
+    retryable: false,
+    terminal: true,
+  });
+  assert.doesNotMatch(JSON.stringify(sanitizeCliErrorMessage(error)), /CANARY|secret-bearing/);
 });
 
 test("direct CLI stderr is only the JSON terminal classification", () => {

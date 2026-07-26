@@ -204,6 +204,11 @@ test("atomic acquisition rejects contention and stores public metadata only", ()
   const input = fixture();
   const first = acquire(input);
   assert.equal(first.status, "ACTIVE");
+  assert.equal(
+    first.leaseSha256,
+    sha256(readFileSync(leasePaths(input.statePath).metadataPath)),
+  );
+  assert.equal(first.stateSha256AtAcquire, input.acquireInput.stateSha256);
   assert.throws(() => acquire(input), /ACTIVE_UPLOAD_LEASE/);
   const stored = JSON.parse(readFileSync(leasePaths(input.statePath).metadataPath, "utf8"));
   assert.deepEqual(stored, {

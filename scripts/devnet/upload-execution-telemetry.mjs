@@ -1,12 +1,11 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   readFileSync,
-  renameSync,
-  writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 
+import { writeCanonicalJsonAtomic } from "./durable-json.mjs";
 import {
   RPC_METHOD_CLASSES,
   RPC_OUTCOMES,
@@ -112,6 +111,28 @@ function nullableFiniteNonnegative(value) {
   return value === null || finiteNonnegative(value);
 }
 
+function durationTolerance(...values) {
+  const scale = Math.max(1, ...values.map((value) => Math.abs(value)));
+  // Four floating-point operations can each contribute one rounding unit.
+  // Double that bound to cover the alternate subtraction evaluation order.
+  return 8 * Number.EPSILON * scale;
+}
+
+function equivalentDuration(durationMs, expectedMs, ...endpoints) {
+  return finiteNonnegative(durationMs) &&
+    finiteNonnegative(expectedMs) &&
+    Math.abs(durationMs - expectedMs) <= durationTolerance(...endpoints);
+}
+
+function canonicalDurationMs(startElapsedMs, endElapsedMs) {
+  if (!finiteNonnegative(startElapsedMs) ||
+      !finiteNonnegative(endElapsedMs) ||
+      endElapsedMs < startElapsedMs) {
+    throw new Error("telemetry timing endpoints are invalid");
+  }
+  return endElapsedMs - startElapsedMs;
+}
+
 function validIso(value) {
   return typeof value === "string" &&
     /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) &&
@@ -163,7 +184,12 @@ function validateRequest(request, previousSequence) {
       (request.endElapsedMs === null) !== (request.outcome === null) ||
       (request.endElapsedMs !== null &&
         (request.endElapsedMs < request.startElapsedMs ||
-         request.durationMs !== request.endElapsedMs - request.startElapsedMs))) {
+         !equivalentDuration(
+           request.durationMs,
+           request.endElapsedMs - request.startElapsedMs,
+           request.startElapsedMs,
+           request.endElapsedMs,
+         )))) {
     throw new Error("telemetry request schema is invalid");
   }
 }
@@ -175,7 +201,12 @@ function validateSend(send, previousIndex) {
       !finiteNonnegative(send.preSignCooldownStartedElapsedMs) ||
       !finiteNonnegative(send.preSignCooldownFinishedElapsedMs) ||
       send.preSignCooldownFinishedElapsedMs < send.preSignCooldownStartedElapsedMs ||
-      send.preSignCooldownMs !== send.preSignCooldownFinishedElapsedMs - send.preSignCooldownStartedElapsedMs ||
+      !equivalentDuration(
+        send.preSignCooldownMs,
+        send.preSignCooldownFinishedElapsedMs - send.preSignCooldownStartedElapsedMs,
+        send.preSignCooldownStartedElapsedMs,
+        send.preSignCooldownFinishedElapsedMs,
+      ) ||
       !validIso(send.preSignCooldownStartedAt) || !validIso(send.preSignCooldownFinishedAt) ||
       !nullableFiniteNonnegative(send.sendStartedElapsedMs) ||
       !nullableFiniteNonnegative(send.sendFinishedElapsedMs) ||
@@ -189,7 +220,12 @@ function validateSend(send, previousIndex) {
       (send.sendFinishedElapsedMs !== null &&
         (send.sendStartedElapsedMs === null ||
          send.sendFinishedElapsedMs < send.sendStartedElapsedMs ||
-         send.sendDurationMs !== send.sendFinishedElapsedMs - send.sendStartedElapsedMs ||
+         !equivalentDuration(
+           send.sendDurationMs,
+           send.sendFinishedElapsedMs - send.sendStartedElapsedMs,
+           send.sendStartedElapsedMs,
+           send.sendFinishedElapsedMs,
+         ) ||
          !SEND_OUTCOME_SET.has(send.outcome)))) {
     throw new Error("telemetry send schema is invalid");
   }
@@ -436,11 +472,15 @@ function telemetryPath(directory) {
   return join(directory, "telemetry.json");
 }
 
-function writeAtomic(path, snapshot) {
+function writeAtomic(path, snapshot, adapters) {
   validateSnapshot(snapshot);
-  const temporary = `${path}.${randomUUID()}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(sortedValue(snapshot), null, 2)}\n`, { flag: "wx" });
-  renameSync(temporary, path);
+  try {
+    writeCanonicalJsonAtomic(path, snapshot, adapters);
+  } catch (cause) {
+    const error = new Error("telemetry persistence failed", { cause });
+    error.classification = "TELEMETRY_PERSISTENCE_FAILED";
+    throw error;
+  }
 }
 
 export function readUploadTelemetry(directory) {
@@ -506,6 +546,7 @@ export function createUploadTelemetryStore({
   startedAt,
   startMonotonicMs,
   policy,
+  persistenceAdapters,
 }) {
   if (typeof directory !== "string" || directory.length === 0 ||
       !SAFE_EXECUTION_ID.test(executionId ?? "") ||
@@ -542,7 +583,7 @@ export function createUploadTelemetryStore({
       verdict: "INCOMPLETE",
       missing: ["terminal"],
     };
-    writeAtomic(path, snapshot);
+    writeAtomic(path, snapshot, persistenceAdapters);
   }
 
   function elapsed(monotonicMs) {
@@ -556,7 +597,7 @@ export function createUploadTelemetryStore({
     refreshComputed(next);
     validateSnapshot(next);
     assertMonotonicExtension(snapshot, next);
-    writeAtomic(path, next);
+    writeAtomic(path, next, persistenceAdapters);
     snapshot = next;
     return evidence();
   }
@@ -616,33 +657,35 @@ export function createUploadTelemetryStore({
       if (!exactKeys(value, LEDGER_ENTRY_KEYS)) {
         throw new Error("telemetry ledger entry schema violates whitelist");
       }
-      validateRequest({
-        sequence: value.sequence,
-        requestType: value.methodClass,
-        startElapsedMs: elapsed(value.startMonotonicMs),
-        endElapsedMs: elapsed(value.endMonotonicMs),
-        durationMs: value.durationMs,
-        startedAt: isoAt(startedAt, elapsed(value.startMonotonicMs)),
-        finishedAt: isoAt(startedAt, elapsed(value.endMonotonicMs)),
-        outcome: value.outcome,
-        retryNumber: value.retryNumber,
-        signaturePersisted: value.signaturePersisted,
-        mutationCapability: value.mutationCapability,
-      }, 0);
-      const next = clone(snapshot);
+      if (!finiteNonnegative(value.startMonotonicMs) ||
+          !finiteNonnegative(value.endMonotonicMs) ||
+          value.endMonotonicMs < value.startMonotonicMs ||
+          !equivalentDuration(
+            value.durationMs,
+            value.endMonotonicMs - value.startMonotonicMs,
+            value.startMonotonicMs,
+            value.endMonotonicMs,
+            startMonotonicMs,
+          )) {
+        throw new Error("telemetry ledger timing is invalid");
+      }
+      const startElapsedMs = elapsed(value.startMonotonicMs);
+      const endElapsedMs = elapsed(value.endMonotonicMs);
       const request = {
         sequence: value.sequence,
         requestType: value.methodClass,
-        startElapsedMs: elapsed(value.startMonotonicMs),
-        endElapsedMs: elapsed(value.endMonotonicMs),
-        durationMs: value.durationMs,
-        startedAt: isoAt(startedAt, elapsed(value.startMonotonicMs)),
-        finishedAt: isoAt(startedAt, elapsed(value.endMonotonicMs)),
+        startElapsedMs,
+        endElapsedMs,
+        durationMs: canonicalDurationMs(startElapsedMs, endElapsedMs),
+        startedAt: isoAt(startedAt, startElapsedMs),
+        finishedAt: isoAt(startedAt, endElapsedMs),
         outcome: value.outcome,
         retryNumber: value.retryNumber,
         signaturePersisted: value.signaturePersisted,
         mutationCapability: value.mutationCapability,
       };
+      validateRequest(request, 0);
+      const next = clone(snapshot);
       const existing = next.requests.find(({ sequence }) => sequence === request.sequence);
       if (existing) {
         const sameStart = existing.requestType === request.requestType &&

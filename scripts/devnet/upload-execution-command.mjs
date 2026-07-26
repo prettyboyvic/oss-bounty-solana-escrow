@@ -39,6 +39,11 @@ import {
   validateConfirmedValidationSnapshot,
 } from "./upload-validation-snapshot.mjs";
 import { createUploadTelemetryStore } from "./upload-execution-telemetry.mjs";
+import {
+  buildUploadTerminalRecord,
+  createUploadLifecycleTracker,
+  writeUploadTerminalEvidence,
+} from "./upload-terminal-evidence.mjs";
 
 const BUFFER_METADATA_LENGTH = 37;
 const PROGRAM_ACCOUNT_LENGTH = 36;
@@ -502,7 +507,7 @@ export async function executeUploadWindow(request, adapters) {
     localBytes: currentLocalBytes,
     nowMonotonicMs: monotonicNow(),
   });
-  acquireUploadLease({
+  const acquiredLease = acquireUploadLease({
     statePath: request.statePath,
     executionId,
     pid: adapters.pid ?? process.pid,
@@ -513,106 +518,128 @@ export async function executeUploadWindow(request, adapters) {
     planFingerprint: preflight.expected.planFingerprint,
     stateSha256: preflight.stateSha256,
   });
-  const schedulerPolicy = adapters.rpcRequestScheduler?.policy?.();
-  const telemetryStore = createUploadTelemetryStore({
-    directory: leasePaths(request.statePath).activeDirectory,
-    executionId,
-    startedAt,
-    startMonotonicMs: startedMonotonicMs,
-    policy: {
-      preSignCooldownMs: 3_000,
-      globalRequestStartGapMs:
-        adapters.rpcRequestPolicy?.globalRequestStartGapMs ??
-        schedulerPolicy?.minimumRequestStartGapMs ??
-        500,
-      requestTimeoutMs:
-        adapters.rpcRequestPolicy?.requestTimeoutMs ??
-        schedulerPolicy?.requestTimeoutMs ??
-        DEFAULT_RPC_REQUEST_TIMEOUT_MS,
-      confirmationPollIntervalMs:
-        adapters.rpcRequestPolicy?.confirmationPollIntervalMs ??
-        CONFIRMATION_POLL_INTERVAL_MS,
-      rateLimitRetryScheduleMs:
-        adapters.rpcRequestPolicy?.rateLimitRetryScheduleMs ??
-        schedulerPolicy?.retryBackoffMs ??
-        [2_000, 5_000],
-      interChunkDelayMs: request.delayMs,
-    },
-  });
+  const activeDirectory = leasePaths(request.statePath).activeDirectory;
+  const lifecycle = createUploadLifecycleTracker();
+  const leaseSha256 = acquiredLease.leaseSha256;
+  const stateSha256Before = acquiredLease.stateSha256AtAcquire;
+  let schedulerPolicy;
+  let telemetryStore = null;
+  let unsubscribeTelemetry = () => {};
+  let unsubscribeTelemetryStarts = () => {};
   let activeConfirmationChunkIndex = null;
-  const recordTelemetryStart = (entry) => telemetryStore.recordRpcStart(entry, {
-    confirmationChunkIndex:
-      entry.methodClass === "GET_SIGNATURE_STATUSES"
-        ? activeConfirmationChunkIndex
-        : null,
-  });
-  const recordTelemetryEntry = (entry) => telemetryStore.recordRpcEntry(entry);
-  if (adapters.rpcRequestLedger && adapters.monotonicNow) {
-    for (const entry of adapters.rpcRequestLedger.debugSafeEntries()) {
-      recordTelemetryEntry(entry);
-    }
-  }
-  const unsubscribeTelemetry =
-    adapters.rpcRequestLedger && adapters.monotonicNow
-      ? adapters.rpcRequestLedger.subscribe(recordTelemetryEntry)
-      : () => {};
-  const unsubscribeTelemetryStarts =
-    adapters.rpcRequestLedger && adapters.monotonicNow
-      ? adapters.rpcRequestLedger.subscribeInvocationStarts(recordTelemetryStart)
-      : () => {};
+  let liveWriteAttempted = false;
+  const completedConfirmations = [];
   const unsubscribeTelemetryObservers = () => {
     unsubscribeTelemetryStarts();
     unsubscribeTelemetry();
   };
 
-  const chunks = preflight.plan.chunks.map((chunk) => ({
-    ...chunk,
-    bytes: currentLocalBytes.subarray(chunk.offset, chunk.offset + chunk.length),
-  }));
-  let authority;
-  let preSignCoolOffComplete = false;
-  const sign = async (chunk) => {
-    let coolOff;
-    const coolOffRequired = !preSignCoolOffComplete;
-    if (coolOffRequired && adapters.rpcRequestScheduler) {
-      coolOff = await adapters.rpcRequestScheduler.waitForCoolOff(3000);
-      preSignCoolOffComplete = true;
-    } else {
-      const boundary = monotonicNow();
-      coolOff = {
-        startedMonotonicMs: boundary,
-        finishedMonotonicMs: boundary,
-        elapsedMs: 0,
-      };
-    }
-    if (coolOffRequired) preSignCoolOffComplete = true;
-    telemetryStore.recordPreSignCooldown({
-      chunkIndex: chunk.index,
-      required: coolOffRequired,
-      startedMonotonicMs: coolOff.startedMonotonicMs,
-      finishedMonotonicMs: coolOff.finishedMonotonicMs,
-    });
-    authority ??= await adapters.loadAuthorityKeypair(request.authorityPath);
-    if (authority?.publicKey?.toBase58() !== preflight.expected.authority) {
-      throw new Error("buffer authority signer mismatch");
-    }
-    const latestBlockhash = await adapters.getLatestBlockhash({
-      statePath: request.statePath,
-      chunkIndex: chunk.index,
-    });
-    return adapters.buildAndSign({
-      chunk,
-      latestBlockhash,
-      authority,
-      buffer: new PublicKey(preflight.expected.buffer),
-    });
-  };
-
-  let result;
-  let liveWriteAttempted = false;
-  const completedConfirmations = [];
   try {
-    result = await runPersistedSequentialUpload({
+    schedulerPolicy = adapters.rpcRequestScheduler?.policy?.();
+    lifecycle.enterPhase("TELEMETRY_INITIALIZATION");
+    const createTelemetry = adapters.createUploadTelemetryStore ?? createUploadTelemetryStore;
+    telemetryStore = createTelemetry({
+      directory: activeDirectory,
+      executionId,
+      startedAt,
+      startMonotonicMs: startedMonotonicMs,
+      policy: {
+        preSignCooldownMs: 3_000,
+        globalRequestStartGapMs:
+          adapters.rpcRequestPolicy?.globalRequestStartGapMs ??
+          schedulerPolicy?.minimumRequestStartGapMs ??
+          500,
+        requestTimeoutMs:
+          adapters.rpcRequestPolicy?.requestTimeoutMs ??
+          schedulerPolicy?.requestTimeoutMs ??
+          DEFAULT_RPC_REQUEST_TIMEOUT_MS,
+        confirmationPollIntervalMs:
+          adapters.rpcRequestPolicy?.confirmationPollIntervalMs ??
+          CONFIRMATION_POLL_INTERVAL_MS,
+        rateLimitRetryScheduleMs:
+          adapters.rpcRequestPolicy?.rateLimitRetryScheduleMs ??
+          schedulerPolicy?.retryBackoffMs ??
+          [2_000, 5_000],
+        interChunkDelayMs: request.delayMs,
+      },
+    });
+    const recordTelemetryStart = (entry) => telemetryStore.recordRpcStart(entry, {
+      confirmationChunkIndex:
+        entry.methodClass === "GET_SIGNATURE_STATUSES"
+          ? activeConfirmationChunkIndex
+          : null,
+    });
+    const recordTelemetryEntry = (entry) => telemetryStore.recordRpcEntry(entry);
+
+    lifecycle.enterPhase("TELEMETRY_REPLAY");
+    if (adapters.rpcRequestLedger && adapters.monotonicNow) {
+      for (const entry of adapters.rpcRequestLedger.debugSafeEntries()) {
+        recordTelemetryEntry(entry);
+      }
+    }
+
+    lifecycle.enterPhase("SUBSCRIBER_SETUP");
+    unsubscribeTelemetry =
+      adapters.rpcRequestLedger && adapters.monotonicNow
+        ? adapters.rpcRequestLedger.subscribe(recordTelemetryEntry)
+        : () => {};
+    unsubscribeTelemetryStarts =
+      adapters.rpcRequestLedger && adapters.monotonicNow
+        ? adapters.rpcRequestLedger.subscribeInvocationStarts(recordTelemetryStart)
+        : () => {};
+
+    lifecycle.enterPhase("SIGNER_PREPARATION");
+    const chunks = preflight.plan.chunks.map((chunk) => ({
+      ...chunk,
+      bytes: currentLocalBytes.subarray(chunk.offset, chunk.offset + chunk.length),
+    }));
+    let authority;
+    let preSignCoolOffComplete = false;
+    const sign = async (chunk) => {
+      lifecycle.recordCandidateSelection();
+      let coolOff;
+      const coolOffRequired = !preSignCoolOffComplete;
+      if (coolOffRequired && adapters.rpcRequestScheduler) {
+        coolOff = await adapters.rpcRequestScheduler.waitForCoolOff(3000);
+        preSignCoolOffComplete = true;
+      } else {
+        const boundary = monotonicNow();
+        coolOff = {
+          startedMonotonicMs: boundary,
+          finishedMonotonicMs: boundary,
+          elapsedMs: 0,
+        };
+      }
+      if (coolOffRequired) preSignCoolOffComplete = true;
+      telemetryStore.recordPreSignCooldown({
+        chunkIndex: chunk.index,
+        required: coolOffRequired,
+        startedMonotonicMs: coolOff.startedMonotonicMs,
+        finishedMonotonicMs: coolOff.finishedMonotonicMs,
+      });
+      if (!authority) {
+        lifecycle.recordKeypairAccess();
+        authority = await adapters.loadAuthorityKeypair(request.authorityPath);
+      }
+      if (authority?.publicKey?.toBase58() !== preflight.expected.authority) {
+        throw new Error("buffer authority signer mismatch");
+      }
+      lifecycle.recordBlockhashRequest();
+      const latestBlockhash = await adapters.getLatestBlockhash({
+        statePath: request.statePath,
+        chunkIndex: chunk.index,
+      });
+      lifecycle.recordSigningAttempt();
+      return adapters.buildAndSign({
+        chunk,
+        latestBlockhash,
+        authority,
+        buffer: new PublicKey(preflight.expected.buffer),
+      });
+    };
+
+    lifecycle.enterPhase("UPLOAD_EXECUTION");
+    const result = await runPersistedSequentialUpload({
       statePath: request.statePath,
       checkpoint: preflight.expected,
       chunks,
@@ -625,6 +652,7 @@ export async function executeUploadWindow(request, adapters) {
           monotonicMs: monotonicNow(),
         });
         liveWriteAttempted = true;
+        lifecycle.recordSendAttempt();
         try {
           const sent = await adapters.sendRawTransaction(signed.rawTransaction, chunk);
           telemetryStore.recordSendFinish({
@@ -655,77 +683,177 @@ export async function executeUploadWindow(request, adapters) {
       sleep: adapters.sleep,
       monotonicNow: adapters.monotonicNow,
       onEvent(event) {
+        if (event.status === "SENT" && typeof event.signature === "string") {
+          lifecycle.recordSignature();
+        }
         if (event.status === "CONFIRMED" && event.confirmationDurationMs !== undefined) {
           completedConfirmations.push({ chunkIndex: event.index, confirmationDurationMs: event.confirmationDurationMs });
         }
       },
     });
-  } catch (error) {
+    lifecycle.enterPhase("TERMINALIZATION");
     const finishedAt = (adapters.now ?? (() => new Date().toISOString()))();
     const telemetryEvidence = telemetryStore.finish({
       finishedAt,
       finishedMonotonicMs: monotonicNow(),
-      expectedChunkIndexes: completedConfirmations.map(({ chunkIndex }) => chunkIndex),
+      expectedChunkIndexes: result.confirmedIndexes,
     });
     unsubscribeTelemetryObservers();
     appendWindowOutcome(request.statePath, {
       executionId,
-      status: classifyTerminalError(request.statePath, error),
+      status: result.status,
       terminal: true,
       startedAt,
       finishedAt,
       maxChunks: request.maxChunks,
       delayMs: request.delayMs,
-      confirmedIndexes: completedConfirmations.map(({ chunkIndex }) => chunkIndex),
-      confirmations: completedConfirmations,
+      processed: result.processed,
+      sent: result.sent,
+      confirmedIndexes: result.confirmedIndexes,
+      confirmations: result.confirmations,
+      skippedIndexes: result.skippedIndexes,
       telemetryEvidence: {
         verdict: telemetryEvidence.verdict,
         sha256: telemetryEvidence.sha256,
       },
     });
-    throw error;
+    return {
+      command: "upload-buffer-throttled",
+      executionId,
+      status: result.status,
+      processed: result.processed,
+      sent: result.sent,
+      confirmedIndexes: result.confirmedIndexes,
+      confirmations: result.confirmations,
+      skippedIndexes: result.skippedIndexes,
+      leaseLifecycle: "RECONCILIATION_REQUIRED",
+      liveWriteAttempted,
+      liveWriteExecuted: result.confirmedIndexes.length > 0 ? true : liveWriteAttempted ? null : false,
+      stateMutation: true,
+      ...(adapters.rpcRequestLedger ? { rpcRequestSummary: adapters.rpcRequestLedger.summary() } : {}),
+      ...(adapters.rpcRequestPolicy ? { rpcRequestPolicy: adapters.rpcRequestPolicy } : {}),
+    };
+  } catch (primaryError) {
+    const primaryPhase = lifecycle.snapshot().phase;
+    const finishedAt = (adapters.now ?? (() => new Date().toISOString()))();
+    const secondaryErrors = [];
+    let telemetryEvidence = null;
+    if (telemetryStore && primaryPhase !== "TERMINALIZATION") {
+      try {
+        telemetryEvidence = telemetryStore.finish({
+          finishedAt,
+          finishedMonotonicMs: monotonicNow(),
+          expectedChunkIndexes: completedConfirmations.map(({ chunkIndex }) => chunkIndex),
+        });
+      } catch {
+        secondaryErrors.push({
+          code: "TELEMETRY_PERSISTENCE_FAILED",
+          phase: "TERMINALIZATION",
+        });
+      }
+    }
+    try {
+      unsubscribeTelemetryObservers();
+    } catch {
+      secondaryErrors.push({
+        code: "TELEMETRY_SUBSCRIBER_CLEANUP_FAILED",
+        phase: "TERMINALIZATION",
+      });
+    }
+    let stateSha256After = stateSha256Before;
+    try {
+      stateSha256After = sha256(readFileSync(request.statePath));
+    } catch {
+      secondaryErrors.push({
+        code: "STATE_EVIDENCE_READ_FAILED",
+        phase: "TERMINALIZATION",
+      });
+    }
+    const terminalRecord = buildUploadTerminalRecord({
+      executionId,
+      leaseSha256,
+      stateSha256Before,
+      stateSha256After,
+      program: preflight.expected.program,
+      buffer: preflight.expected.buffer,
+      authority: preflight.expected.authority,
+      startedAt,
+      finishedAt,
+      primaryError,
+      tracker: lifecycle,
+      secondaryErrors,
+    });
+    let terminalEvidence = null;
+    try {
+      const writeTerminal = adapters.writeUploadTerminalEvidence ??
+        writeUploadTerminalEvidence;
+      terminalEvidence = writeTerminal(activeDirectory, terminalRecord);
+    } catch {
+      secondaryErrors.push({
+        code: "FALLBACK_TERMINAL_PERSISTENCE_FAILED",
+        phase: "TERMINALIZATION",
+      });
+    }
+    if (terminalRecord.classification !== "FAILED_PRE_SELECTION_STALE_SAFE") {
+      try {
+        appendWindowOutcome(request.statePath, {
+          executionId,
+          status: classifyTerminalError(request.statePath, primaryError),
+          terminal: true,
+          startedAt,
+          finishedAt,
+          maxChunks: request.maxChunks,
+          delayMs: request.delayMs,
+          confirmedIndexes: completedConfirmations.map(({ chunkIndex }) => chunkIndex),
+          confirmations: completedConfirmations,
+          ...(telemetryEvidence ? {
+            telemetryEvidence: {
+              verdict: telemetryEvidence.verdict,
+              sha256: telemetryEvidence.sha256,
+            },
+          } : {}),
+          ...(terminalEvidence ? {
+            terminalEvidence: {
+              classification: terminalRecord.classification,
+              sha256: terminalEvidence.sha256,
+            },
+          } : {}),
+        });
+      } catch {
+        secondaryErrors.push({
+          code: "STATE_TERMINALIZATION_FAILED",
+          phase: "TERMINALIZATION",
+        });
+      }
+    }
+    const surfacedError = new Error(
+      primaryError instanceof Error
+        ? primaryError.message
+        : "upload execution failed",
+      { cause: primaryError },
+    );
+    if (primaryError instanceof Error) {
+      surfacedError.name = primaryError.name;
+      if (typeof primaryError.stack === "string") {
+        surfacedError.stack = primaryError.stack;
+      }
+    }
+    surfacedError.safeCode = terminalRecord.primaryError.code;
+    surfacedError.safePhase = primaryPhase;
+    surfacedError.secondaryErrors = structuredClone(secondaryErrors);
+    if (terminalRecord.primaryError.code === primaryError?.classification) {
+      surfacedError.classification = terminalRecord.primaryError.code;
+      if (primaryError?.name === "SafeRpcRequestError" &&
+          typeof primaryError.methodClass === "string" &&
+          Number.isSafeInteger(primaryError.sequence) &&
+          typeof primaryError.signaturePersisted === "boolean") {
+        surfacedError.methodClass = primaryError.methodClass;
+        surfacedError.sequence = primaryError.sequence;
+        surfacedError.signaturePersisted = primaryError.signaturePersisted;
+      }
+    }
+    throw surfacedError;
   }
-  const finishedAt = (adapters.now ?? (() => new Date().toISOString()))();
-  const telemetryEvidence = telemetryStore.finish({
-    finishedAt,
-    finishedMonotonicMs: monotonicNow(),
-    expectedChunkIndexes: result.confirmedIndexes,
-  });
-  unsubscribeTelemetryObservers();
-  appendWindowOutcome(request.statePath, {
-    executionId,
-    status: result.status,
-    terminal: true,
-    startedAt,
-    finishedAt,
-    maxChunks: request.maxChunks,
-    delayMs: request.delayMs,
-    processed: result.processed,
-    sent: result.sent,
-    confirmedIndexes: result.confirmedIndexes,
-    confirmations: result.confirmations,
-    skippedIndexes: result.skippedIndexes,
-    telemetryEvidence: {
-      verdict: telemetryEvidence.verdict,
-      sha256: telemetryEvidence.sha256,
-    },
-  });
-  return {
-    command: "upload-buffer-throttled",
-    executionId,
-    status: result.status,
-    processed: result.processed,
-    sent: result.sent,
-    confirmedIndexes: result.confirmedIndexes,
-    confirmations: result.confirmations,
-    skippedIndexes: result.skippedIndexes,
-    leaseLifecycle: "RECONCILIATION_REQUIRED",
-    liveWriteAttempted,
-    liveWriteExecuted: result.confirmedIndexes.length > 0 ? true : liveWriteAttempted ? null : false,
-    stateMutation: true,
-    ...(adapters.rpcRequestLedger ? { rpcRequestSummary: adapters.rpcRequestLedger.summary() } : {}),
-    ...(adapters.rpcRequestPolicy ? { rpcRequestPolicy: adapters.rpcRequestPolicy } : {}),
-  };
 }
 
 export function encodeBase58(bytes) {

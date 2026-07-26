@@ -42,6 +42,11 @@ or credential.
 All compliance durations and gaps derive from one nondecreasing monotonic clock
 and are stored as elapsed values relative to invocation start. Wall-clock ISO
 timestamps improve audit readability only and never establish compliance.
+New request durations are derived once from their stored elapsed endpoints.
+An incoming ledger duration is accepted only when finite, nonnegative, and
+within a representation-derived floating-point rounding bound of that
+canonical difference. This accepts valid fractional cancellation and existing
+integer records without weakening rejection of material inconsistency.
 Canonical sanitized JSON uses recursively sorted object keys and stable array
 order. SHA-256 is computed over the canonical form excluding no evidence
 fields and is deterministic.
@@ -77,6 +82,14 @@ closed.
 Telemetry persistence failure aborts before a later signing/send boundary. If
 failure occurs after a send start, normal lease reconciliation remains
 required; telemetry cannot manufacture an on-chain outcome.
+
+Every failure after lease acquisition also attempts a minimal whitelisted
+`terminal.json`. Its counters bind candidate selection, keypair access,
+blockhash, signing, send, and recorded-signature boundaries. Only all-zero
+counters, unchanged state hash, and no ambiguity can classify the lease as
+`FAILED_PRE_SELECTION_STALE_SAFE`; this is recovery evidence, never automatic
+release authority. Persistence, cleanup, or fallback failures are secondary
+safe codes and never replace the primary exception.
 
 ## Archive and compatibility
 
