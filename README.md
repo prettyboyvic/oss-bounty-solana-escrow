@@ -79,10 +79,16 @@ recovery reachable after the repository advances past the incident commit
 without rewriting historical evidence. See the
 [R4N recovery repository-identity repair checkpoint](docs/PHASE_2_R4N_RECOVERY_REPOSITORY_IDENTITY_REPAIR_2026-07-26.md).
 
-The sole R4L five-chunk window finalized chunks 259-263. A total of 264 chunks
-are `CONFIRMED` and 127 are `PLANNED`, with zero `SENT` or `UNKNOWN` chunks.
-Chunk index 264 remains `PLANNED` with a null signature, and the program
-remains absent.
+The first repaired R4N five-chunk window finalized chunks 264-268 after the
+stale-lease recovery. A total of 269 chunks are `CONFIRMED` and 122 are
+`PLANNED`, with zero `SENT` or `UNKNOWN` chunks. Chunk index 269 remains
+`PLANNED` with a null signature, and the program remains absent. That window
+used exactly one supervised outer-host uploader invocation (recovery made zero
+on-chain writes), verified all five signatures as `finalized`, then reconciled
+`SAFE_TO_RELEASE` and released the lease. See the
+[R4N first repaired window checkpoint](docs/PHASE_2_R4N_FIRST_REPAIRED_WINDOW_2026-07-26.md).
+
+The earlier R4L five-chunk window finalized chunks 259-263.
 Live telemetry was `COMPLETE`: its canonical hash matched the terminal state,
 measured pacing policies passed, and the artifact was preserved byte-for-byte
 through archive. Fresh reconciliation returned `SAFE_TO_RELEASE` with
