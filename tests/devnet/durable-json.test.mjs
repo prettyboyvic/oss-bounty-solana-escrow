@@ -17,12 +17,14 @@ test("durable canonical JSON flushes the file before rename and the directory af
   const events = [];
   const descriptors = new Map();
   let nextDescriptor = 10;
+  let temporaryPath;
   writeCanonicalJsonAtomic("C:\\test\\terminal.json", { z: 1, a: { y: 2, x: 3 } }, {
     randomUUID: () => "fixture",
     dirname: () => "C:\\test",
     basename: () => "terminal.json",
     openSync(path, flag) {
       events.push(`open:${path}:${flag}`);
+      if (flag === "wx") temporaryPath = path;
       const descriptor = nextDescriptor++;
       descriptors.set(descriptor, path);
       return descriptor;
@@ -45,12 +47,12 @@ test("durable canonical JSON flushes the file before rename and the directory af
     },
   });
 
-  const fileFlush = events.indexOf("fsync:C:\\test\\.terminal.json.fixture.tmp");
-  const rename = events.indexOf("rename:C:\\test\\.terminal.json.fixture.tmp:C:\\test\\terminal.json");
+  const fileFlush = events.indexOf(`fsync:${temporaryPath}`);
+  const rename = events.indexOf(`rename:${temporaryPath}:C:\\test\\terminal.json`);
   const directoryFlush = events.indexOf("fsync:C:\\test");
   assert.ok(fileFlush >= 0 && fileFlush < rename);
   assert.ok(directoryFlush > rename);
-  assert.ok(events.some((event) => event.includes('write:C:\\test\\.terminal.json.fixture.tmp:{\n  "a"')));
+  assert.ok(events.some((event) => event.includes(`write:${temporaryPath}:{\n  "a"`)));
 });
 
 test("rename interruption leaves no falsely complete durable JSON record", () => {
