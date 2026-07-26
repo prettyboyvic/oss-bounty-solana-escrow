@@ -5,33 +5,63 @@
 R4N is not executed by this plan. It is a new label and must never be treated
 as an R4M retry or replay.
 
-Readiness is `BLOCKED` until the timeout-hardening commit is pushed and its
-exact-SHA CI completes successfully. After that gate passes, the readiness
-verdict becomes `READY_FOR_SEPARATE_AUTHORIZATION`; live execution still
-requires a new explicit authorization.
+The inner timeout-hardening gate has passed. The repository now owns the outer
+host implementation, but this implementation does not authorize R4N.
+R4N remains `R4N_NOT_READY` until the outer-host commit is pushed, exact-SHA CI
+passes, and a new read-only authorization-preparation pass selects fresh
+manifest bindings and timeout values for that exact commit.
 
-## Mandatory supervisor boundary
+## Mandatory outer-host boundary
 
-The future operator must invoke the repository-owned supervisor, not the
-uploader entrypoint directly:
+The future operator must invoke the repository-owned outer host. Direct
+invocation of either the uploader or inner supervisor is forbidden:
 
 ```text
-node scripts/devnet/upload-process-supervisor.mjs \
-  --timeout-ms <explicitly-authorized-milliseconds> \
+node scripts/devnet/upload-window-host.mjs \
+  --execution-id <separately-authorized-single-use-id> \
+  --outer-timeout-ms <explicitly-authorized-outer-milliseconds> \
+  --cleanup-allowance-ms <explicitly-authorized-cleanup-milliseconds> \
+  --result-root .devnet/upload-window-host-results \
+  --expected-repository-sha <exact-authorized-commit> \
+  --expected-state-sha <fresh-state-sha256> \
+  --expected-buffer-sha <fresh-finalized-buffer-sha256> \
+  --expected-binary-sha <fresh-binary-sha256> \
+  --expected-plan-fingerprint <fresh-plan-fingerprint> \
+  --expected-candidates <fresh-inclusive-range> \
+  --expected-invocations 1 \
   -- \
-  upload-buffer-throttled <exact-R4N-uploader-arguments>
+  <exact-node-executable> scripts/devnet/upload-process-supervisor.mjs \
+    --timeout-ms <explicitly-authorized-inner-milliseconds> \
+    -- \
+    upload-buffer-throttled <exact-R4N-uploader-arguments>
 ```
 
-The timeout has no live default. The R4N authorization must state the exact
-integer millisecond value. Values below 3,000 ms, zero, negative, fractional,
-overflowed, or unit-suffixed values are rejected before uploader invocation.
-The 3,000 ms bound is only a strict invalid-value floor derived from paced
-preflight startup; it is not a recommended live duration.
+The host verifies the immutable manifest before child spawn, requires
+`expected-invocations = 1`, and creates
+`<result-root>/<execution-id>/` with exclusive-create semantics. An execution
+ID is consumed permanently once that directory is created, including after
+host failure or crash. The host never retries, resumes, respawns, or starts a
+replacement child.
 
-The external execution host must have a separately explicit timeout greater
-than the supervisor timeout plus cleanup allowance. Repository code cannot
-override an earlier host kill. Both values and their units must be recorded in
-the R4N gate before invocation.
+The outer timeout is enforced by repository code using a monotonic timer. It
+must be strictly greater than the inner timeout plus the explicit cleanup
+allowance. All values have no live default and must be selected by the later
+authorization in integer milliseconds. The earlier `879500`, `5000`, and
+`889500` values remain unapproved proposals and are not embedded in the host.
+
+Durable host evidence is outside the upload-lease lifecycle:
+
+```text
+<result-root>/<execution-id>/authorization.json
+<result-root>/<execution-id>/invocation.json
+<result-root>/<execution-id>/supervisor-stdout.log
+<result-root>/<execution-id>/supervisor-stderr.log
+<result-root>/<execution-id>/host-result.json
+```
+
+`.devnet/state.json.upload-lease/telemetry.json` is not the durable host
+result. `host-result.json` is written atomically only after child cleanup and
+both log streams close.
 
 ## R4N gate
 
@@ -52,8 +82,10 @@ A separately authorized R4N session must:
    remains `PLANNED` with a null signature. Otherwise stop before signer load.
 7. Record explicit inner-supervisor and outer-host timeout values in
    milliseconds and prove the outer boundary outlives the inner boundary.
-8. Invoke the supervisor exactly once. Never retry, replay, re-sign, resend, or
-   start a second child after success, error, timeout, rate limit, or ambiguity.
+8. Invoke the outer host exactly once with a new single-use execution ID. The
+   host may spawn the inner supervisor at most once. Never retry, replay,
+   re-sign, resend, or start a second child after success, error, timeout, rate
+   limit, interruption, cleanup failure, or ambiguity.
 9. Treat a pre-lease timeout as blocked/no-op with telemetry `UNAVAILABLE`.
    Preserve any actual active lease and evidence if timeout occurs after lease
    acquisition.
@@ -76,10 +108,13 @@ close, faucet, mint, DEVTEST, or escrow flow is authorized by this plan.
 
 Before `READY_FOR_SEPARATE_AUTHORIZATION`:
 
-- the timeout-hardening commit must be pushed;
-- its exact-SHA CI must complete successfully; and
+- the outer-host implementation commit must be pushed;
+- exact-SHA CI for that commit must complete successfully;
 - the repository must remain clean and synchronized afterward.
+- a new read-only authorization pass must recompute every manifest binding,
+  cooldown/funding fact, and exact timeout value against that commit.
 
 The later R4N authorization must additionally supply the exact supervisor and
-outer-host timeout values and approve the one bounded live invocation. This
-plan supplies no such authorization.
+outer-host timeout values, cleanup allowance, execution ID, result root, and
+approve the one bounded live invocation. This plan and implementation supply
+no such authorization.
