@@ -82,6 +82,9 @@ jobs:
       - name: Run devnet tooling tests
         run: npm run test:devnet:unit
 
+      - name: Run local validator lifecycle tests
+        run: node --test tests/local-validator/local-validator-supervisor.test.mjs
+
       - name: Run throttled uploader interruption and resume integration
         run: node --test tests/local-validator/throttled-uploader.test.mjs
 
@@ -110,5 +113,16 @@ jobs:
           '
 
       - name: Anchor localnet integration tests (26 cases)
-        # Anchor 0.31.1 omits all validator preload flags with --skip-deploy.
-        run: anchor test --skip-build
+        run: >-
+          node scripts/local-validator-supervisor.mjs
+          --program target/deploy/oss_bounty_escrow.so
+          --program-id 6UoYT4jtiS23rCU1zARqnn181BxwuJ9waS1sv35gRg1Z
+
+      - name: Upload local validator failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-validator-log
+          path: .tmp/local-validator/validator.log
+          if-no-files-found: ignore
+          retention-days: 3
