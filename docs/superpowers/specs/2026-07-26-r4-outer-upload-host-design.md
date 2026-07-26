@@ -141,11 +141,24 @@ normalized exit codes for ambiguous host failures.
 The host never opens the authority/keypair path. URLs are sanitized before
 evidence persistence, environment values are not captured, log parsing keeps
 only a bounded suffix in memory, and full logs stream directly to files.
-Retained-process checks require the canonical workflow's program, buffer, and
-relative or resolved state-path identities instead of rejecting unrelated Node
-processes. This is intentionally conservative across repository clones: a
-supervisor/uploader carrying all canonical upload identities blocks preflight,
-but is never terminated by this host.
+Retained-process checks are role-first. Structured process metadata must prove
+a Node executable and the exact repository entrypoint in `argv[1]` before the
+canonical program, buffer, and relative or resolved state-path identities may
+establish a conflict. The recognized roles are the outer host, inner
+supervisor, and production uploader. Windows command lines are parsed with
+Windows quote/backslash rules; paths compare case-insensitively and normalize
+relative, absolute, backslash, and forward-slash forms. A PowerShell, `pwsh`,
+`cmd`, task-runner, editor, test, or unrelated Node wrapper does not become an
+upload process merely because one argument contains a textual copy of the
+future command.
+
+Current-host PID exclusion remains a secondary self-check. Parent or ancestor
+PID is never a bypass: a separately proven supervisor/uploader role still
+blocks. Metadata that identifies a canonical repository entrypoint but cannot
+prove the executable identity fails closed with bounded, field-name-only
+diagnostics. A transient Node record with no entrypoint evidence is not by
+itself a suspicious upload candidate. The check is read-only and never
+terminates any process.
 Cleanup targets only the owned child PID/process group. Graceful cleanup,
 force escalation at half the allowance, and a hard failure deadline at the
 full allowance are bounded by the supplied cleanup allowance. Windows
@@ -165,7 +178,31 @@ zero spawns when the host cannot prove the count.
 Deterministic tests inject fake verification, child, timer, cleanup, and
 filesystem seams. A real-process fake supervisor fixture proves streamed logs,
 terminal parsing, timeout cleanup, single-use IDs, and unrelated-process
-isolation without invoking the uploader. Existing uploader and supervisor
-tests remain unchanged.
+isolation without invoking the uploader. Classifier regressions cover wrapper
+false positives, exact real roles, Windows argv/path normalization,
+fail-closed metadata, stable deduplication, and no termination. A Windows-local
+PowerShell probe carries the complete nested command in its parent command
+line, reaches exactly one fake child, writes fake durable evidence, and proves
+execution-ID reuse is rejected before another spawn.
+
+## R4N rejected-at-host incident
+
+The previously authorized outer-host invocation used execution ID
+`ddf6f16e-7556-43d8-9875-9b3371ad524e` exactly once. It ended
+`HOST_MANIFEST_REJECTED` with exit code 64, child spawn count zero, and no
+durable execution directory. The inner supervisor and uploader did not start;
+no signer was opened, lease acquired, or transaction signed or sent. Its
+technical substatus is `R4N_HOST_MANIFEST_REJECTED_PRE_CHILD`.
+
+The former scanner searched raw command-line substrings. The PowerShell parent
+contained the complete frozen nested command in its `-Command` argument, so
+text belonging to a wrapper was incorrectly treated as an active upload
+process. Excluding that parent, all ancestors, PowerShell, Codex, or that exact
+command would leave the same classification defect. Positive role proof is the
+repair contract.
+
+The execution ID is permanently `AUTHORIZATION_SPENT_PRE_CHILD` and must never
+be reused. After classifier publication, any later authorization-preparation
+pass requires a fresh manifest and a new execution ID.
 
 This repair does not authorize R4N.

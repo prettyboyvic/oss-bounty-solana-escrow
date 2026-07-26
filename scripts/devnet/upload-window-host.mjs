@@ -41,6 +41,9 @@ import {
   parseUploadProcessSupervisorArgs,
 } from "./upload-process-supervisor.mjs";
 import {
+  inspectRetainedUploadProcessesProduction,
+} from "./upload-process-classifier.mjs";
+import {
   planBufferUpload,
 } from "./upload-plan.mjs";
 
@@ -324,37 +327,6 @@ async function collectRepositorySnapshotProduction(repoRoot, resultRoot) {
   };
 }
 
-async function retainedProcessCountProduction({ statePath, stateArgument, program, buffer }) {
-  const command = process.platform === "win32"
-    ? ["powershell", ["-NoProfile", "-NonInteractive", "-Command", "Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"]]
-    : ["ps", ["-eo", "pid=,args="]];
-  const result = spawnSync(command[0], command[1], {
-    encoding: "utf8",
-    windowsHide: true,
-    shell: false,
-  });
-  if (result.status !== 0) throw new Error("retained uploader process inspection failed");
-  const pattern = /upload-process-supervisor\.mjs|upload-buffer-cli\.mjs/;
-  const normalizedStatePath = resolve(statePath).replaceAll("\\", "/").toLowerCase();
-  const normalizedStateArgument = String(stateArgument).replaceAll("\\", "/").toLowerCase();
-  const isOwnedUpload = (commandLine) => {
-    const normalized = String(commandLine ?? "").replaceAll("\\", "/").toLowerCase();
-    return pattern.test(normalized) &&
-      normalized.includes(program.toLowerCase()) &&
-      normalized.includes(buffer.toLowerCase()) &&
-      (normalized.includes(normalizedStatePath) || normalized.includes(normalizedStateArgument));
-  };
-  if (process.platform === "win32") {
-    const parsed = result.stdout.trim() ? JSON.parse(result.stdout) : [];
-    return (Array.isArray(parsed) ? parsed : [parsed]).filter((entry) =>
-      entry?.ProcessId !== process.pid && isOwnedUpload(entry?.CommandLine)).length;
-  }
-  return result.stdout.split(/\r?\n/).filter((line) => {
-    const match = /^\s*(\d+)\s+(.*)$/.exec(line);
-    return match && Number(match[1]) !== process.pid && isOwnedUpload(match[2]);
-  }).length;
-}
-
 async function verifyFinalizedBufferProduction({ requestTimeoutMs } = {}) {
   const scheduler = createRpcRequestScheduler({ requestTimeoutMs });
   const connection = new Connection(DEVNET_RPC_URL, {
@@ -401,14 +373,31 @@ export async function verifyAuthorizationManifest(parsed, adapters = {}) {
   const pathExists = adapters.pathExists ?? existsSync;
   if (pathExists(`${statePath}.upload-lease`)) throw new Error("upload lease already exists");
   if (pathExists(`${statePath}.upload-lease-operation-lock`)) throw new Error("upload operation lock already exists");
-  const retainedProcessCount = adapters.retainedProcessCount ?? retainedProcessCountProduction;
-  if (await retainedProcessCount({
+  const retainedProcessIdentity = {
     repoRoot,
+    currentPid: process.pid,
     statePath,
     stateArgument: parsed.supervisorRequest.statePath,
     program: PLAN_UPLOAD_IDENTITIES.program,
     buffer: PLAN_UPLOAD_IDENTITIES.buffer,
-  }) !== 0) throw new Error("retained uploader process exists");
+  };
+  if (adapters.retainedProcessCount) {
+    if (await adapters.retainedProcessCount(retainedProcessIdentity) !== 0) {
+      throw new Error("retained uploader process exists");
+    }
+  } else {
+    const inspectRetainedProcesses = adapters.inspectRetainedProcesses ??
+      inspectRetainedUploadProcessesProduction;
+    const inspection = await inspectRetainedProcesses(retainedProcessIdentity);
+    if (inspection.diagnostics.length !== 0) {
+      const summary = inspection.diagnostics
+        .map(({ code, pid, missing }) =>
+          `${code}[pid=${pid ?? "unknown"};missing=${missing.join(",")}]`)
+        .join(";");
+      throw new Error(`retained process metadata unavailable: ${summary}`);
+    }
+    if (inspection.conflicts.length !== 0) throw new Error("retained uploader process exists");
+  }
 
   const readStateBytes = adapters.readStateBytes ?? ((path) => readFileSync(path));
   const readBinaryBytes = adapters.readBinaryBytes ?? ((path) => readFileSync(path));

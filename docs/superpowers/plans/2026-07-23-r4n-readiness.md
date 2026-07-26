@@ -169,8 +169,8 @@ close, faucet, mint, DEVTEST, or escrow flow is authorized by this plan.
 
 Before `READY_FOR_SEPARATE_AUTHORIZATION`:
 
-- the outer-host implementation commit must be pushed;
-- exact-SHA CI for that commit must complete successfully;
+- the structured retained-process-classifier repair must be pushed;
+- exact-SHA CI for that repair commit must complete successfully;
 - the repository must remain clean and synchronized afterward.
 - a new read-only authorization pass must recompute every manifest binding,
   cooldown/funding fact, and exact timeout value against that commit.
@@ -181,5 +181,33 @@ total deadline, request timeout, canonical candidate digest, execution ID,
 result root, and
 approve the one bounded live invocation. This plan and implementation supply
 no such authorization.
+
+## Rejected pre-child authorization
+
+Execution ID `ddf6f16e-7556-43d8-9875-9b3371ad524e` was used by the one
+authorized outer-host attempt and is permanently
+`AUTHORIZATION_SPENT_PRE_CHILD`. The host returned
+`HOST_MANIFEST_REJECTED`/64 before creating a durable execution directory and
+reported child spawn count zero. The technical substatus is
+`R4N_HOST_MANIFEST_REJECTED_PRE_CHILD`: no supervisor, uploader, signer, lease,
+signed transaction, or sent transaction existed.
+
+The rejection was a retained-process false positive. Raw command-line
+substring matching saw the complete future command inside the PowerShell
+parent's `-Command` argument. It did not prove that PowerShell was the Node
+outer host, supervisor, or uploader. Parent/ancestor exclusion alone is not a
+valid repair because a real retained role may itself be a parent or ancestor.
+
+The gate must instead use structured process metadata, Windows-aware argv
+parsing, Node executable identity, and the exact repository entrypoint at
+`argv[1]`. Only after role proof may program, buffer, and state identities
+establish a workflow conflict. Metadata that exposes a canonical entrypoint
+but lacks executable proof fails closed with bounded sanitized diagnostics; a
+transient Node record with no entrypoint evidence is not a positive or a
+suspicious candidate. The read-only gate never terminates processes.
+
+Publication of this repair does not revive the spent execution ID. Any future
+R4N preparation requires a new read-only pass, a fresh authorization manifest,
+and a new execution ID.
 
 This repair does not authorize R4N.
