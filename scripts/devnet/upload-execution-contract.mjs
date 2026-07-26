@@ -36,6 +36,7 @@ const PRE_SELECTION_RECONCILE_KEYS = new Set([
   "expected-candidates",
   "expected-dead-owner",
   "expected-evidence-sha",
+  "expected-incident-repository-sha",
   "expected-inner-execution-id",
   "expected-lease-sha",
   "expected-outer-execution-id",
@@ -158,6 +159,9 @@ function parsePreSelectionBindings(values) {
   if (!/^[a-f0-9]{40}$/.test(values["expected-repository-sha"])) {
     throw new Error("lowercase repository SHA is required");
   }
+  if (!/^[a-f0-9]{40}$/.test(values["expected-incident-repository-sha"])) {
+    throw new Error("lowercase incident repository SHA is required");
+  }
   if (values["expected-authority"] !== PLAN_UPLOAD_IDENTITIES.authority) {
     throw new Error("canonical authority is required");
   }
@@ -179,6 +183,7 @@ function parsePreSelectionBindings(values) {
       outerExecutionId: values["expected-outer-execution-id"],
       innerExecutionId: values["expected-inner-execution-id"],
       repositorySha: values["expected-repository-sha"],
+      incidentRepositorySha: values["expected-incident-repository-sha"],
       stateSha256: values["expected-state-sha"],
       bufferSha256: values["expected-buffer-sha"],
       program: values.program,

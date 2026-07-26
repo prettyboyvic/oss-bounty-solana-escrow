@@ -1,14 +1,19 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { createRpcRequestLedger } from "../../scripts/devnet/rpc-request-ledger.mjs";
-import { main, sanitizeCliErrorMessage } from "../../scripts/devnet/upload-buffer-cli.mjs";
+import {
+  collectIncidentRepositoryAncestry,
+  collectRecoveryRepositorySha,
+  main,
+  sanitizeCliErrorMessage,
+} from "../../scripts/devnet/upload-buffer-cli.mjs";
 
 const ENTRY = fileURLToPath(new URL("../../scripts/devnet/upload-buffer-cli.mjs", import.meta.url));
 const ENTRY_URL = pathToFileURL(ENTRY).href;
@@ -223,6 +228,7 @@ test("public command dispatch preserves read-only and local-only authority bound
     "--expected-outer-execution-id", "outer-fixture",
     "--expected-inner-execution-id", "inner-fixture",
     "--expected-repository-sha", "a".repeat(40),
+    "--expected-incident-repository-sha", "9".repeat(40),
     "--expected-state-sha", "3".repeat(64),
     "--expected-buffer-sha", "4".repeat(64),
     "--expected-authority", "Avfvs1k6ttrBtqh83tFw5g3dhWncrjP5hj4D52kGNZGk",
@@ -482,4 +488,63 @@ test("direct CLI stderr is only the JSON terminal classification", () => {
   assert.equal(result.status, 1);
   assert.equal(result.stdout, "");
   assert.equal(result.stderr, `${JSON.stringify(COMMAND_FAILED)}\n`);
+});
+
+function git(root, args) {
+  const result = spawnSync("git", args, { cwd: root, encoding: "utf8", windowsHide: true });
+  assert.equal(result.status, 0, `git ${args.join(" ")}: ${result.stderr}`);
+  return result.stdout.trim();
+}
+
+function initRepo() {
+  const root = mkdtempSync(join(tmpdir(), "recovery-repo-identity-"));
+  git(root, ["init", "--quiet"]);
+  git(root, ["config", "user.email", "test@example.com"]);
+  git(root, ["config", "user.name", "Test"]);
+  git(root, ["config", "commit.gpgsign", "false"]);
+  git(root, ["config", "core.autocrlf", "false"]);
+  spawnSync("git", ["commit", "--allow-empty", "-m", "incident"], { cwd: root, windowsHide: true });
+  const incident = git(root, ["rev-parse", "HEAD"]);
+  spawnSync("git", ["commit", "--allow-empty", "-m", "repair"], { cwd: root, windowsHide: true });
+  const live = git(root, ["rev-parse", "HEAD"]);
+  // Point origin/main at the live commit so the live gates are satisfiable.
+  git(root, ["update-ref", "refs/remotes/origin/main", live]);
+  return { root, incident, live };
+}
+
+test("live recovery repository gates and incident ancestry are enforced with real Git state", () => {
+  const { root, incident, live } = initRepo();
+  try {
+    // Live gates pass at the clean live HEAD == origin/main.
+    assert.equal(collectRecoveryRepositorySha(root, live), live);
+    // Historical incident SHA is an ancestor of the live SHA.
+    assert.equal(collectIncidentRepositoryAncestry(root, incident, live), true);
+    // Equal SHAs count as an ancestor (same-commit recovery is allowed).
+    assert.equal(collectIncidentRepositoryAncestry(root, live, live), true);
+    // The live SHA is NOT an ancestor of the older incident SHA (forward transition rejected).
+    assert.equal(collectIncidentRepositoryAncestry(root, live, incident), false);
+
+    // Wrong expected live SHA is rejected.
+    assert.throws(() => collectRecoveryRepositorySha(root, "a".repeat(40)), /binding mismatch/);
+
+    // A dirty tracked worktree is rejected.
+    writeFileSync(join(root, "tracked.txt"), "x");
+    git(root, ["add", "tracked.txt"]);
+    assert.throws(() => collectRecoveryRepositorySha(root, live), /binding mismatch/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("live HEAD diverging from origin/main is rejected by the live recovery gate", () => {
+  const { root, live } = initRepo();
+  try {
+    spawnSync("git", ["commit", "--allow-empty", "-m", "extra"], { cwd: root, windowsHide: true });
+    const ahead = git(root, ["rev-parse", "HEAD"]);
+    // HEAD now differs from origin/main; even the exact HEAD SHA must be rejected.
+    assert.throws(() => collectRecoveryRepositorySha(root, ahead), /binding mismatch/);
+    assert.notEqual(ahead, live);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

@@ -131,7 +131,7 @@ function runGitValue(repoRoot, args) {
   return result.stdout.trim();
 }
 
-function collectRecoveryRepositorySha(repoRoot, expectedSha) {
+export function collectRecoveryRepositorySha(repoRoot, expectedSha) {
   const head = runGitValue(repoRoot, ["rev-parse", "HEAD"]);
   const originMain = runGitValue(repoRoot, ["rev-parse", "origin/main"]);
   const status = runGitValue(repoRoot, [
@@ -150,6 +150,27 @@ function collectRecoveryRepositorySha(repoRoot, expectedSha) {
     throw new Error("repository recovery binding mismatch");
   }
   return head;
+}
+
+// Establishes whether the historical incident repository SHA is a Git ancestor
+// of the live recovery SHA. `git merge-base --is-ancestor A B` exits 0 when A
+// is an ancestor of (or equal to) B, 1 when it is not, and non-{0,1} on any
+// other error (for example an unknown object). Anything but a clean 0/1 result
+// fails closed rather than being interpreted as "not an ancestor".
+export function collectIncidentRepositoryAncestry(repoRoot, incidentSha, liveSha) {
+  if (!/^[a-f0-9]{40}$/.test(incidentSha) || !/^[a-f0-9]{40}$/.test(liveSha)) {
+    throw new Error("repository recovery binding mismatch");
+  }
+  const result = spawnSync(
+    "git",
+    ["merge-base", "--is-ancestor", incidentSha, liveSha],
+    { cwd: repoRoot, windowsHide: true, shell: false },
+  );
+  if (result.error || result.signal !== null ||
+      (result.status !== 0 && result.status !== 1)) {
+    throw new Error("repository ancestry inspection failed");
+  }
+  return result.status === 0;
 }
 
 export async function main(argv = process.argv.slice(2), dependencies = {}) {
@@ -242,6 +263,11 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
         repoRoot,
         request.expected.repositorySha,
       );
+      const incidentRepositoryIsAncestor = collectIncidentRepositoryAncestry(
+        repoRoot,
+        request.expected.incidentRepositorySha,
+        repositorySha,
+      );
       const inspection = await inspectRetainedUploadProcessesProduction({
         repoRoot,
         currentPid: process.pid,
@@ -254,6 +280,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
         ...request,
         observations: {
           repositorySha,
+          incidentRepositoryIsAncestor,
           bufferDataSha256: reconciliationInput.observations.bufferDataSha256,
           programAbsent: reconciliationInput.observations.programAbsent,
           confirmedChunksMatch:
@@ -287,6 +314,12 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
               repoRoot,
               lockedInput.expected.repositorySha,
             );
+            const freshIncidentRepositoryIsAncestor =
+              collectIncidentRepositoryAncestry(
+                repoRoot,
+                lockedInput.expected.incidentRepositorySha,
+                freshRepositorySha,
+              );
             const freshInspection =
               await inspectRetainedUploadProcessesProduction({
                 repoRoot,
@@ -300,6 +333,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
               ...lockedInput,
               observations: {
                 repositorySha: freshRepositorySha,
+                incidentRepositoryIsAncestor: freshIncidentRepositoryIsAncestor,
                 bufferDataSha256:
                   freshReconciliationInput.observations.bufferDataSha256,
                 programAbsent:

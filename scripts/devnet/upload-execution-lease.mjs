@@ -675,6 +675,16 @@ function fileProjection(directory, names) {
   }));
 }
 
+// A known repository-identity validation failure that must surface a precise
+// structured reason instead of collapsing into the generic evidence bucket.
+class PreSelectionEvidenceError extends Error {
+  constructor(reason) {
+    super(reason);
+    this.name = "PreSelectionEvidenceError";
+    this.reason = reason;
+  }
+}
+
 function readOuterPreSelectionEvidence(directory, expected, lease) {
   const names = [
     "authorization.json",
@@ -694,6 +704,13 @@ function readOuterPreSelectionEvidence(directory, expected, lease) {
   const supervisor = JSON.parse(stdoutBytes.toString("utf8"));
   const publicError = JSON.parse(stderrBytes.toString("utf8"));
   const manifest = authorization.expectedManifest;
+  // The frozen authorization manifest carries the historical incident-time
+  // repository SHA. It is evaluated against the caller's explicit incident
+  // binding, never against the live recovery SHA, so a legitimate advance of
+  // the repository past the incident commit does not falsely fail.
+  if (manifest && manifest.expectedRepositorySha !== expected.incidentRepositorySha) {
+    throw new PreSelectionEvidenceError("INCIDENT_REPOSITORY_IDENTITY_MISMATCH");
+  }
   const consumedAt = Date.parse(authorization.consumedAt);
   const spawnedAt = Date.parse(invocation.spawnedAt);
   const hostStartedAt = Date.parse(hostResult.startedAt);
@@ -704,7 +721,6 @@ function readOuterPreSelectionEvidence(directory, expected, lease) {
       !Number.isSafeInteger(authorization.hostPid) ||
       authorization.expectedInvocations !== 1 ||
       authorization.retryAllowed !== false ||
-      manifest?.expectedRepositorySha !== expected.repositorySha ||
       manifest?.expectedStateSha !== expected.stateSha256 ||
       manifest?.expectedBufferSha !== expected.bufferSha256 ||
       manifest?.expectedInvocations !== 1 ||
@@ -760,6 +776,7 @@ function completePreSelectionExpected(expected) {
     SAFE_EXECUTION_ID.test(expected.outerExecutionId ?? "") &&
     SAFE_EXECUTION_ID.test(expected.innerExecutionId ?? "") &&
     /^[a-f0-9]{40}$/.test(expected.repositorySha ?? "") &&
+    /^[a-f0-9]{40}$/.test(expected.incidentRepositorySha ?? "") &&
     HEX_64.test(expected.stateSha256 ?? "") &&
     HEX_64.test(expected.bufferSha256 ?? "") &&
     typeof expected.program === "string" &&
@@ -834,6 +851,12 @@ export function reconcilePreSelectionUploadLease(input, adapters = {}) {
         (!adapters.allowOwnedOperationLock &&
           existsSync(operationLockPath(input.statePath)))) {
       return preSelectionFailure("OBSERVATION_MISMATCH");
+    }
+    // The live recovery SHA (validated above) is only allowed to run against a
+    // historical incident SHA that it descends from. Equality is permitted
+    // (a same-commit recovery), but an unrelated or forward transition is not.
+    if (input.observations?.incidentRepositoryIsAncestor !== true) {
+      return preSelectionFailure("HISTORICAL_REPOSITORY_NOT_ANCESTOR");
     }
     const directory = expected.leasePath;
     const names = readdirSync(directory).sort();
@@ -976,7 +999,10 @@ export function reconcilePreSelectionUploadLease(input, adapters = {}) {
       stateMutation: false,
       onchainWrite: false,
     };
-  } catch {
+  } catch (error) {
+    if (error instanceof PreSelectionEvidenceError) {
+      return preSelectionFailure(error.reason);
+    }
     return preSelectionFailure("INSUFFICIENT_EVIDENCE");
   }
 }

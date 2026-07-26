@@ -71,6 +71,14 @@ remains forbidden and any recovery or future live window needs separate
 authorization. See the
 [R4N pre-selection failure repair checkpoint](docs/PHASE_2_R4N_PRE_SELECTION_FAILURE_REPAIR_2026-07-26.md).
 
+The recovery path also separates the historical incident repository SHA (frozen
+in the immutable authorization manifest) from the live recovery repository SHA
+(the reviewed publication commit), requiring the incident SHA to be a Git
+ancestor of the live SHA via `--expected-incident-repository-sha`. This makes
+recovery reachable after the repository advances past the incident commit
+without rewriting historical evidence. See the
+[R4N recovery repository-identity repair checkpoint](docs/PHASE_2_R4N_RECOVERY_REPOSITORY_IDENTITY_REPAIR_2026-07-26.md).
+
 The sole R4L five-chunk window finalized chunks 259-263. A total of 264 chunks
 are `CONFIRMED` and 127 are `PLANNED`, with zero `SENT` or `UNKNOWN` chunks.
 Chunk index 264 remains `PLANNED` with a null signature, and the program

@@ -22,6 +22,7 @@ import {
 const OUTER_ID = "outer-fixture-1";
 const INNER_ID = "inner-fixture-1";
 const REPOSITORY_SHA = "a".repeat(40);
+const INCIDENT_SHA = "9".repeat(40);
 const BUFFER_SHA = "b".repeat(64);
 const PROGRAM = "6UoYT4jtiS23rCU1zARqnn181BxwuJ9waS1sv35gRg1Z";
 const BUFFER = "CT1DGjkt9t926L6SoFxiYJmzc18nMowpdw1WcZgWwbbW";
@@ -59,7 +60,10 @@ function telemetryEntry() {
   };
 }
 
-function fixture() {
+function fixture(options = {}) {
+  const incidentRepositorySha = options.incidentRepositorySha ?? REPOSITORY_SHA;
+  const liveRepositorySha = options.liveRepositorySha ?? REPOSITORY_SHA;
+  const incidentRepositoryIsAncestor = options.incidentRepositoryIsAncestor ?? true;
   const root = mkdtempSync(join(tmpdir(), "preselection-recovery-"));
   const statePath = join(root, "state.json");
   const activeDirectory = leasePaths(statePath).activeDirectory;
@@ -128,7 +132,7 @@ function fixture() {
   writeFileSync(join(outerDirectory, "supervisor-stdout.log"), stdout);
   writeFileSync(join(outerDirectory, "supervisor-stderr.log"), stderr);
   const expectedManifest = {
-    expectedRepositorySha: REPOSITORY_SHA,
+    expectedRepositorySha: incidentRepositorySha,
     expectedStateSha: stateSha256,
     expectedBufferSha: BUFFER_SHA,
     expectedCandidates: [0, 1],
@@ -188,7 +192,8 @@ function fixture() {
     evidenceSha256: sha256(readFileSync(join(activeDirectory, "telemetry.json"))),
     outerExecutionId: OUTER_ID,
     innerExecutionId: INNER_ID,
-    repositorySha: REPOSITORY_SHA,
+    repositorySha: liveRepositorySha,
+    incidentRepositorySha,
     stateSha256,
     bufferSha256: BUFFER_SHA,
     program: PROGRAM,
@@ -203,7 +208,8 @@ function fixture() {
     outerEvidenceDirectory: outerDirectory,
     expected,
     observations: {
-      repositorySha: REPOSITORY_SHA,
+      repositorySha: liveRepositorySha,
+      incidentRepositoryIsAncestor,
       bufferDataSha256: BUFFER_SHA,
       programAbsent: true,
       confirmedChunksMatch: true,
@@ -234,6 +240,64 @@ test("incident-shaped pre-selection evidence is recovery eligible only with comp
   assert.match(result.recoveryHash, /^[a-f0-9]{64}$/);
   assert.equal(result.stateMutation, false);
   assert.equal(result.onchainWrite, false);
+});
+
+test("distinct historical incident and live recovery repository SHAs are eligible when incident is an ancestor", () => {
+  const value = fixture({
+    incidentRepositorySha: INCIDENT_SHA,
+    liveRepositorySha: REPOSITORY_SHA,
+    incidentRepositoryIsAncestor: true,
+  });
+  const result = reconcilePreSelectionUploadLease(value.input, deadOwner);
+  assert.equal(result.result, "RECOVERY_ELIGIBLE");
+  assert.equal(result.lifecycle, "FAILED_PRE_SELECTION_STALE_SAFE");
+  assert.match(result.recoveryHash, /^[a-f0-9]{64}$/);
+});
+
+test("the recovery hash binds both the historical incident and live recovery repository identities", () => {
+  const base = fixture({
+    incidentRepositorySha: INCIDENT_SHA,
+    liveRepositorySha: REPOSITORY_SHA,
+  });
+  const baseHash = reconcilePreSelectionUploadLease(base.input, deadOwner).recoveryHash;
+
+  const otherIncident = fixture({
+    incidentRepositorySha: "7".repeat(40),
+    liveRepositorySha: REPOSITORY_SHA,
+  });
+  const otherIncidentHash =
+    reconcilePreSelectionUploadLease(otherIncident.input, deadOwner).recoveryHash;
+  assert.notEqual(baseHash, otherIncidentHash);
+});
+
+test("repository-identity failures surface precise reasons instead of a generic bucket", () => {
+  const notAncestor = fixture({
+    incidentRepositorySha: INCIDENT_SHA,
+    liveRepositorySha: REPOSITORY_SHA,
+    incidentRepositoryIsAncestor: false,
+  });
+  const notAncestorResult = reconcilePreSelectionUploadLease(notAncestor.input, deadOwner);
+  assert.equal(notAncestorResult.result, "RECOVERY_INELIGIBLE");
+  assert.equal(notAncestorResult.reason, "HISTORICAL_REPOSITORY_NOT_ANCESTOR");
+
+  const wrongIncident = fixture({
+    incidentRepositorySha: INCIDENT_SHA,
+    liveRepositorySha: REPOSITORY_SHA,
+  });
+  // Caller binds an incident SHA that disagrees with the frozen manifest.
+  wrongIncident.input.expected.incidentRepositorySha = "6".repeat(40);
+  const wrongIncidentResult = reconcilePreSelectionUploadLease(wrongIncident.input, deadOwner);
+  assert.equal(wrongIncidentResult.result, "RECOVERY_INELIGIBLE");
+  assert.equal(wrongIncidentResult.reason, "INCIDENT_REPOSITORY_IDENTITY_MISMATCH");
+
+  const liveMismatch = fixture({
+    incidentRepositorySha: INCIDENT_SHA,
+    liveRepositorySha: REPOSITORY_SHA,
+  });
+  liveMismatch.input.observations.repositorySha = "5".repeat(40);
+  const liveMismatchResult = reconcilePreSelectionUploadLease(liveMismatch.input, deadOwner);
+  assert.equal(liveMismatchResult.result, "RECOVERY_INELIGIBLE");
+  assert.equal(liveMismatchResult.reason, "OBSERVATION_MISMATCH");
 });
 
 test("pre-selection reconciliation rejects every ambiguous ownership or evidence boundary", () => {
