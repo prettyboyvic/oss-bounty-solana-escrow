@@ -106,14 +106,20 @@ and
 [R4N campaign window 289-293 checkpoint](docs/PHASE_2_R4N_CAMPAIGN_WINDOW_289_293_2026-07-27.md).
 
 A further bounded campaign (planned three windows, ceiling four) then continued.
-Its three windows finalized chunks 294-298, 299-303, and 304-308: a total of
-309 chunks are `CONFIRMED` and 82 are `PLANNED`, with zero `SENT` or `UNKNOWN`
-chunks. Chunk index 309 remains `PLANNED` with a null signature, and the
-program remains absent. See the
+Its three windows finalized chunks 294-298, 299-303, and 304-308: at that point
+309 chunks were `CONFIRMED` and 82 `PLANNED`. See the
 [R4N campaign window 294-298 checkpoint](docs/PHASE_2_R4N_CAMPAIGN_WINDOW_294_298_2026-07-27.md),
 [R4N campaign window 299-303 checkpoint](docs/PHASE_2_R4N_CAMPAIGN_WINDOW_299_303_2026-07-27.md),
 and
 [R4N campaign window 304-308 checkpoint](docs/PHASE_2_R4N_CAMPAIGN_WINDOW_304_308_2026-07-27.md).
+
+A subsequent campaign (planned two windows, ceiling three), gated on an
+independent disposition of the prior `378/1` local validation anomaly, then
+continued. Its first window finalized chunks 309-313: a total of 314 chunks are
+`CONFIRMED` and 77 are `PLANNED`, with zero `SENT` or `UNKNOWN` chunks. Chunk
+index 314 remains `PLANNED` with a null signature, and the program remains
+absent. See the
+[R4N campaign window 309-313 checkpoint](docs/PHASE_2_R4N_CAMPAIGN_WINDOW_309_313_2026-07-27.md).
 
 The earlier R4L five-chunk window finalized chunks 259-263.
 Live telemetry was `COMPLETE`: its canonical hash matched the terminal state,
