@@ -115,11 +115,13 @@ and
 
 A subsequent campaign (planned two windows, ceiling three), gated on an
 independent disposition of the prior `378/1` local validation anomaly, then
-continued. Its first window finalized chunks 309-313: a total of 314 chunks are
-`CONFIRMED` and 77 are `PLANNED`, with zero `SENT` or `UNKNOWN` chunks. Chunk
-index 314 remains `PLANNED` with a null signature, and the program remains
-absent. See the
-[R4N campaign window 309-313 checkpoint](docs/PHASE_2_R4N_CAMPAIGN_WINDOW_309_313_2026-07-27.md).
+continued. Its two windows finalized chunks 309-313 and 314-318: a total of 319
+chunks are `CONFIRMED` and 72 are `PLANNED`, with zero `SENT` or `UNKNOWN`
+chunks. Chunk index 319 remains `PLANNED` with a null signature, and the program
+remains absent. See the
+[R4N campaign window 309-313 checkpoint](docs/PHASE_2_R4N_CAMPAIGN_WINDOW_309_313_2026-07-27.md)
+and the
+[R4N campaign window 314-318 checkpoint](docs/PHASE_2_R4N_CAMPAIGN_WINDOW_314_318_2026-07-27.md).
 
 The earlier R4L five-chunk window finalized chunks 259-263.
 Live telemetry was `COMPLETE`: its canonical hash matched the terminal state,
