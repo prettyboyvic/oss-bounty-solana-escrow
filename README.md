@@ -95,6 +95,12 @@ exact-SHA CI, 900-second cooldown, and a fresh preflight). See the
 and the
 [R4N pilot window 274-278 checkpoint](docs/PHASE_2_R4N_PILOT_WINDOW_274_278_2026-07-27.md).
 
+A bounded campaign (planned three windows, ceiling five) then continued. Its
+first window finalized chunks 279-283: a total of 284 chunks are `CONFIRMED`
+and 107 are `PLANNED`, with zero `SENT` or `UNKNOWN` chunks. Chunk index 284
+remains `PLANNED` with a null signature, and the program remains absent. See the
+[R4N campaign window 279-283 checkpoint](docs/PHASE_2_R4N_CAMPAIGN_WINDOW_279_283_2026-07-27.md).
+
 The earlier R4L five-chunk window finalized chunks 259-263.
 Live telemetry was `COMPLETE`: its canonical hash matched the terminal state,
 measured pacing policies passed, and the artifact was preserved byte-for-byte
