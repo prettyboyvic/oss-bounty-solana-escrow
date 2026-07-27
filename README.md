@@ -83,14 +83,17 @@ The first repaired R4N five-chunk window finalized chunks 264-268 after the
 stale-lease recovery. See the
 [R4N first repaired window checkpoint](docs/PHASE_2_R4N_FIRST_REPAIRED_WINDOW_2026-07-26.md).
 
-A bounded two-window pilot then began. Its first window finalized chunks
-269-273: a total of 274 chunks are `CONFIRMED` and 117 are
-`PLANNED`, with zero `SENT` or `UNKNOWN` chunks. Chunk index 274 remains
-`PLANNED` with a null signature, and the program remains absent. Each pilot
-window used exactly one supervised outer-host uploader invocation, verified all
-five signatures as `finalized`, reconciled `SAFE_TO_RELEASE`, and released the
-lease. See the
-[R4N pilot window 269-273 checkpoint](docs/PHASE_2_R4N_PILOT_WINDOW_269_273_2026-07-27.md).
+A bounded two-window pilot then ran, finalizing chunks 269-273 and 274-278. A
+total of 279 chunks are `CONFIRMED` and 112 are `PLANNED`, with zero `SENT` or
+`UNKNOWN` chunks. Chunk index 279 remains `PLANNED` with a null signature, and
+the program remains absent. Each pilot window used exactly one supervised
+outer-host uploader invocation, verified all five signatures as `finalized`,
+reconciled `SAFE_TO_RELEASE`, and released the lease; the two windows were
+separated by the full between-window boundary (per-window checkpoint,
+exact-SHA CI, 900-second cooldown, and a fresh preflight). See the
+[R4N pilot window 269-273 checkpoint](docs/PHASE_2_R4N_PILOT_WINDOW_269_273_2026-07-27.md)
+and the
+[R4N pilot window 274-278 checkpoint](docs/PHASE_2_R4N_PILOT_WINDOW_274_278_2026-07-27.md).
 
 The earlier R4L five-chunk window finalized chunks 259-263.
 Live telemetry was `COMPLETE`: its canonical hash matched the terminal state,
