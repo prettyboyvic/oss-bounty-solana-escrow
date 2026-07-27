@@ -80,13 +80,17 @@ without rewriting historical evidence. See the
 [R4N recovery repository-identity repair checkpoint](docs/PHASE_2_R4N_RECOVERY_REPOSITORY_IDENTITY_REPAIR_2026-07-26.md).
 
 The first repaired R4N five-chunk window finalized chunks 264-268 after the
-stale-lease recovery. A total of 269 chunks are `CONFIRMED` and 122 are
-`PLANNED`, with zero `SENT` or `UNKNOWN` chunks. Chunk index 269 remains
-`PLANNED` with a null signature, and the program remains absent. That window
-used exactly one supervised outer-host uploader invocation (recovery made zero
-on-chain writes), verified all five signatures as `finalized`, then reconciled
-`SAFE_TO_RELEASE` and released the lease. See the
+stale-lease recovery. See the
 [R4N first repaired window checkpoint](docs/PHASE_2_R4N_FIRST_REPAIRED_WINDOW_2026-07-26.md).
+
+A bounded two-window pilot then began. Its first window finalized chunks
+269-273: a total of 274 chunks are `CONFIRMED` and 117 are
+`PLANNED`, with zero `SENT` or `UNKNOWN` chunks. Chunk index 274 remains
+`PLANNED` with a null signature, and the program remains absent. Each pilot
+window used exactly one supervised outer-host uploader invocation, verified all
+five signatures as `finalized`, reconciled `SAFE_TO_RELEASE`, and released the
+lease. See the
+[R4N pilot window 269-273 checkpoint](docs/PHASE_2_R4N_PILOT_WINDOW_269_273_2026-07-27.md).
 
 The earlier R4L five-chunk window finalized chunks 259-263.
 Live telemetry was `COMPLETE`: its canonical hash matched the terminal state,
