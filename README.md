@@ -127,11 +127,14 @@ windows finalized chunks 319-323 and 324-328, reaching 329 `CONFIRMED`. See the
 and the
 [R4N campaign window 324-328 checkpoint](docs/PHASE_2_R4N_CAMPAIGN_WINDOW_324_328_2026-07-27.md).
 
-Another campaign (planned two windows, ceiling three) then continued. Its first
-window finalized chunks 329-333: a total of 334 chunks are `CONFIRMED` and 57
-are `PLANNED`, with zero `SENT` or `UNKNOWN` chunks. Chunk index 334 remains
-`PLANNED` with a null signature, and the program remains absent. See the
-[R4N campaign window 329-333 checkpoint](docs/PHASE_2_R4N_CAMPAIGN_WINDOW_329_333_2026-07-27.md).
+Another campaign (planned two windows, ceiling three) then continued. Its two
+windows finalized chunks 329-333 and 334-338: a total of 339 chunks are
+`CONFIRMED` and 52 are `PLANNED`, with zero `SENT` or `UNKNOWN` chunks. Chunk
+index 339 remains `PLANNED` with a null signature, and the program remains
+absent. See the
+[R4N campaign window 329-333 checkpoint](docs/PHASE_2_R4N_CAMPAIGN_WINDOW_329_333_2026-07-27.md)
+and the
+[R4N campaign window 334-338 checkpoint](docs/PHASE_2_R4N_CAMPAIGN_WINDOW_334_338_2026-07-27.md).
 
 The earlier R4L five-chunk window finalized chunks 259-263.
 Live telemetry was `COMPLETE`: its canonical hash matched the terminal state,
