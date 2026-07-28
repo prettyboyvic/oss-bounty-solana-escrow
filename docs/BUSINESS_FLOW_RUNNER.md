@@ -7,7 +7,11 @@ its IDL contract, PDA rules, or business logic.
 
 - Core: `scripts/devnet/business-flow-runner.mjs`
 - CLI (plan default): `scripts/devnet/business-flow-cli.mjs`
-- Tests: `tests/devnet/business-flow-runner.test.mjs`
+- Tests: `tests/devnet/business-flow-runner.test.mjs`,
+  `business-flow-instructions.test.mjs`, `business-flow-adapter.test.mjs`,
+  `business-flow-execution.test.mjs`, `business-flow-full-matrix.test.mjs`
+  (top-level driver, end-to-end with fake adapter + fake clock), and
+  `business-flow-cli-safety.test.mjs`
 
 The existing local-validator integration suite (`tests/oss-bounty-escrow.ts`,
 `npm run test:integration`) is unchanged in meaning and remains the authoritative
@@ -46,13 +50,14 @@ Plan output is passed through `sanitizePublicOutput`; no secret bytes are produc
 and the explicit `acknowledgeDevnet = "R4_DEVNET_BUSINESS_FLOW"`. It rejects stale
 or missing values and any identity equal to the upgrade authority.
 
-`executeBusinessFlows(plan, authorization, deps)` builds the ordered step plan and
-delegates signing/sending to injected `deps.signAndSend` / `deps.readAccount`. It
-enforces the ceiling, stops on the first failed send or unexpected on-chain status,
-never blind-retries, and preserves partial-success evidence. **This module and its
-CLI never invoke the execute path in the enablement phase**; the CLI's `execute`
-subcommand is intentionally disabled and directs the operator to the separately
-authorized live-acceptance session.
+`executeBusinessFlows(plan, authorization, deps)` (in the runner) builds the ordered
+step plan and delegates signing/sending to injected `deps.signAndSend` /
+`deps.readAccount`; it enforces the ceiling, stops on the first failed send or
+unexpected on-chain status, never blind-retries, and preserves partial-success
+evidence. The concrete top-level driver `executeFullMatrix(...)` (in
+`business-flow-execution.mjs`, see below) is what the CLI actually calls. **Neither
+path is ever invoked against live devnet in this phase or in CI**; the CLI's
+`execute` subcommand is fail-closed behind an explicit live acknowledgement flag.
 
 ## Flows and negatives
 
@@ -97,14 +102,30 @@ in CI or the repair phase):
   execution-ID reservation (replay refusal), plan TTL freshness, immediate
   on-chain rechecks (program executable, ProgramData linkage, PDA re-derivation,
   escrow collision, sponsor balance), bounded refund expiry wait using chain time,
-  post-state verification via decoders, outcome classes (`NOT_STARTED`,
+  post-state verification via decoders, outcome classes (`NOT_STARTED`, `RUNNING`,
   `CONFIRMED_SUCCESS`, `CONFIRMED_FAILED`, `CONFIRMATION_UNKNOWN`, `PARTIAL_SUCCESS`,
-  `STOPPED_ON_STATE_MISMATCH`, `COMPLETE`), no blind retry, and durable evidence.
+  `STOPPED_ON_STATE_MISMATCH`, `STOPPED_ON_SIMULATION`, `STOPPED_ON_EXPIRY_TIMEOUT`,
+  `COMPLETE`), no blind retry, and durable evidence.
+  - `runAcceptanceMatrix(...)` is the guarded context builder (freshness, replay
+    reservation, on-chain recheck, ceiling, and a guarded `sendStep`).
+  - `executeFullMatrix(...)` is the **top-level driver** that self-orchestrates the
+    whole matrix: 4 setup sends (create+init mint, sponsor ATA, contributor ATA,
+    mint tokens), then per instance the release / refund / cancel flows, running the
+    three negative checks as read-only simulations at the correct states
+    (fail-closed on unexpected success), waiting for refund expiry on chain time
+    with a bounded timeout that stops rather than resends, verifying terminal escrow
+    status and token deltas, stopping the whole matrix on the first failure (no step
+    N+1), and writing a durable partial receipt that always carries the completed
+    steps, the pending/unknown step, the stop reason, and the ephemeral mint public
+    key. It is proven end-to-end with a fake adapter and fake clock in
+    `tests/devnet/business-flow-full-matrix.test.mjs`.
 
-The CLI `execute` subcommand now builds the production adapter but requires
-`--plan`, `--authorization` and `--acknowledge-live-devnet-write`; without the
-acknowledgement it refuses, so no accidental devnet write can occur. The mint is a
-transient generated keypair (never persisted to tracked files).
+The CLI `execute` subcommand builds the production adapter and calls
+`executeFullMatrix`, but requires `--plan`, `--authorization` and
+`--acknowledge-live-devnet-write`; without the acknowledgement it refuses (covered
+by `tests/devnet/business-flow-cli-safety.test.mjs`), so no accidental devnet write
+can occur. The mint is a transient generated keypair (never persisted to tracked
+files); its public key is bound into the receipt for post-crash reconciliation.
 
 Full transaction ceiling: setup is part of the same execution and is included in the
 ceiling (12 live writes for all three flows); negative checks are 3 read-only

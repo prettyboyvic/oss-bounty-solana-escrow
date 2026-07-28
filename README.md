@@ -29,8 +29,16 @@ Funded -> Refunded, when now >= expiry
 At the exact expiry timestamp, release is rejected and refund is allowed.
 
 The MVP intentionally excludes partial payout, fees, arbitration, yield,
-swaps, bridges, Token-2022, upgradeability, automatic GitHub-triggered payout,
-mainnet deployment, and real-value assets.
+swaps, bridges, Token-2022, in-program upgrade or migration logic, automatic
+GitHub-triggered payout, mainnet deployment, and real-value assets.
+
+"No in-program upgrade logic" refers to the program's own instruction set: it
+exposes no upgrade or state-migration instruction. This is distinct from the
+Solana loader-level upgrade authority. The current devnet deployment (see
+[Current status](#current-status)) was intentionally published as *upgradeable*
+with a retained loader upgrade authority as a deployment/governance choice; that
+authority governs redeployment of the program binary, not any in-program
+migration feature.
 
 ## Trust model
 
@@ -57,7 +65,43 @@ vault  = ["vault", escrow]
 Readable issue and pull-request URLs remain offchain. Only the fixed 32-byte
 reference hash is stored in the escrow account.
 
-## Current verification
+## Current status
+
+The escrow program is **deployed to Solana devnet** (upgradeable, upgrade
+authority retained). Directly observed on-chain and byte-verified against the
+local build:
+
+- Program ID `6UoYT4jtiS23rCU1zARqnn181BxwuJ9waS1sv35gRg1Z`, owned by the
+  upgradeable loader, executable.
+- ProgramData `GSLxCPBrBFwAhyCTUpMGKGeqvUQWD1YkZG9ssXp1kPBs`, retained upgrade
+  authority `Avfvs1k6ttrBtqh83tFw5g3dhWncrjP5hj4D52kGNZGk`.
+- Deployed binary SHA-256
+  `f0820f1f06e5ffcb64026ae3c748b47b6e64674333f3ca98e8e468717c668fcd`,
+  byte-identical to `target/sbf-solana-solana/release/oss_bounty_escrow.so`.
+
+See the
+[devnet first-deployment checkpoint](docs/PHASE_2_R4N_DEVNET_FIRST_DEPLOY_2026-07-28.md).
+
+The program is **not** on mainnet, handles **no** real-value assets, and no
+business-flow live transaction has been sent to it. A governed client-side
+business-flow harness is implemented and covered by tests: a read-only PLAN mode
+plus an authorization-gated top-level `executeFullMatrix` driver that
+orchestrates asset setup, the release/refund/cancel flows, and the negative-path
+simulations. The driver, its instruction builders, production adapter, decoders,
+transaction ceiling, replay/freshness guards, chain-time expiry wait, durable
+receipts, and recovery classification are exercised end-to-end with a fake
+adapter and a fake clock only; they have **not** been run against live devnet.
+Executing the live acceptance matrix (which writes to devnet) remains a
+separately authorized, separately funded phase. See
+[docs/BUSINESS_FLOW_RUNNER.md](docs/BUSINESS_FLOW_RUNNER.md).
+
+## Historical upload evidence
+
+The statements below describe the historical buffer-upload campaign that
+preceded the deployment above. Their "the program remains absent" observations
+were accurate at the time each window ran and are **superseded** by the
+[Current status](#current-status): the program is now deployed. This history is
+preserved unchanged as evidence and is not a description of current state.
 
 The one R4N invocation failed after acquiring its upload lease but before
 candidate selection. Preserved evidence proves one read-only genesis request,

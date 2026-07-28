@@ -22,9 +22,11 @@ import {
   authorizeExecution,
   deriveEscrowPda,
   deriveVaultPda,
+  planExpiry,
   waitReached,
 } from "./business-flow-runner.mjs";
 import {
+  MINT_SIZE,
   associatedTokenAddress,
   buildCancel,
   buildCreateAssociatedTokenAccount,
@@ -46,6 +48,9 @@ export const OUTCOME = Object.freeze({
   CONFIRMATION_UNKNOWN: "CONFIRMATION_UNKNOWN",
   PARTIAL_SUCCESS: "PARTIAL_SUCCESS",
   STOPPED_ON_STATE_MISMATCH: "STOPPED_ON_STATE_MISMATCH",
+  STOPPED_ON_SIMULATION: "STOPPED_ON_SIMULATION",
+  STOPPED_ON_EXPIRY_TIMEOUT: "STOPPED_ON_EXPIRY_TIMEOUT",
+  RUNNING: "RUNNING",
   COMPLETE: "COMPLETE",
 });
 
@@ -338,4 +343,355 @@ export async function runAcceptanceMatrix(plan, authorization, adapter, options 
     sendStep,
     evidence,
   });
+}
+
+// --- Top-level orchestration driver ---------------------------------------
+//
+// executeFullMatrix is the single public execution entry point the live CLI
+// invokes. It self-drives the whole acceptance matrix:
+//
+//   setup (4 sends): create+init mint, sponsor ATA, contributor ATA, mint tokens
+//   release instance: initialize, fund, [simulate unauthorized], release, verify
+//   refund  instance: initialize, fund, [simulate before-expiry], wait(chain time),
+//                     [simulate at-expiry], refund, verify
+//   cancel  instance: initialize, cancel, verify
+//
+// It enforces the full transaction-send ceiling (setup + flows) through the same
+// guarded sendStep used by runAcceptanceMatrix, runs the three negative checks as
+// read-only simulations at the correct states (fail-closed on unexpected success),
+// waits for refund expiry on authoritative chain time with a bounded timeout,
+// verifies terminal escrow status and token deltas, never blind-retries, stops the
+// whole matrix on the first failure (no step N+1), and writes a durable partial
+// receipt that always contains the completed steps, the pending/unknown step, and
+// the stop reason. The ephemeral mint public key is bound into the receipt.
+//
+// It is never invoked against live devnet in this phase or in CI; tests drive it
+// with a fake adapter and a fake clock.
+
+const DEFAULT_CLOCK = { now: () => Date.now(), sleep: (ms) => new Promise((r) => setTimeout(r, ms)) };
+
+function instanceForFlow(plan, flow) {
+  const inst = plan.manifest.instances.find((i) => i.flow === flow);
+  if (!inst) throw new Error(`plan has no instance for flow "${flow}"`);
+  return inst;
+}
+
+export async function executeFullMatrix(plan, authorization, adapter, options = {}) {
+  const wired = await runAcceptanceMatrix(plan, authorization, adapter, options);
+  const { grant, ceiling, recheck, sendStep } = wired;
+  const clock = options.clock ?? DEFAULT_CLOCK;
+
+  const mint = adapter.signerPublicKeys?.mint;
+  const mintAuthority = adapter.signerPublicKeys?.mintAuthority;
+  if (!mint) throw new Error("adapter must expose an ephemeral mint signer public key");
+  if (!mintAuthority) throw new Error("adapter must expose a mintAuthority signer public key");
+
+  const programId = plan.manifest.programId;
+  const { sponsor, maintainer, contributor } = plan.identities;
+  const amount = Number(plan.manifest.amount);
+  const decimals = plan.manifest.decimals;
+  if (!Number.isInteger(amount) || amount <= 0) throw new Error("plan amount must be a positive integer");
+
+  const mintLamports =
+    options.mintLamports ?? (await adapter.getMinimumBalanceForRentExemption(MINT_SIZE));
+  const sponsorToken = associatedTokenAddress(mint, sponsor).toBase58();
+  const contributorToken = associatedTokenAddress(mint, contributor).toBase58();
+
+  const steps = [];
+  const simulations = [];
+  let pending = null;
+  let stopReason = null;
+  let finalStatus = OUTCOME.RUNNING;
+
+  const writeMatrixReceipt = () => {
+    try {
+      adapter.writeReceipt(`${grant.executionId}.matrix.json`, {
+        executionId: grant.executionId,
+        manifestHash: plan.manifestHash,
+        mint,
+        sponsorToken,
+        contributorToken,
+        ceiling,
+        recheck,
+        steps,
+        simulations,
+        pendingStep: pending,
+        stopReason,
+        finalStatus,
+      });
+    } catch {
+      /* receipt best-effort; in-memory log is authoritative for the return value */
+    }
+  };
+
+  const result = () =>
+    Object.freeze({
+      status: finalStatus,
+      stopReason,
+      executionId: grant.executionId,
+      mint,
+      ceiling,
+      steps: Object.freeze([...steps]),
+      simulations: Object.freeze([...simulations]),
+      pendingStep: pending,
+    });
+
+  const stop = (reason, status) => {
+    stopReason = reason;
+    finalStatus = status;
+    pending = null;
+    writeMatrixReceipt();
+    return result();
+  };
+
+  // A guarded send that logs the step and clears the pending marker on return.
+  const send = async (id, instructions, feePayerRole, signerRoles, verify) => {
+    pending = { id, kind: "send", feePayerRole, signerRoles };
+    writeMatrixReceipt();
+    const r = await sendStep(id, instructions, feePayerRole, signerRoles, verify);
+    steps.push({
+      id,
+      kind: "send",
+      feePayerRole,
+      signerRoles,
+      outcome: r.outcome,
+      signature: r.signature ?? null,
+    });
+    pending = null;
+    writeMatrixReceipt();
+    return r;
+  };
+
+  // A read-only simulation at the current state. Never sends; fail-closed on an
+  // unexpected success or an unexpected error.
+  const simulate = async (id, spec) => {
+    pending = { id, kind: "simulate", feePayerRole: spec.feePayerRole, signerRoles: spec.signerRoles };
+    writeMatrixReceipt();
+    const sim = await adapter.simulate({
+      instructions: [spec.build()],
+      feePayerRole: spec.feePayerRole,
+      signerRoles: spec.signerRoles,
+    });
+    pending = null;
+    if (!sim.err) {
+      simulations.push({ id, status: "UNEXPECTED_SUCCESS" });
+      writeMatrixReceipt();
+      return { ok: false, unexpectedSuccess: true };
+    }
+    const decoded = decodeProgramError(sim);
+    const ok = spec.expected.includes(decoded.name) || spec.expected.includes(null);
+    simulations.push({ id, status: ok ? "EXPECTED_ERROR" : "UNEXPECTED_ERROR", decoded, err: sim.err });
+    writeMatrixReceipt();
+    return { ok, decoded };
+  };
+
+  const readEscrow = async (address) => {
+    const info = await adapter.readAccount(address);
+    if (!info) throw new Error(`escrow ${address} is absent at verification time`);
+    return info.data;
+  };
+  const tokenAmount = async (ata) => {
+    const info = await adapter.readAccount(ata);
+    if (!info) throw new Error(`token account ${ata} is absent at verification time`);
+    return decodeTokenAccountAmount(info.data);
+  };
+  const verifyStatus = (escrow, expected) => async () =>
+    verifyEscrowStatus(await readEscrow(escrow), expected);
+
+  const guardSimulation = (id, sim) => {
+    if (sim.unexpectedSuccess) {
+      return stop(`SIMULATION_UNEXPECTED_SUCCESS:${id}`, OUTCOME.STOPPED_ON_SIMULATION);
+    }
+    if (!sim.ok) {
+      return stop(`SIMULATION_UNEXPECTED_ERROR:${id}`, OUTCOME.STOPPED_ON_SIMULATION);
+    }
+    return null;
+  };
+
+  // === Shared asset setup (4 live sends) ===
+  let r;
+  r = await send(
+    "setup:create_mint",
+    buildCreateMintInstructions({ payer: sponsor, mint, mintAuthority, decimals, lamports: mintLamports }),
+    "sponsor",
+    ["mint"],
+    null,
+  );
+  if (r.stop) return stop(`SETUP_FAILED:create_mint:${r.outcome}`, r.outcome);
+
+  r = await send(
+    "setup:sponsor_ata",
+    [buildCreateAssociatedTokenAccount({ payer: sponsor, owner: sponsor, mint }).instruction],
+    "sponsor",
+    [],
+    null,
+  );
+  if (r.stop) return stop(`SETUP_FAILED:sponsor_ata:${r.outcome}`, r.outcome);
+
+  r = await send(
+    "setup:contributor_ata",
+    [buildCreateAssociatedTokenAccount({ payer: sponsor, owner: contributor, mint }).instruction],
+    "sponsor",
+    [],
+    null,
+  );
+  if (r.stop) return stop(`SETUP_FAILED:contributor_ata:${r.outcome}`, r.outcome);
+
+  // Mint enough test tokens to fund every escrow instance that will be funded.
+  const setupMintAmount = amount * Math.max(1, grant.enabledFlows.length);
+  r = await send(
+    "setup:mint_tokens",
+    [buildMintTo({ mint, destination: sponsorToken, mintAuthority, amount: setupMintAmount })],
+    "sponsor",
+    ["mintAuthority"],
+    null,
+  );
+  if (r.stop) return stop(`SETUP_FAILED:mint_tokens:${r.outcome}`, r.outcome);
+
+  // Expiry policy is derived from authoritative chain time (never wall clock).
+  const chainTimeSeconds = await adapter.getChainTime();
+  const expiry = planExpiry({ chainTimeSeconds });
+
+  // === Release instance ===
+  if (grant.enabledFlows.includes("release")) {
+    const inst = instanceForFlow(plan, "release");
+    const hash = referenceHashFor(plan, inst);
+
+    r = await send(
+      "release:initialize",
+      [buildInitializeEscrow({ programId, sponsor, mint, escrow: inst.escrow, vault: inst.vault, externalRefHash: hash, amount, expiry: expiry.releaseExpiry, maintainer, contributor })],
+      "sponsor",
+      ["sponsor"],
+      verifyStatus(inst.escrow, "Initialized"),
+    );
+    if (r.stop) return stop(`RELEASE_FAILED:initialize:${r.outcome}`, r.outcome);
+
+    r = await send(
+      "release:fund",
+      [buildFundEscrow({ programId, sponsor, mint, sponsorToken, escrow: inst.escrow, vault: inst.vault })],
+      "sponsor",
+      ["sponsor"],
+      verifyStatus(inst.escrow, "Funded"),
+    );
+    if (r.stop) return stop(`RELEASE_FAILED:fund:${r.outcome}`, r.outcome);
+
+    const unauth = await simulate("unauthorized_release", {
+      build: () => buildRelease({ programId, maintainer: contributor, mint, escrow: inst.escrow, vault: inst.vault, contributorToken }),
+      feePayerRole: "sponsor",
+      signerRoles: ["contributor"],
+      expected: ["InvalidContributorTokenOwner", "ConstraintHasOne", null],
+    });
+    const s1 = guardSimulation("unauthorized_release", unauth);
+    if (s1) return s1;
+
+    const beforeContributor = await tokenAmount(contributorToken);
+    r = await send(
+      "release:release",
+      [buildRelease({ programId, maintainer, mint, escrow: inst.escrow, vault: inst.vault, contributorToken })],
+      "maintainer",
+      ["maintainer"],
+      async () => {
+        const st = verifyEscrowStatus(await readEscrow(inst.escrow), "Released");
+        if (!st.ok) return st;
+        return verifyTokenDelta(beforeContributor, await tokenAmount(contributorToken), amount);
+      },
+    );
+    if (r.stop) return stop(`RELEASE_FAILED:release:${r.outcome}`, r.outcome);
+  }
+
+  // === Refund instance ===
+  if (grant.enabledFlows.includes("refund")) {
+    const inst = instanceForFlow(plan, "refund");
+    const hash = referenceHashFor(plan, inst);
+
+    r = await send(
+      "refund:initialize",
+      [buildInitializeEscrow({ programId, sponsor, mint, escrow: inst.escrow, vault: inst.vault, externalRefHash: hash, amount, expiry: expiry.refundExpiry, maintainer, contributor })],
+      "sponsor",
+      ["sponsor"],
+      verifyStatus(inst.escrow, "Initialized"),
+    );
+    if (r.stop) return stop(`REFUND_FAILED:initialize:${r.outcome}`, r.outcome);
+
+    r = await send(
+      "refund:fund",
+      [buildFundEscrow({ programId, sponsor, mint, sponsorToken, escrow: inst.escrow, vault: inst.vault })],
+      "sponsor",
+      ["sponsor"],
+      verifyStatus(inst.escrow, "Funded"),
+    );
+    if (r.stop) return stop(`REFUND_FAILED:fund:${r.outcome}`, r.outcome);
+
+    const beforeExpiry = await simulate("refund_before_expiry", {
+      build: () => buildRefund({ programId, sponsor, mint, escrow: inst.escrow, vault: inst.vault, sponsorToken }),
+      feePayerRole: "sponsor",
+      signerRoles: ["sponsor"],
+      expected: ["EscrowNotExpired"],
+    });
+    const s2 = guardSimulation("refund_before_expiry", beforeExpiry);
+    if (s2) return s2;
+
+    // Bounded wait on authoritative chain time. A timeout STOPS the matrix; it
+    // never sends the refund and never retries.
+    pending = { id: "refund:wait_expiry", kind: "wait" };
+    writeMatrixReceipt();
+    const wait = await waitForExpiry(expiry.wait, adapter, clock);
+    steps.push({ id: "refund:wait_expiry", kind: "wait", outcome: wait.reason });
+    pending = null;
+    writeMatrixReceipt();
+    if (wait.reason !== "REACHED") {
+      return stop("REFUND_EXPIRY_WAIT_TIMEOUT", OUTCOME.STOPPED_ON_EXPIRY_TIMEOUT);
+    }
+
+    const atExpiry = await simulate("release_at_or_after_expiry", {
+      build: () => buildRelease({ programId, maintainer, mint, escrow: inst.escrow, vault: inst.vault, contributorToken }),
+      feePayerRole: "sponsor",
+      signerRoles: ["maintainer"],
+      expected: ["EscrowExpired"],
+    });
+    const s3 = guardSimulation("release_at_or_after_expiry", atExpiry);
+    if (s3) return s3;
+
+    const beforeSponsor = await tokenAmount(sponsorToken);
+    r = await send(
+      "refund:refund",
+      [buildRefund({ programId, sponsor, mint, escrow: inst.escrow, vault: inst.vault, sponsorToken })],
+      "sponsor",
+      ["sponsor"],
+      async () => {
+        const st = verifyEscrowStatus(await readEscrow(inst.escrow), "Refunded");
+        if (!st.ok) return st;
+        return verifyTokenDelta(beforeSponsor, await tokenAmount(sponsorToken), amount);
+      },
+    );
+    if (r.stop) return stop(`REFUND_FAILED:refund:${r.outcome}`, r.outcome);
+  }
+
+  // === Cancel instance ===
+  if (grant.enabledFlows.includes("cancel")) {
+    const inst = instanceForFlow(plan, "cancel");
+    const hash = referenceHashFor(plan, inst);
+
+    r = await send(
+      "cancel:initialize",
+      [buildInitializeEscrow({ programId, sponsor, mint, escrow: inst.escrow, vault: inst.vault, externalRefHash: hash, amount, expiry: expiry.releaseExpiry, maintainer, contributor })],
+      "sponsor",
+      ["sponsor"],
+      verifyStatus(inst.escrow, "Initialized"),
+    );
+    if (r.stop) return stop(`CANCEL_FAILED:initialize:${r.outcome}`, r.outcome);
+
+    r = await send(
+      "cancel:cancel",
+      [buildCancel({ programId, sponsor, escrow: inst.escrow })],
+      "sponsor",
+      ["sponsor"],
+      verifyStatus(inst.escrow, "Cancelled"),
+    );
+    if (r.stop) return stop(`CANCEL_FAILED:cancel:${r.outcome}`, r.outcome);
+  }
+
+  finalStatus = OUTCOME.COMPLETE;
+  writeMatrixReceipt();
+  return result();
 }

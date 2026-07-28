@@ -69,6 +69,10 @@ export function createProductionAdapter({
       return connection.getBalance(new PublicKey(address), "confirmed");
     },
 
+    async getMinimumBalanceForRentExemption(space) {
+      return connection.getMinimumBalanceForRentExemption(space);
+    },
+
     async getLatestBlockhash() {
       return connection.getLatestBlockhash("confirmed");
     },

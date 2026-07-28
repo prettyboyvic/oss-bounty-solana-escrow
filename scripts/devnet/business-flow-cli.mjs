@@ -16,7 +16,7 @@ import { Keypair as _Keypair } from "@solana/web3.js";
 import { DEVNET_RPC_URL } from "./safety.mjs";
 import { buildPlan } from "./business-flow-runner.mjs";
 import { createProductionAdapter, loadSigners } from "./business-flow-adapter.mjs";
-import { runAcceptanceMatrix } from "./business-flow-execution.mjs";
+import { executeFullMatrix } from "./business-flow-execution.mjs";
 
 const ESCROW_ACCOUNT_BYTES = 227; // 8 discriminator + Escrow::INIT_SPACE(219)
 const TOKEN_ACCOUNT_BYTES = 165;
@@ -78,7 +78,10 @@ export async function main(argv = process.argv.slice(2)) {
     signers.mint = _Keypair.generate();
     signers.feePayer = signers.sponsor;
     const adapter = createProductionAdapter({ connection, repoRoot, signers });
-    return runAcceptanceMatrix(plan, authorization, adapter);
+    // Top-level driver: self-orchestrates setup -> release/refund/cancel flows ->
+    // negative simulations, enforces the ceiling, waits on chain-time expiry, and
+    // writes durable receipts. Reached only past the explicit live-ack gate above.
+    return executeFullMatrix(plan, authorization, adapter);
   }
   if (command !== "plan") {
     throw new Error(`unknown command "${command}"; only read-only "plan" is supported here`);
