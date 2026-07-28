@@ -1,0 +1,94 @@
+// Thin CLI for the governed devnet business-flow runner.
+//
+// Default action is read-only PLAN mode. There is no way to trigger a live write
+// from this CLI without an explicit `execute` subcommand plus an authorization
+// file; even then this enablement-phase CLI intentionally refuses to sign/send and
+// directs the operator to the separately authorized live-acceptance session.
+
+import { readFileSync } from "node:fs";
+import { resolve, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { Connection, Keypair, PublicKey } from "@solana/web3.js";
+
+import { DEVNET_RPC_URL } from "./safety.mjs";
+import { buildPlan } from "./business-flow-runner.mjs";
+
+const ESCROW_ACCOUNT_BYTES = 227; // 8 discriminator + Escrow::INIT_SPACE(219)
+const TOKEN_ACCOUNT_BYTES = 165;
+const MINT_BYTES = 82;
+
+// Read-only adapter: exposes ONLY read methods, so buildPlan's forbidden-method
+// guard passes and no signing/sending surface exists.
+function createReadOnlyAdapter(connection) {
+  return {
+    getGenesisHash: (...a) => connection.getGenesisHash(...a),
+    getAccountInfo: (...a) => connection.getAccountInfo(...a),
+    getBalance: (...a) => connection.getBalance(...a),
+    getMinimumBalanceForRentExemption: (...a) =>
+      connection.getMinimumBalanceForRentExemption(...a),
+  };
+}
+
+function pubkeyFromKeypairFile(path) {
+  // Reads only to derive the public key; secret bytes are never returned/printed.
+  const secret = Uint8Array.from(JSON.parse(readFileSync(path, "utf8")));
+  return Keypair.fromSecretKey(secret).publicKey.toBase58();
+}
+
+export async function main(argv = process.argv.slice(2)) {
+  const command = argv[0] ?? "plan";
+  const repoRoot = resolve(fileURLToPath(new URL("../..", import.meta.url)));
+
+  if (command === "execute") {
+    throw new Error(
+      "EXECUTE_DISABLED: live business-flow execution is not performed by this enablement CLI; " +
+        "run the separately authorized live-acceptance session",
+    );
+  }
+  if (command !== "plan") {
+    throw new Error(`unknown command "${command}"; only read-only "plan" is supported here`);
+  }
+
+  const uniquenessToken =
+    argv[argv.indexOf("--uniqueness") + 1] && argv.includes("--uniqueness")
+      ? argv[argv.indexOf("--uniqueness") + 1]
+      : new Date().toISOString();
+
+  const connection = new Connection(DEVNET_RPC_URL, { commitment: "confirmed" });
+  const rpc = createReadOnlyAdapter(connection);
+
+  const identities = {
+    sponsor: pubkeyFromKeypairFile(join(repoRoot, ".devnet", "sponsor.devnet-keypair.json")),
+    maintainer: pubkeyFromKeypairFile(join(repoRoot, ".devnet", "maintainer.devnet-keypair.json")),
+    contributor: pubkeyFromKeypairFile(join(repoRoot, ".devnet", "contributor.devnet-keypair.json")),
+  };
+
+  const rentReads = {
+    mintRent: await connection.getMinimumBalanceForRentExemption(MINT_BYTES),
+    tokenAccountRent: await connection.getMinimumBalanceForRentExemption(TOKEN_ACCOUNT_BYTES),
+    escrowRent: await connection.getMinimumBalanceForRentExemption(ESCROW_ACCOUNT_BYTES),
+  };
+
+  return buildPlan(
+    {
+      rpcUrl: DEVNET_RPC_URL,
+      expectedProgramId: "6UoYT4jtiS23rCU1zARqnn181BxwuJ9waS1sv35gRg1Z",
+      identities,
+      flows: ["release", "refund", "cancel"],
+      uniquenessToken,
+      rentReads,
+    },
+    rpc,
+  );
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  try {
+    const report = await main();
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  } catch (error) {
+    process.stderr.write(`${error.message}\n`);
+    process.exitCode = 1;
+  }
+}
