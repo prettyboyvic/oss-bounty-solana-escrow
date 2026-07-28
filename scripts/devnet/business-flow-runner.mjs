@@ -409,6 +409,7 @@ export async function buildPlan(request, rpc) {
     mode: "PLAN",
     stateMutation: false,
     liveWriteExecuted: false,
+    createdAtMs: typeof request.nowMs === "number" ? request.nowMs : Date.now(),
     manifest,
     manifestHash: manifestHash(manifest),
     tokenProgram: CLASSIC_TOKEN_PROGRAM_ID,

@@ -76,6 +76,40 @@ Negative checks are **simulate-only** by contract: `unauthorized_release`,
 - Funding separates recoverable account rent from permanent transaction fees plus a
   safety reserve; test identities are never assumed funded and are never auto-funded.
 
+## Concrete execution implementation (Phase 2 repair)
+
+The scaffold is now backed by concrete code (still never invoked against live devnet
+in CI or the repair phase):
+
+- `scripts/devnet/business-flow-instructions.mjs` — concrete builders for the five
+  escrow instructions and classic SPL asset setup (create mint @6 decimals, create
+  associated token accounts, mint tokens), plus decoders for `Escrow`, mint and token
+  accounts and an Anchor custom-error decoder. Account-meta order, signer/writable
+  flags and discriminators are pinned against the committed IDL by tests.
+- `scripts/devnet/business-flow-adapter.mjs` — production adapter over a Solana
+  `Connection`: read account/balance, latest blockhash, authoritative chain time
+  (`getBlockTime(getSlot)`), build+sign, send, confirm, signature status, read-only
+  `simulate`, and atomic sanitized receipts. It loads only contained `.devnet`
+  keypairs, rejects any signer equal to the deployment/upgrade authority, exposes no
+  airdrop/fund/close surface, and never emits secret bytes.
+- `scripts/devnet/business-flow-execution.mjs` — orchestrator: full transaction
+  ceiling (setup 4 + flows 8 = 12; 3 read-only simulations), persistent
+  execution-ID reservation (replay refusal), plan TTL freshness, immediate
+  on-chain rechecks (program executable, ProgramData linkage, PDA re-derivation,
+  escrow collision, sponsor balance), bounded refund expiry wait using chain time,
+  post-state verification via decoders, outcome classes (`NOT_STARTED`,
+  `CONFIRMED_SUCCESS`, `CONFIRMED_FAILED`, `CONFIRMATION_UNKNOWN`, `PARTIAL_SUCCESS`,
+  `STOPPED_ON_STATE_MISMATCH`, `COMPLETE`), no blind retry, and durable evidence.
+
+The CLI `execute` subcommand now builds the production adapter but requires
+`--plan`, `--authorization` and `--acknowledge-live-devnet-write`; without the
+acknowledgement it refuses, so no accidental devnet write can occur. The mint is a
+transient generated keypair (never persisted to tracked files).
+
+Full transaction ceiling: setup is part of the same execution and is included in the
+ceiling (12 live writes for all three flows); negative checks are 3 read-only
+simulations. The ceiling is enforced before every send.
+
 ## Later live-acceptance phase (separately authorized)
 
 A later session, with its own authorization, funds the identities if needed, obtains
