@@ -392,8 +392,8 @@
     "pptxPublicationDecision": "publish-with-pdf",
     "pdfPath": "submission/oss-bounty-escrow-pitch-deck.pdf",
     "pdfPageCount": 2,
-    "pptxSha256": "dd19c9589628b2f58bb7ed26c52acb188d49239fc4725089c26818410fb26abf",
-    "pdfSha256": "31cc881f584b8c3e4e1af81edaa76379d135c7ad31ef14d59120ced1d7c14d14"
+    "pptxSha256": "158be441ce2d38ce398d9ea0467b0626cb23962b6550f48856272e5b25c238dd",
+    "pdfSha256": "aec50973df3d7edff062d017fd4bad3ac1dac5105143ec72636e5fa206a73ce6"
   },
   "evidence": {
     "manifestPath": "docs/evidence/evidence-manifest.json",
@@ -449,6 +449,54 @@
       "verifiedAt": "2026-07-30T03:44:00Z",
       "exitCode": 0,
       "result": "All 10 local Markdown links resolve."
+    },
+    {
+      "command": "npm ci",
+      "verifiedAt": "2026-07-30T04:24:00Z",
+      "exitCode": 0,
+      "result": "Fresh independent install added 180 packages and audited 181; npm reported 16 known vulnerabilities (1 low, 7 moderate, 8 high) and four pending install-script approvals."
+    },
+    {
+      "command": "npm run typecheck",
+      "verifiedAt": "2026-07-30T04:24:20Z",
+      "exitCode": 0,
+      "result": "Fresh independent TypeScript no-emit typecheck passed."
+    },
+    {
+      "command": "cargo test --workspace",
+      "verifiedAt": "2026-07-30T04:24:22Z",
+      "exitCode": 0,
+      "result": "Fresh independent run passed 11 Rust tests; 0 failed."
+    },
+    {
+      "command": "npm run test:devnet:unit",
+      "verifiedAt": "2026-07-30T04:24:36Z",
+      "exitCode": 0,
+      "result": "Fresh quiet run passed 542 devnet tests; 0 failed."
+    },
+    {
+      "command": "node --test tests/devnet/evidence-package.test.mjs",
+      "verifiedAt": "2026-07-30T04:24:37Z",
+      "exitCode": 0,
+      "result": "Fresh independent run passed 13 evidence-package tests using the hash-verified ignored receipt; 0 failed."
+    },
+    {
+      "command": "node --test --test-name-pattern=\"a real timeout remains bounded and invokes the owned process once\" tests/devnet/upload-process-supervisor.test.mjs",
+      "verifiedAt": "2026-07-30T04:25:00Z",
+      "exitCode": 0,
+      "result": "The unchanged timing-bound test passed in a controlled quiet run in 925 ms against its 4,000 ms ceiling."
+    },
+    {
+      "command": "Independent deck render, overflow, factual, placeholder, and package inspection",
+      "verifiedAt": "2026-07-30T04:26:00Z",
+      "exitCode": 0,
+      "result": "Bounded repair removed the unresolved public-URL placeholder, distinguished pre-funding cancellation from expiry refund, and named the contributor release. Exactly 2 pages rendered and passed full-size visual review and overflow checks. PPTX/PDF metadata and package scans found no private or active content."
+    },
+    {
+      "command": "Independent provenance, identity, privacy, and recursive link gates",
+      "verifiedAt": "2026-07-30T04:26:19Z",
+      "exitCode": 0,
+      "result": "31 byte-identical imports verified against 5c8869f; immutable manifest and retained receipt hashes matched; all 10 local links passed with exact case and anchors; 18 external Explorer links were classified for later logged-out verification; privacy matches were limited to explicit defensive test tokens and regex syntax."
     }
   ],
   "optionalVideo": {
