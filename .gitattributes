@@ -1,0 +1,5 @@
+# Evidence package files are byte-deterministic projections validated by
+# tests/devnet/evidence-package.test.mjs. Pin them to LF so the byte-equality
+# check holds on every platform regardless of core.autocrlf.
+docs/evidence/** text eol=lf
+tests/devnet/evidence-package.test.mjs text eol=lf

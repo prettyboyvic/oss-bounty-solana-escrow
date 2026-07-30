@@ -11,6 +11,7 @@ import { createHash } from "node:crypto";
 
 import {
   PublicKey,
+  SystemInstruction,
   SystemProgram,
   TransactionInstruction,
 } from "@solana/web3.js";
@@ -22,10 +23,17 @@ import {
   createInitializeAccount3Instruction,
   createInitializeMint2Instruction,
   createMintToInstruction,
+  decodeInitializeMint2Instruction,
   getAssociatedTokenAddressSync,
 } from "@solana/spl-token";
 
 import { CLASSIC_TOKEN_PROGRAM_ID, assertClassicTokenProgram } from "./safety.mjs";
+import { deriveBusinessFlowMint } from "./business-flow-identity.mjs";
+
+export {
+  ESCROW_ERROR_CODES,
+  decodeProgramError,
+} from "./business-flow-errors.mjs";
 
 export const ESCROW_STATUS = Object.freeze([
   "Initialized",
@@ -34,20 +42,6 @@ export const ESCROW_STATUS = Object.freeze([
   "Refunded",
   "Cancelled",
 ]);
-
-export const ESCROW_ERROR_CODES = Object.freeze({
-  6000: "InvalidStatus",
-  6001: "InvalidAmount",
-  6002: "InvalidExpiry",
-  6003: "InvalidMaintainer",
-  6004: "InvalidContributor",
-  6005: "InvalidContributorTokenOwner",
-  6006: "UnauthorizedSponsor",
-  6007: "EscrowExpired",
-  6008: "EscrowNotExpired",
-  6009: "InvalidVault",
-  6010: "InvalidExternalReference",
-});
 
 export function discriminator(namespace, name) {
   return createHash("sha256").update(`${namespace}:${name}`).digest().subarray(0, 8);
@@ -196,6 +190,113 @@ export function buildCreateMintInstructions({ payer, mint, mintAuthority, decima
   ];
 }
 
+function equalPublicKey(left, right) {
+  return new PublicKey(left).equals(new PublicKey(right));
+}
+
+async function canonicalCreateWithSeedInput(input) {
+  try {
+    assertClassicTokenProgram(input.owner);
+  } catch {
+    throw new Error("input does not match canonical create-with-seed derivation");
+  }
+  if (input.decimals !== 6) {
+    throw new Error("canonical create-with-seed mint uses 6 decimals");
+  }
+  if (!Number.isSafeInteger(input.lamports) || input.lamports < 0) {
+    throw new Error("canonical create-with-seed lamports must be a nonnegative integer");
+  }
+  const derivation = await deriveBusinessFlowMint(input);
+  const canonical =
+    typeof input.seed === "string" &&
+    Buffer.byteLength(input.seed, "utf8") === 32 &&
+    input.seed === derivation.seed &&
+    equalPublicKey(input.payer, derivation.sponsorBase) &&
+    equalPublicKey(input.base, derivation.sponsorBase) &&
+    equalPublicKey(input.owner, derivation.tokenProgram) &&
+    equalPublicKey(input.mint, derivation.mint);
+  if (!canonical) {
+    throw new Error("input does not match canonical create-with-seed derivation");
+  }
+  return derivation;
+}
+
+export async function buildCreateMintWithSeedInstructions(input, adapters = {}) {
+  const derivation = await canonicalCreateWithSeedInput(input);
+  const createAccountWithSeed =
+    adapters.createAccountWithSeed ??
+    SystemProgram.createAccountWithSeed.bind(SystemProgram);
+  const create = createAccountWithSeed({
+    fromPubkey: new PublicKey(input.payer),
+    newAccountPubkey: new PublicKey(derivation.mint),
+    basePubkey: new PublicKey(derivation.sponsorBase),
+    seed: derivation.seed,
+    lamports: input.lamports,
+    space: MINT_SIZE,
+    programId: TOKEN_PROGRAM_ID,
+  });
+  const initialize = createInitializeMint2Instruction(
+    new PublicKey(derivation.mint),
+    input.decimals,
+    new PublicKey(input.mintAuthority),
+    null,
+    TOKEN_PROGRAM_ID,
+  );
+  const instructions = Object.freeze([create, initialize]);
+  await decodeAndVerifyCreateMintWithSeed(instructions, input);
+  return Object.freeze({ derivation, instructions });
+}
+
+export async function decodeAndVerifyCreateMintWithSeed(instructions, expected) {
+  if (!Array.isArray(instructions) || instructions.length !== 2) {
+    throw new Error("canonical create-with-seed mint requires exactly two instructions");
+  }
+  const derivation = await canonicalCreateWithSeedInput(expected);
+  let decoded;
+  let initialize;
+  try {
+    decoded = SystemInstruction.decodeCreateWithSeed(instructions[0]);
+    initialize = decodeInitializeMint2Instruction(
+      instructions[1],
+      TOKEN_PROGRAM_ID,
+    );
+  } catch {
+    throw new Error("canonical create-with-seed instruction decoding failed");
+  }
+  const keys = instructions[0].keys;
+  const matches =
+    equalPublicKey(decoded.fromPubkey, expected.payer) &&
+    equalPublicKey(decoded.basePubkey, derivation.sponsorBase) &&
+    equalPublicKey(decoded.newAccountPubkey, derivation.mint) &&
+    decoded.seed === derivation.seed &&
+    equalPublicKey(decoded.programId, derivation.tokenProgram) &&
+    decoded.lamports === expected.lamports &&
+    decoded.space === MINT_SIZE &&
+    keys.length === 2 &&
+    equalPublicKey(keys[0].pubkey, derivation.sponsorBase) &&
+    keys[0].isSigner === true &&
+    keys[0].isWritable === true &&
+    equalPublicKey(keys[1].pubkey, derivation.mint) &&
+    keys[1].isSigner === false &&
+    keys[1].isWritable === true &&
+    equalPublicKey(initialize.keys.mint.pubkey, derivation.mint) &&
+    initialize.data.decimals === 6 &&
+    equalPublicKey(initialize.data.mintAuthority, expected.mintAuthority) &&
+    initialize.data.freezeAuthority === null;
+  if (!matches) {
+    throw new Error("decoded instruction does not match canonical create-with-seed mint");
+  }
+  return Object.freeze({
+    payer: new PublicKey(expected.payer).toBase58(),
+    base: derivation.sponsorBase,
+    mint: derivation.mint,
+    seed: derivation.seed,
+    owner: derivation.tokenProgram,
+    lamports: expected.lamports,
+    space: MINT_SIZE,
+  });
+}
+
 export function buildCreateAssociatedTokenAccount({ payer, owner, mint }) {
   const ata = associatedTokenAddress(mint, owner);
   return {
@@ -288,31 +389,4 @@ export function decodeMint(data) {
     decimals: buf.readUInt8(44),
     isInitialized: buf.readUInt8(45) === 1,
   });
-}
-
-// Decode a custom Anchor program error from a simulation/confirmation result.
-// Accepts either an err object ({ InstructionError: [i, { Custom: code }] }) or
-// program log lines, and returns the mapped error name when recognized.
-export function decodeProgramError({ err, logs } = {}) {
-  let code = null;
-  if (err && typeof err === "object" && Array.isArray(err.InstructionError)) {
-    const detail = err.InstructionError[1];
-    if (detail && typeof detail === "object" && Number.isInteger(detail.Custom)) {
-      code = detail.Custom;
-    }
-  }
-  if (code === null && Array.isArray(logs)) {
-    for (const line of logs) {
-      const m = /Error Code:\s*(\w+)/.exec(line) || /custom program error:\s*0x([0-9a-fA-F]+)/.exec(line);
-      if (m) {
-        if (/^\d+$/.test(m[1]) === false && !/^[0-9a-fA-F]+$/.test(m[1])) {
-          return { code: null, name: m[1] };
-        }
-        code = m[1].length <= 4 && /[a-fA-F]/.test(m[1]) ? parseInt(m[1], 16) : Number(m[1]);
-        break;
-      }
-    }
-  }
-  if (code === null) return { code: null, name: null };
-  return { code, name: ESCROW_ERROR_CODES[code] ?? null };
 }

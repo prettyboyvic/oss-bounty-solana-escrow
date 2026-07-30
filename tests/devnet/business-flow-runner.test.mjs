@@ -16,18 +16,21 @@ import {
   authorizeExecution,
   buildManifest,
   buildPlan,
-  computeFundingPlan,
   computeTransactionCeiling,
+  deriveSelectedFunding,
   deriveEscrowPda,
   deriveFlowInstances,
   deriveVaultPda,
-  executeBusinessFlows,
   externalReference,
   instructionDiscriminator,
   manifestHash,
   planExpiry,
   waitReached,
 } from "../../scripts/devnet/business-flow-runner.mjs";
+import {
+  BUSINESS_FLOW_EXECUTION_SPEC,
+  selectExecutionEvents,
+} from "../../scripts/devnet/business-flow-spec.mjs";
 
 const PROGRAM_ID = "6UoYT4jtiS23rCU1zARqnn181BxwuJ9waS1sv35gRg1Z";
 const UPGRADE_AUTHORITY = "Avfvs1k6ttrBtqh83tFw5g3dhWncrjP5hj4D52kGNZGk";
@@ -52,7 +55,11 @@ function programAccount(programDataAddress) {
   return { owner: new PublicKey(UPGRADEABLE_LOADER), executable: true, data };
 }
 
-function makeReadOnlyRpc({ sponsorBalance = 5_000_000_000, calls } = {}) {
+function makeReadOnlyRpc({
+  balances = {},
+  sponsorBalance = balances.sponsor ?? 5_000_000_000,
+  calls,
+} = {}) {
   const [pd] = PublicKey.findProgramAddressSync(
     [new PublicKey(PROGRAM_ID).toBuffer()],
     new PublicKey(UPGRADEABLE_LOADER),
@@ -72,12 +79,23 @@ function makeReadOnlyRpc({ sponsorBalance = 5_000_000_000, calls } = {}) {
     },
     getBalance: async (pk) => {
       calls?.push("getBalance");
-      return pk.toBase58() === SPONSOR ? sponsorBalance : 1_000_000_000;
+      const byPublicKey = {
+        [SPONSOR]: sponsorBalance,
+        [MAINTAINER]: balances.maintainer ?? 1_000_000_000,
+        [CONTRIBUTOR]: balances.contributor ?? 1_000_000_000,
+      };
+      return byPublicKey[pk.toBase58()] ?? 1_000_000_000;
     },
   };
 }
 
 const RENT = { mintRent: 1_461_600, tokenAccountRent: 2_039_280, escrowRent: 2_470_800 };
+const RENT_BY_CLASS = {
+  mint: RENT.mintRent,
+  ata: RENT.tokenAccountRent,
+  escrow: RENT.escrowRent,
+  vault: RENT.tokenAccountRent,
+};
 
 function planRequest(overrides = {}) {
   return {
@@ -135,6 +153,54 @@ test("plan mode performs no send and only read calls", async () => {
   }
   assert.equal(plan.tokenProgram, CLASSIC_TOKEN_PROGRAM_ID);
   assert.equal(plan.upgradeAuthority, UPGRADE_AUTHORITY);
+  assert.equal(plan.transactionCeiling, 12);
+  assert.deepEqual(plan.selectedEvents, plan.manifest.selectedEvents);
+  assert.deepEqual(plan.selectedEvents.eventIds, plan.funding.selectedEventIds);
+  assert.equal(plan.selectedEvents.sendCount, plan.funding.sendCount);
+  assert.equal(
+    plan.funding.byIdentity.sponsor.safetyMarginLamports,
+    20_000_000,
+  );
+  for (const identity of ["maintainer", "contributor", "mintAuthority"]) {
+    assert.equal(
+      plan.funding.byIdentity[identity].safetyMarginLamports,
+      0,
+    );
+  }
+  assert.deepEqual(plan.manifest.funding, {
+    selectedEventIds: [...plan.funding.selectedEventIds],
+    sendCount: plan.funding.sendCount,
+    simulationCount: plan.funding.simulationCount,
+    waitCount: plan.funding.waitCount,
+    createdAccountsByClass: {
+      mint: plan.funding.createdAccountsByClass.mint,
+      ata: plan.funding.createdAccountsByClass.ata,
+      escrow: plan.funding.createdAccountsByClass.escrow,
+      vault: plan.funding.createdAccountsByClass.vault,
+    },
+    recoverableRentLamports: plan.funding.recoverableRentLamports,
+    transactionFeeLamports: plan.funding.transactionFeeLamports,
+    requiredBalanceLamports: plan.funding.requiredBalanceLamports,
+    byIdentity: Object.fromEntries(
+      ["sponsor", "maintainer", "contributor", "mintAuthority"].map(
+        (identity) => [
+          identity,
+          {
+            feeCount: plan.funding.byIdentity[identity].feeCount,
+            signatureCount: plan.funding.byIdentity[identity].signatureCount,
+            feeLamports: plan.funding.byIdentity[identity].feeLamports,
+            rentLamports: plan.funding.byIdentity[identity].rentLamports,
+            retryReserveLamports:
+              plan.funding.byIdentity[identity].retryReserveLamports,
+            safetyMarginLamports:
+              plan.funding.byIdentity[identity].safetyMarginLamports,
+            requiredLamports:
+              plan.funding.byIdentity[identity].requiredLamports,
+          },
+        ],
+      ),
+    ),
+  });
 });
 
 test("plan rejects an rpc adapter exposing a send/sign method", async () => {
@@ -158,25 +224,70 @@ test("plan rejects any business identity equal to the upgrade authority", async 
   );
 });
 
-test("plan flags insufficient sponsor funding without airdrop", async () => {
-  const plan = await buildPlan(planRequest(), makeReadOnlyRpc({ sponsorBalance: 1000 }));
-  assert.equal(plan.fundingSufficient, false);
-  assert.match(plan.notes.join(" "), /BLOCKED_FUNDING/);
+test("plan rejects every equal sponsor, maintainer, or contributor pair", async () => {
+  const duplicatePairs = [
+    { sponsor: SPONSOR, maintainer: SPONSOR, contributor: CONTRIBUTOR },
+    { sponsor: SPONSOR, maintainer: MAINTAINER, contributor: SPONSOR },
+    { sponsor: SPONSOR, maintainer: MAINTAINER, contributor: MAINTAINER },
+  ];
+  for (const identities of duplicatePairs) {
+    await assert.rejects(
+      buildPlan(planRequest({ identities }), makeReadOnlyRpc()),
+      /sponsor, maintainer, and contributor must be mutually distinct/,
+    );
+  }
 });
 
-test("transaction ceiling is the sum of per-flow live writes", () => {
-  assert.equal(computeTransactionCeiling(["release"]), 3);
-  assert.equal(computeTransactionCeiling(["release", "refund", "cancel"]), 8);
-  assert.throws(() => computeTransactionCeiling(["bogus"]), /unknown flow/);
+test("plan flags insufficient payer funding without accepting an equal aggregate", async () => {
+  const plan = await buildPlan(
+    planRequest(),
+    makeReadOnlyRpc({
+      balances: {
+        sponsor: 5_000_000_000,
+        maintainer: 0,
+        contributor: 1_000_000_000,
+      },
+    }),
+  );
+  assert.equal(plan.fundingSufficient, false);
+  assert.equal(plan.fundingSufficientByIdentity.sponsor, true);
+  assert.equal(plan.fundingSufficientByIdentity.maintainer, false);
+  assert.match(plan.notes.join(" "), /BLOCKED_FUNDING.*maintainer/);
+});
+
+test("transaction ceiling is the selected canonical SEND count", () => {
+  assert.equal(computeTransactionCeiling(["release"]), 7);
+  assert.equal(computeTransactionCeiling(["release", "refund", "cancel"]), 12);
+  assert.throws(() => computeTransactionCeiling(["bogus"]), /requested execution flows/);
 });
 
 test("negative checks are simulate-only", () => {
-  assert.ok(NEGATIVE_CHECKS.length >= 3);
+  assert.equal(NEGATIVE_CHECKS.length, 3);
   for (const n of NEGATIVE_CHECKS) assert.equal(n.mode, "simulate");
-  const ids = NEGATIVE_CHECKS.map((n) => n.id);
-  assert.ok(ids.includes("unauthorized_release"));
-  assert.ok(ids.includes("refund_before_expiry"));
-  assert.ok(ids.includes("release_at_or_after_expiry"));
+  assert.deepEqual(NEGATIVE_CHECKS, [
+    {
+      id: "unauthorized_release",
+      mode: "simulate",
+      expectedErrors: [
+        "InvalidContributorTokenOwner",
+        "ConstraintHasOne",
+      ],
+    },
+    {
+      id: "refund_before_expiry",
+      mode: "simulate",
+      expectedErrors: ["EscrowNotExpired"],
+    },
+    {
+      id: "release_at_or_after_expiry",
+      mode: "simulate",
+      expectedErrors: ["EscrowExpired"],
+    },
+  ]);
+  assert.equal(
+    NEGATIVE_CHECKS.some((check) => check.expectedErrors.includes(null)),
+    false,
+  );
 });
 
 test("expiry policy is bounded and rejects fragile leads", () => {
@@ -195,20 +306,178 @@ test("wait bound stops on timeout rather than resending", () => {
   assert.deepEqual(waitReached({ chainTimeSeconds: 5, targetSeconds: 10, elapsedMs: 2000, timeoutMs: 1000 }), { done: true, reason: "TIMEOUT_STOP" });
 });
 
-test("funding model separates recoverable rent from permanent fees", () => {
-  const f = computeFundingPlan({
-    mintRent: RENT.mintRent,
-    tokenAccountRent: RENT.tokenAccountRent,
-    escrowRent: RENT.escrowRent,
-    feePerTransaction: 5000,
-    setupWrites: 7,
-    flowLiveWrites: 3,
-    tokenAccountCount: 3,
-    safetyReserveLamports: 20_000_000,
+test("full canonical funding derives account counts, sends, and payer identities", () => {
+  const selectedPlan = selectExecutionEvents(
+    BUSINESS_FLOW_EXECUTION_SPEC,
+    ["release", "refund", "cancel"],
+  );
+  const funding = deriveSelectedFunding({
+    selectedPlan,
+    rentByClass: RENT_BY_CLASS,
+    feePerSignature: 5_000,
+    safetyMarginByIdentity: { sponsor: 20_000_000 },
   });
-  assert.equal(f.recoverableRent, RENT.mintRent + RENT.escrowRent + RENT.tokenAccountRent * 3);
-  assert.equal(f.permanentFees, 10 * 5000);
-  assert.equal(f.requiredLamports, f.recoverableRent + f.permanentFees + 20_000_000);
+  assert.deepEqual(funding.createdAccountsByClass, {
+    mint: 1,
+    ata: 2,
+    escrow: 3,
+    vault: 3,
+  });
+  assert.equal(funding.sendCount, 12);
+  assert.equal(funding.simulationCount, 3);
+  assert.equal(funding.waitCount, 1);
+  assert.equal(funding.byIdentity.sponsor.feeCount, 11);
+  assert.equal(funding.byIdentity.maintainer.feeCount, 1);
+  assert.deepEqual(
+    Object.keys(funding.byIdentity),
+    ["sponsor", "maintainer", "contributor", "mintAuthority"],
+  );
+  assert.equal(
+    funding.recoverableRentLamports,
+    RENT.mintRent + RENT.tokenAccountRent * 5 + RENT.escrowRent * 3,
+  );
+});
+
+test("release-only canonical funding assigns seven sends to exact payers", () => {
+  const funding = deriveSelectedFunding({
+    selectedPlan: selectExecutionEvents(
+      BUSINESS_FLOW_EXECUTION_SPEC,
+      ["release"],
+    ),
+    rentByClass: RENT_BY_CLASS,
+    feePerSignature: 5_000,
+  });
+  assert.deepEqual(funding.createdAccountsByClass, {
+    mint: 1,
+    ata: 2,
+    escrow: 1,
+    vault: 1,
+  });
+  assert.equal(funding.sendCount, 7);
+  assert.equal(funding.simulationCount, 1);
+  assert.equal(funding.waitCount, 0);
+  assert.equal(funding.byIdentity.sponsor.feeCount, 6);
+  assert.equal(funding.byIdentity.maintainer.feeCount, 1);
+});
+
+test("refund-only canonical funding tracks sends, simulations, and wait separately", () => {
+  const funding = deriveSelectedFunding({
+    selectedPlan: selectExecutionEvents(
+      BUSINESS_FLOW_EXECUTION_SPEC,
+      ["refund"],
+    ),
+    rentByClass: RENT_BY_CLASS,
+    feePerSignature: 5_000,
+  });
+  assert.deepEqual(funding.createdAccountsByClass, {
+    mint: 1,
+    ata: 2,
+    escrow: 1,
+    vault: 1,
+  });
+  assert.equal(funding.sendCount, 7);
+  assert.equal(funding.simulationCount, 2);
+  assert.equal(funding.waitCount, 1);
+  assert.equal(funding.byIdentity.sponsor.feeCount, 7);
+  assert.equal(funding.byIdentity.maintainer.feeCount, 0);
+});
+
+test("retry reserve and safety margin are assigned to only the named payer", () => {
+  const funding = deriveSelectedFunding({
+    selectedPlan: selectExecutionEvents(
+      BUSINESS_FLOW_EXECUTION_SPEC,
+      ["release"],
+    ),
+    rentByClass: RENT_BY_CLASS,
+    feePerSignature: 5_000,
+    retryReserveByIdentity: { contributor: 12_345 },
+    safetyMarginByIdentity: { maintainer: 54_321 },
+  });
+  assert.equal(funding.sendCount, 7);
+  assert.equal(funding.byIdentity.contributor.retryReserveLamports, 12_345);
+  assert.equal(funding.byIdentity.maintainer.safetyMarginLamports, 54_321);
+  assert.equal(funding.byIdentity.sponsor.retryReserveLamports, 0);
+  assert.equal(funding.byIdentity.sponsor.safetyMarginLamports, 0);
+});
+
+test("canonical funding rejects invalid numeric inputs and missing payer or class data", () => {
+  const selectedPlan = selectExecutionEvents(
+    BUSINESS_FLOW_EXECUTION_SPEC,
+    ["release"],
+  );
+  const base = {
+    selectedPlan,
+    rentByClass: RENT_BY_CLASS,
+    feePerSignature: 5_000,
+  };
+  for (const feePerSignature of [-1, 1.5, undefined]) {
+    assert.throws(
+      () => deriveSelectedFunding({ ...base, feePerSignature }),
+      /feePerSignature.*nonnegative integer/,
+    );
+  }
+  for (const rentByClass of [
+    { ...RENT_BY_CLASS, vault: -1 },
+    { ...RENT_BY_CLASS, escrow: 1.5 },
+    { mint: RENT.mintRent, ata: RENT.tokenAccountRent, escrow: RENT.escrowRent },
+  ]) {
+    assert.throws(
+      () => deriveSelectedFunding({ ...base, rentByClass }),
+      /(rentByClass|vault|escrow).*nonnegative integer/,
+    );
+  }
+  for (const field of ["retryReserveByIdentity", "safetyMarginByIdentity"]) {
+    for (const value of [-1, 1.5, undefined]) {
+      assert.throws(
+        () =>
+          deriveSelectedFunding({
+            ...base,
+            [field]: { sponsor: value },
+          }),
+        new RegExp(`${field}\\.sponsor.*nonnegative integer`),
+      );
+    }
+    assert.throws(
+      () =>
+        deriveSelectedFunding({
+          ...base,
+          [field]: { stranger: 1 },
+        }),
+      /unknown funding identity "stranger"/,
+    );
+  }
+
+  const badPayerEvent = {
+    ...selectedPlan.sendEvents[0],
+    feePayerRole: "stranger",
+    rentPayerRole: "stranger",
+  };
+  assert.throws(
+    () =>
+      deriveSelectedFunding({
+        ...base,
+        selectedPlan: {
+          ...selectedPlan,
+          sendEvents: [badPayerEvent],
+        },
+      }),
+    /unknown fee payer "stranger"/,
+  );
+  const badClassEvent = {
+    ...selectedPlan.sendEvents[0],
+    creates: ["mystery"],
+  };
+  assert.throws(
+    () =>
+      deriveSelectedFunding({
+        ...base,
+        selectedPlan: {
+          ...selectedPlan,
+          sendEvents: [badClassEvent],
+        },
+      }),
+    /unknown created account class "mystery"/,
+  );
 });
 
 test("deployment-authority guard rejects the authority as a role", () => {
@@ -251,6 +520,42 @@ test("execute refuses stale manifest hash", async () => {
   assert.throws(() => authorizeExecution(plan, auth), /manifest hash/);
 });
 
+test("authorization rejects mutable funding or manifest content under an unchanged hash", async () => {
+  const original = await freshPlan();
+  const authorization = validAuthorization(original);
+  const cases = [
+    {
+      label: "plan funding",
+      mutate(plan) {
+        plan.funding.byIdentity.maintainer.requiredLamports = 0;
+      },
+    },
+    {
+      label: "manifest funding",
+      mutate(plan) {
+        plan.manifest.funding ??= structuredClone(plan.funding);
+        plan.manifest.funding.byIdentity.maintainer.requiredLamports = 0;
+      },
+    },
+    {
+      label: "manifest content",
+      mutate(plan) {
+        plan.manifest.amount += 1;
+      },
+    },
+  ];
+
+  for (const fixture of cases) {
+    const tampered = structuredClone(original);
+    fixture.mutate(tampered);
+    assert.throws(
+      () => authorizeExecution(tampered, authorization),
+      /(funding projection|manifest hash)/,
+      fixture.label,
+    );
+  }
+});
+
 test("execute refuses wrong genesis and wrong program id", async () => {
   const plan = await freshPlan();
   const a1 = validAuthorization(plan);
@@ -285,44 +590,6 @@ test("valid authorization is accepted", async () => {
   assert.deepEqual([...grant.enabledFlows].sort(), ["cancel", "refund", "release"]);
 });
 
-test("executeBusinessFlows requires injected deps and never blind-retries on failure", async () => {
-  const plan = await freshPlan();
-  const auth = validAuthorization(plan);
-  await assert.rejects(executeBusinessFlows(plan, auth, {}), /injected signAndSend/);
-
-  let calls = 0;
-  const failingDeps = {
-    signAndSend: async () => {
-      calls += 1;
-      throw new Error("simulated send failure");
-    },
-    readAccount: async () => ({}),
-  };
-  const result = await executeBusinessFlows(plan, { ...auth, enabledFlows: ["cancel"] }, failingDeps);
-  assert.equal(result.status, "STOPPED");
-  assert.equal(result.reason, "STEP_FAILED");
-  assert.equal(result.sent, 0);
-  assert.equal(calls, 1, "must not blind-retry");
-  assert.equal(result.evidence.length, 1);
-  assert.equal(result.evidence[0].status, "FAILED");
-});
-
-test("executeBusinessFlows stops on unexpected on-chain state and preserves evidence", async () => {
-  const plan = await freshPlan();
-  const auth = { ...validAuthorization(plan), enabledFlows: ["cancel"] };
-  const deps = {
-    signAndSend: async (step) => ({ signature: `sig-${step.instruction}` }),
-    readAccount: async (step) =>
-      step.instruction === "cancel"
-        ? { expectedStatus: "Cancelled", observedStatus: "Initialized" }
-        : {},
-  };
-  const result = await executeBusinessFlows(plan, auth, deps);
-  assert.equal(result.status, "STOPPED");
-  assert.equal(result.reason, "UNEXPECTED_STATE");
-  assert.ok(result.evidence.some((e) => e.status === "UNEXPECTED_STATE"));
-});
-
 test("manifest hash is stable and secrets never appear in plan output", async () => {
   const plan = await freshPlan();
   const m = buildManifest({
@@ -334,7 +601,10 @@ test("manifest hash is stable and secrets never appear in plan output", async ()
     flows: ["release", "refund", "cancel"],
     uniquenessToken: "unit-token",
     instances: plan.manifest.instances,
-    transactionCeiling: 8,
+    selectedEvents: plan.selectedEvents,
+    funding: plan.funding,
+    transactionCeiling: 12,
+    negativeChecks: plan.negativeChecks,
     amount: 1_000_000,
     decimals: 6,
   });

@@ -2,14 +2,22 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 
-import { PublicKey, SystemProgram } from "@solana/web3.js";
-import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import {
+  Keypair,
+  Message,
+  PublicKey,
+  SystemInstruction,
+  SystemProgram,
+  Transaction,
+} from "@solana/web3.js";
+import { MINT_SIZE, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 
 import {
   ESCROW_ERROR_CODES,
   ESCROW_STATUS,
   buildCancel,
   buildCreateAssociatedTokenAccount,
+  buildCreateMintWithSeedInstructions,
   buildCreateMintInstructions,
   buildFundEscrow,
   buildInitializeEscrow,
@@ -17,11 +25,13 @@ import {
   buildRefund,
   buildRelease,
   decodeEscrow,
+  decodeAndVerifyCreateMintWithSeed,
   decodeMint,
   decodeProgramError,
   decodeTokenAccountAmount,
   discriminator,
 } from "../../scripts/devnet/business-flow-instructions.mjs";
+import { deriveBusinessFlowMint } from "../../scripts/devnet/business-flow-identity.mjs";
 
 const PROGRAM_ID = "6UoYT4jtiS23rCU1zARqnn181BxwuJ9waS1sv35gRg1Z";
 const A = PublicKey.unique().toBase58();
@@ -122,6 +132,131 @@ test("asset-setup builders use classic token program and reject non-6 decimals",
 
   const mintTo = buildMintTo({ mint: B, destination: C, mintAuthority: D, amount: 1_000_000 });
   assert.equal(mintTo.programId.toBase58(), TOKEN_PROGRAM_ID.toBase58());
+});
+
+test("the pinned SDK builder accepts oversized seeds and mismatched derived addresses", () => {
+  const payer = Keypair.fromSeed(new Uint8Array(32).fill(1)).publicKey;
+  const unrelated = Keypair.fromSeed(new Uint8Array(32).fill(2)).publicKey;
+
+  for (const seed of ["a".repeat(33), "é".repeat(17)]) {
+    assert.ok(Buffer.byteLength(seed, "utf8") > 32);
+    const instruction = SystemProgram.createAccountWithSeed({
+      fromPubkey: payer,
+      newAccountPubkey: unrelated,
+      basePubkey: payer,
+      seed,
+      lamports: 1,
+      space: MINT_SIZE,
+      programId: TOKEN_PROGRAM_ID,
+    });
+    const decoded = SystemInstruction.decodeCreateWithSeed(instruction);
+    assert.equal(decoded.seed, seed);
+    assert.equal(decoded.newAccountPubkey.toBase58(), unrelated.toBase58());
+  }
+});
+
+test("application validation rejects noncanonical create-with-seed input before SDK access", async () => {
+  const sponsor = Keypair.fromSeed(new Uint8Array(32).fill(3));
+  const authority = Keypair.fromSeed(new Uint8Array(32).fill(4));
+  const input = {
+    executionId: "exec-1",
+    genesisHash: "EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
+    programId: PROGRAM_ID,
+    sponsorBase: sponsor.publicKey.toBase58(),
+    payer: sponsor.publicKey.toBase58(),
+    base: sponsor.publicKey.toBase58(),
+    owner: TOKEN_PROGRAM_ID.toBase58(),
+    mintAuthority: authority.publicKey.toBase58(),
+    decimals: 6,
+    lamports: 1_461_600,
+  };
+  const derived = await deriveBusinessFlowMint(input);
+  const builderCalls = [];
+  const builder = (value) => {
+    builderCalls.push(value);
+    return SystemProgram.createAccountWithSeed(value);
+  };
+  const invalid = [
+    { seed: "a".repeat(33), mint: derived.mint },
+    { seed: "é".repeat(17), mint: derived.mint },
+    { seed: derived.seed, mint: Keypair.generate().publicKey.toBase58() },
+    { seed: derived.seed, mint: derived.mint, base: Keypair.generate().publicKey.toBase58() },
+    { seed: derived.seed, mint: derived.mint, owner: SystemProgram.programId.toBase58() },
+  ];
+
+  for (const mutation of invalid) {
+    await assert.rejects(
+      buildCreateMintWithSeedInstructions(
+        { ...input, seed: derived.seed, mint: derived.mint, ...mutation },
+        { createAccountWithSeed: builder },
+      ),
+      /canonical create-with-seed/,
+    );
+  }
+  assert.equal(builderCalls.length, 0);
+});
+
+test("valid deterministic mint instruction is decoded and compiles to one sponsor signature", async () => {
+  const sponsor = Keypair.fromSeed(new Uint8Array(32).fill(5));
+  const authority = Keypair.fromSeed(new Uint8Array(32).fill(6));
+  const input = {
+    executionId: "matrix-1",
+    genesisHash: "EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
+    programId: PROGRAM_ID,
+    sponsorBase: sponsor.publicKey.toBase58(),
+    payer: sponsor.publicKey.toBase58(),
+    base: sponsor.publicKey.toBase58(),
+    owner: TOKEN_PROGRAM_ID.toBase58(),
+    mintAuthority: authority.publicKey.toBase58(),
+    decimals: 6,
+    lamports: 1_461_600,
+  };
+  const derived = await deriveBusinessFlowMint(input);
+  const built = await buildCreateMintWithSeedInstructions({
+    ...input,
+    seed: derived.seed,
+    mint: derived.mint,
+  });
+  const proof = await decodeAndVerifyCreateMintWithSeed(built.instructions, {
+    ...input,
+    seed: derived.seed,
+    mint: derived.mint,
+  });
+
+  assert.deepEqual(proof, {
+    payer: sponsor.publicKey.toBase58(),
+    base: sponsor.publicKey.toBase58(),
+    mint: derived.mint,
+    seed: derived.seed,
+    owner: TOKEN_PROGRAM_ID.toBase58(),
+    lamports: 1_461_600,
+    space: MINT_SIZE,
+  });
+  const blockhash = Keypair.fromSeed(new Uint8Array(32).fill(7)).publicKey.toBase58();
+  const tx = new Transaction({
+    feePayer: sponsor.publicKey,
+    recentBlockhash: blockhash,
+  }).add(...built.instructions);
+  tx.sign(sponsor);
+  const message = Message.from(tx.serializeMessage());
+  assert.equal(message.header.numRequiredSignatures, 1);
+  assert.deepEqual(message.accountKeys.map(String), [
+    sponsor.publicKey.toBase58(),
+    derived.mint,
+    SystemProgram.programId.toBase58(),
+    TOKEN_PROGRAM_ID.toBase58(),
+  ]);
+  assert.deepEqual(
+    built.instructions[0].keys.map((key) => ({
+      pubkey: key.pubkey.toBase58(),
+      signer: key.isSigner,
+      writable: key.isWritable,
+    })),
+    [
+      { pubkey: sponsor.publicKey.toBase58(), signer: true, writable: true },
+      { pubkey: derived.mint, signer: false, writable: true },
+    ],
+  );
 });
 
 test("decodeEscrow reads the full struct layout", () => {

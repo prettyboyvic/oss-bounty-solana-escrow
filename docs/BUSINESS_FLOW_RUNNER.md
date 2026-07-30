@@ -34,11 +34,14 @@ local-validator coverage.
 - assert the sponsor/maintainer/contributor identities are all distinct from the
   deployment/upgrade authority;
 - derive all escrow/vault PDAs from unique external references;
-- inspect identity balances and compute a funding plan (rent vs permanent fees);
-- emit a canonical, hashed execution manifest, a sanitized transaction plan, the
-  exact transaction ceiling, and the simulate-only negative-check list;
-- report `BLOCKED_FUNDING` when the sponsor balance is below the required lamports,
-  and never request an airdrop.
+- select the dependency-complete canonical event list once, derive rent, fees,
+  inventory, simulations, waits, and the send ceiling from that selection, and
+  allocate every lamport requirement to its exact payer identity;
+- emit the selected event IDs, counts, and complete per-payer funding projection
+  in the canonical hashed manifest together with a sanitized transaction plan and
+  selected simulate-only negative checks;
+- report `BLOCKED_FUNDING` when any payer balance is below that payer's own
+  requirement, and never use another payer's excess balance or request an airdrop.
 
 Plan output is passed through `sanitizePublicOutput`; no secret bytes are produced.
 
@@ -47,17 +50,15 @@ Plan output is passed through `sanitizePublicOutput`; no secret bytes are produc
 `authorizeExecution(plan, authorization)` requires and cross-checks a fresh
 `manifestHash`, `expectedGenesisHash` (must be devnet), `expectedProgramId`,
 `executionId`, `transactionCeiling`, `enabledFlows`, per-role `identityAssertions`,
-and the explicit `acknowledgeDevnet = "R4_DEVNET_BUSINESS_FLOW"`. It rejects stale
-or missing values and any identity equal to the upgrade authority.
+and the explicit `acknowledgeDevnet = "R4_DEVNET_BUSINESS_FLOW"`. It recomputes
+the manifest hash, compares the public funding view with the hash-bound projection,
+and rejects stale or missing values and any identity equal to the upgrade authority.
 
-`executeBusinessFlows(plan, authorization, deps)` (in the runner) builds the ordered
-step plan and delegates signing/sending to injected `deps.signAndSend` /
-`deps.readAccount`; it enforces the ceiling, stops on the first failed send or
-unexpected on-chain status, never blind-retries, and preserves partial-success
-evidence. The concrete top-level driver `executeFullMatrix(...)` (in
-`business-flow-execution.mjs`, see below) is what the CLI actually calls. **Neither
-path is ever invoked against live devnet in this phase or in CI**; the CLI's
-`execute` subcommand is fail-closed behind an explicit live acknowledgement flag.
+The sole public execution entry point is `executeFullMatrix(...)` in
+`business-flow-execution.mjs`. It selects dependency-complete canonical events and
+constructs every transaction through the canonical registry/factory. It is never
+invoked against live devnet in this phase or in CI; the CLI's `execute` subcommand
+is fail-closed behind an explicit live acknowledgement flag.
 
 ## Flows and negatives
 
@@ -78,8 +79,11 @@ Negative checks are **simulate-only** by contract: `unauthorized_release`,
   escrows expire ~1 hour ahead; refund escrows use a bounded lead (default 20 s,
   minimum 10 s) with a bounded polling wait that **stops rather than resends** on
   timeout. `waitReached(...)` is a pure, unit-tested bound.
-- Funding separates recoverable account rent from permanent transaction fees plus a
-  safety reserve; test identities are never assumed funded and are never auto-funded.
+- Funding separates recoverable account rent from permanent transaction fees,
+  per-identity retry reserve, and per-identity safety margin. The legacy scalar
+  safety reserve maps only to the sponsor's safety margin. Sponsor, maintainer,
+  contributor, and mint-authority allocations remain explicit even when zero; test
+  identities are never assumed funded and are never auto-funded.
 
 ## Concrete execution implementation (Phase 2 repair)
 
@@ -97,35 +101,43 @@ in CI or the repair phase):
   `simulate`, and atomic sanitized receipts. It loads only contained `.devnet`
   keypairs, rejects any signer equal to the deployment/upgrade authority, exposes no
   airdrop/fund/close surface, and never emits secret bytes.
-- `scripts/devnet/business-flow-execution.mjs` — orchestrator: full transaction
-  ceiling (setup 4 + flows 8 = 12; 3 read-only simulations), persistent
+- `scripts/devnet/business-flow-execution.mjs` — orchestrator: canonical
+  selected-event ceiling (12 sends, 3 read-only simulations, and 1 wait for the
+  full canonical matrix), persistent
   execution-ID reservation (replay refusal), plan TTL freshness, immediate
   on-chain rechecks (program executable, ProgramData linkage, PDA re-derivation,
-  escrow collision, sponsor balance), bounded refund expiry wait using chain time,
+  escrow collision, each payer's balance), bounded refund expiry wait using chain time,
   post-state verification via decoders, outcome classes (`NOT_STARTED`, `RUNNING`,
   `CONFIRMED_SUCCESS`, `CONFIRMED_FAILED`, `CONFIRMATION_UNKNOWN`, `PARTIAL_SUCCESS`,
   `STOPPED_ON_STATE_MISMATCH`, `STOPPED_ON_SIMULATION`, `STOPPED_ON_EXPIRY_TIMEOUT`,
   `COMPLETE`), no blind retry, and durable evidence.
-  - `runAcceptanceMatrix(...)` is the guarded context builder (freshness, replay
-    reservation, on-chain recheck, ceiling, and a guarded `sendStep`).
-  - `executeFullMatrix(...)` is the **top-level driver** that self-orchestrates the
+  - `executeFullMatrix(...)` is the **sole public execution driver** that
+    self-orchestrates the
     whole matrix: 4 setup sends (create+init mint, sponsor ATA, contributor ATA,
     mint tokens), then per instance the release / refund / cancel flows, running the
     three negative checks as read-only simulations at the correct states
     (fail-closed on unexpected success), waiting for refund expiry on chain time
     with a bounded timeout that stops rather than resends, verifying terminal escrow
     status and token deltas, stopping the whole matrix on the first failure (no step
-    N+1), and writing a durable partial receipt that always carries the completed
-    steps, the pending/unknown step, the stop reason, and the ephemeral mint public
-    key. It is proven end-to-end with a fake adapter and fake clock in
+    N+1), and writing the single authoritative `<executionId>.matrix.json` receipt.
+    Its append-only `evidence` timeline binds every lifecycle entry to the
+    execution-spec hash/schema and canonical event identity. `steps`, `simulations`,
+    `pendingStep`, outcome, and stop-reason fields are compatibility projections
+    derived from that timeline on every receipt snapshot, not independent logs.
+    The receipt also carries the deterministic seed-derived mint public key. It is
+    proven end-to-end with a
+    fake adapter and
+    fake clock in
     `tests/devnet/business-flow-full-matrix.test.mjs`.
 
 The CLI `execute` subcommand builds the production adapter and calls
 `executeFullMatrix`, but requires `--plan`, `--authorization` and
 `--acknowledge-live-devnet-write`; without the acknowledgement it refuses (covered
 by `tests/devnet/business-flow-cli-safety.test.mjs`), so no accidental devnet write
-can occur. The mint is a transient generated keypair (never persisted to tracked
-files); its public key is bound into the receipt for post-crash reconciliation.
+can occur. The mint is deterministically derived from canonical execution identity
+and created with the sponsor as the System Program seed base; no mint keypair is
+generated or loaded. Its public key is bound into the receipt for post-crash
+reconciliation.
 
 Full transaction ceiling: setup is part of the same execution and is included in the
 ceiling (12 live writes for all three flows); negative checks are 3 read-only

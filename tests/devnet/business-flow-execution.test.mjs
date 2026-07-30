@@ -1,7 +1,4 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import test from "node:test";
 
 import { PublicKey } from "@solana/web3.js";
@@ -9,15 +6,12 @@ import { PublicKey } from "@solana/web3.js";
 import { DEVNET_GENESIS_HASH, DEVNET_RPC_URL } from "../../scripts/devnet/safety.mjs";
 import { buildPlan } from "../../scripts/devnet/business-flow-runner.mjs";
 import {
-  OUTCOME,
   SETUP_TRANSACTION_COUNT,
   assertPlanFresh,
   assertSignersExcludeAuthority,
   computeFullCeiling,
   recheckOnChainBeforeExecution,
   reserveExecutionId,
-  runAcceptanceMatrix,
-  runNegativeSimulations,
   verifyEscrowStatus,
   verifyTokenDelta,
   waitForExpiry,
@@ -78,19 +72,6 @@ async function freshPlan(nowMs = Date.now()) {
   );
 }
 
-function validAuthorization(plan) {
-  return {
-    manifestHash: plan.manifestHash,
-    expectedGenesisHash: DEVNET_GENESIS_HASH,
-    expectedProgramId: PROGRAM_ID,
-    executionId: "exec-1",
-    transactionCeiling: plan.transactionCeiling,
-    enabledFlows: ["release", "refund", "cancel"],
-    identityAssertions: { sponsor: SPONSOR, maintainer: MAINTAINER, contributor: CONTRIBUTOR },
-    acknowledgeDevnet: "R4_DEVNET_BUSINESS_FLOW",
-  };
-}
-
 test("full ceiling includes setup and flow writes", () => {
   const c = computeFullCeiling(["release", "refund", "cancel"]);
   assert.equal(c.setupWrites, SETUP_TRANSACTION_COUNT);
@@ -149,7 +130,7 @@ test("assertSignersExcludeAuthority rejects any role equal to upgrade authority"
   );
 });
 
-test("recheck rejects escrow collision and insufficient balance", async () => {
+test("recheck rejects escrow collision and each payer's insufficient balance", async () => {
   const plan = await freshPlan();
   await assert.doesNotReject(recheckOnChainBeforeExecution(plan, {}, fakeExecAdapter()));
   const collide = fakeExecAdapter({
@@ -164,32 +145,14 @@ test("recheck rejects escrow collision and insufficient balance", async () => {
   await assert.rejects(recheckOnChainBeforeExecution(plan, {}, collide), /collision/);
   const poor = fakeExecAdapter({ readBalance: async () => 1000 });
   await assert.rejects(recheckOnChainBeforeExecution(plan, {}, poor), /insufficient/);
-});
-
-test("negative simulations decode expected errors and never call send", async () => {
-  let sendCalled = false;
-  const adapter = fakeExecAdapter({
-    send: async () => { sendCalled = true; return {}; },
-    simulate: async ({ instructions }) => {
-      // First negative -> unauthorized (has-one), map to a recognized code; second -> not expired; third -> expired.
-      const disc = [...instructions[0].data.subarray(0, 8)].join(",");
-      void disc;
-      return { err: { InstructionError: [0, { Custom: 6008 }] }, logs: ["Error Code: EscrowNotExpired"], unitsConsumed: 10 };
-    },
+  const wrongPayerAllocation = fakeExecAdapter({
+    readBalance: async (identity) =>
+      identity === MAINTAINER ? 0 : 5_000_000_000,
   });
-  const ctx = { programId: PROGRAM_ID, mint: SPONSOR, identities: { sponsor: SPONSOR, maintainer: MAINTAINER, contributor: CONTRIBUTOR }, fundedEscrow: SPONSOR, fundedVault: MAINTAINER, expiredEscrow: CONTRIBUTOR, expiredVault: SPONSOR, sponsorToken: MAINTAINER, contributorToken: CONTRIBUTOR };
-  const out = await runNegativeSimulations(ctx, adapter);
-  // 6008 == EscrowNotExpired is accepted for cases whose expected set contains it or null.
-  assert.ok(["PASS", "FAILED"].includes(out.status));
-  assert.equal(sendCalled, false, "simulation must never send");
-});
-
-test("negative simulation fails if a case unexpectedly succeeds", async () => {
-  const adapter = fakeExecAdapter({ simulate: async () => ({ err: null, logs: [], unitsConsumed: 1 }) });
-  const ctx = { programId: PROGRAM_ID, mint: SPONSOR, identities: { sponsor: SPONSOR, maintainer: MAINTAINER, contributor: CONTRIBUTOR }, fundedEscrow: SPONSOR, fundedVault: MAINTAINER, expiredEscrow: CONTRIBUTOR, expiredVault: SPONSOR, sponsorToken: MAINTAINER, contributorToken: CONTRIBUTOR };
-  const out = await runNegativeSimulations(ctx, adapter);
-  assert.equal(out.status, "FAILED");
-  assert.match(out.reason, /unexpectedly succeeded/);
+  await assert.rejects(
+    recheckOnChainBeforeExecution(plan, {}, wrongPayerAllocation),
+    /maintainer funding insufficient/,
+  );
 });
 
 test("refund wait reaches target and stops on timeout without resend", async () => {
@@ -214,58 +177,4 @@ test("verify helpers detect status and token delta", () => {
   assert.equal(verifyEscrowStatus(buf, "Funded").ok, false);
   assert.equal(verifyTokenDelta("100", "1100", 1000).ok, true);
   assert.equal(verifyTokenDelta("100", "200", 1000).ok, false);
-});
-
-test("runAcceptanceMatrix enforces freshness, replay reservation and recheck, then wires steps without sending", async () => {
-  const plan = await freshPlan();
-  const dir = mkdtempSync(join(tmpdir(), "bfr-"));
-  const writes = [];
-  const adapter = fakeExecAdapter({ receiptDir: dir, writeReceipt: (name, v) => writes.push({ name, v }) });
-  const result = await runAcceptanceMatrix(plan, validAuthorization(plan), adapter, {
-    nowMs: plan.createdAtMs + 1000,
-    ttlMs: 300_000,
-  });
-  assert.equal(result.status, OUTCOME.NOT_STARTED);
-  assert.equal(result.ceiling.totalWrites, 12);
-  assert.ok(existsSync(join(dir, "execution-ids.json")));
-  const reserved = JSON.parse(readFileSync(join(dir, "execution-ids.json"), "utf8"));
-  assert.deepEqual(reserved, ["exec-1"]);
-});
-
-test("runAcceptanceMatrix refuses a reused execution ID", async () => {
-  const plan = await freshPlan();
-  const dir = mkdtempSync(join(tmpdir(), "bfr-"));
-  const adapter = fakeExecAdapter({ receiptDir: dir });
-  await runAcceptanceMatrix(plan, validAuthorization(plan), adapter, { nowMs: plan.createdAtMs + 1, ttlMs: 300_000 });
-  await assert.rejects(
-    runAcceptanceMatrix(plan, validAuthorization(plan), adapter, { nowMs: plan.createdAtMs + 1, ttlMs: 300_000 }),
-    /already been reserved/,
-  );
-});
-
-test("sendStep classifies confirmation-unknown and state-mismatch and records evidence without retry", async () => {
-  const plan = await freshPlan();
-  const dir = mkdtempSync(join(tmpdir(), "bfr-"));
-
-  // send throws -> CONFIRMATION_UNKNOWN, no retry
-  let sendCount = 0;
-  const throwing = fakeExecAdapter({
-    receiptDir: dir,
-    send: async () => { sendCount += 1; throw new Error("rpc timeout after send"); },
-  });
-  const wired = await runAcceptanceMatrix(plan, { ...validAuthorization(plan), executionId: "u1" }, throwing, { nowMs: plan.createdAtMs + 1 });
-  const r1 = await wired.sendStep("s1", [], "sponsor", ["sponsor"], null);
-  assert.equal(r1.outcome, OUTCOME.CONFIRMATION_UNKNOWN);
-  assert.equal(sendCount, 1, "must not blind-retry");
-
-  // send ok, confirm ok, verify fails -> STOPPED_ON_STATE_MISMATCH
-  const mismatch = fakeExecAdapter({
-    receiptDir: dir,
-    send: async () => ({ signature: "sigX", blockhash: "bh", lastValidBlockHeight: 1 }),
-    confirm: async () => ({ value: { err: null } }),
-  });
-  const wired2 = await runAcceptanceMatrix(plan, { ...validAuthorization(plan), executionId: "u2" }, mismatch, { nowMs: plan.createdAtMs + 1 });
-  const r2 = await wired2.sendStep("s2", [], "sponsor", ["sponsor"], async () => ({ ok: false, observed: "Initialized", expected: "Funded" }));
-  assert.equal(r2.outcome, OUTCOME.STOPPED_ON_STATE_MISMATCH);
-  assert.ok(wired2.evidence.some((e) => e.outcome === OUTCOME.STOPPED_ON_STATE_MISMATCH));
 });

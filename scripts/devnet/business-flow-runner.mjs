@@ -1,10 +1,8 @@
 // Governed devnet business-flow runner.
 //
-// Strict separation of a READ-ONLY plan mode from an authorization-gated execute
-// mode. Plan mode never signs or sends. Execute mode is fully implemented but is
-// never invoked by this module or its CLI in the enablement phase; it delegates
-// all signing/sending to injected dependencies so that no secret-key bytes and no
-// live devnet dependency ever enter this module or CI.
+// Strict separation of a READ-ONLY plan mode from the authorization contract used
+// by the canonical executor. This module never signs or sends; executeFullMatrix
+// in business-flow-execution.mjs is the sole public execution entry point.
 //
 // Deployment/business identity is always taken from authoritative program and
 // account reads (injected rpc adapter), never from the stale `.devnet/state.json`
@@ -23,29 +21,30 @@ import {
   sanitizePublicOutput,
 } from "./safety.mjs";
 import { canonicalJson } from "./durable-json.mjs";
+import { effectiveExpectedErrorNames } from "./business-flow-errors.mjs";
+import {
+  BUSINESS_FLOW_EXECUTION_SPEC,
+  selectExecutionEvents,
+} from "./business-flow-spec.mjs";
 
 export const UPGRADEABLE_LOADER = "BPFLoaderUpgradeab1e11111111111111111111111";
 export const PROGRAMDATA_METADATA_OFFSET = 45; // tag(4)+slot(8)+option(1)+pubkey(32)
 export const RUNNER_MANIFEST_SCHEMA = "R4_BUSINESS_FLOW_MANIFEST_V1";
 export const RUNNER_MANIFEST_DOMAIN = "R4_BUSINESS_FLOW_MANIFEST_V1";
 
-// Bounded acceptance flows. Live-write transaction counts are conservative upper
-// bounds for the escrow instructions themselves (setup transactions are counted
-// separately in the funding model).
+// Bounded acceptance-flow labels. Transaction and funding projections come from
+// the selected canonical execution events below.
 export const FLOW_DEFINITIONS = Object.freeze({
   release: Object.freeze({
     steps: Object.freeze(["initialize", "fund", "release"]),
-    liveWrites: 3,
     requiresExpiryWait: false,
   }),
   refund: Object.freeze({
     steps: Object.freeze(["initialize", "fund", "refund"]),
-    liveWrites: 3,
     requiresExpiryWait: true,
   }),
   cancel: Object.freeze({
     steps: Object.freeze(["initialize", "cancel"]),
-    liveWrites: 2,
     requiresExpiryWait: false,
   }),
 });
@@ -55,9 +54,15 @@ export const FLOW_NAMES = Object.freeze(Object.keys(FLOW_DEFINITIONS));
 // Negative checks are simulate-only by contract. The runner refuses to send them
 // live; a later session runs them through read-only transaction simulation.
 export const NEGATIVE_CHECKS = Object.freeze([
-  Object.freeze({ id: "unauthorized_release", mode: "simulate", expectedError: "ConstraintHasOne" }),
-  Object.freeze({ id: "refund_before_expiry", mode: "simulate", expectedError: "EscrowNotExpired" }),
-  Object.freeze({ id: "release_at_or_after_expiry", mode: "simulate", expectedError: "EscrowExpired" }),
+  ...BUSINESS_FLOW_EXECUTION_SPEC.events
+    .filter((event) => event.kind === "SIMULATE")
+    .map((event) =>
+      Object.freeze({
+        id: event.id,
+        mode: "simulate",
+        expectedErrors: effectiveExpectedErrorNames(event),
+      }),
+    ),
 ]);
 
 // Anchor global-namespace instruction discriminator (matches tests/idl.ts).
@@ -187,42 +192,281 @@ export function waitReached({ chainTimeSeconds, targetSeconds, elapsedMs, timeou
 
 // --- Funding model. ---
 
-export function computeFundingPlan({
-  mintRent,
-  tokenAccountRent,
-  escrowRent,
-  feePerTransaction,
-  setupWrites,
-  flowLiveWrites,
-  tokenAccountCount,
-  safetyReserveLamports,
-}) {
-  for (const [k, v] of Object.entries({
-    mintRent,
-    tokenAccountRent,
-    escrowRent,
-    feePerTransaction,
-    setupWrites,
-    flowLiveWrites,
-    tokenAccountCount,
-    safetyReserveLamports,
-  })) {
-    if (!Number.isInteger(v) || v < 0) throw new Error(`${k} must be a nonnegative integer`);
+const FUNDING_IDENTITIES = Object.freeze([
+  "sponsor",
+  "maintainer",
+  "contributor",
+  "mintAuthority",
+]);
+const CREATED_ACCOUNT_CLASSES = Object.freeze([
+  "mint",
+  "ata",
+  "escrow",
+  "vault",
+]);
+
+function assertNonnegativeInteger(value, label) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${label} must be a nonnegative integer`);
   }
-  // Rent is potentially recoverable (accounts may later be closed by a separately
-  // authorized session); fees are permanent.
-  const recoverableRent =
-    mintRent + escrowRent + tokenAccountRent * tokenAccountCount;
-  const totalWrites = setupWrites + flowLiveWrites;
-  const permanentFees = totalWrites * feePerTransaction;
-  const requiredLamports = recoverableRent + permanentFees + safetyReserveLamports;
+  return value;
+}
+
+function validatePerIdentityLamports(values, label) {
+  if (
+    values === null ||
+    typeof values !== "object" ||
+    Array.isArray(values)
+  ) {
+    throw new Error(`${label} must be an object`);
+  }
+  for (const [identity, value] of Object.entries(values)) {
+    if (!FUNDING_IDENTITIES.includes(identity)) {
+      throw new Error(`unknown funding identity "${identity}"`);
+    }
+    assertNonnegativeInteger(value, `${label}.${identity}`);
+  }
+}
+
+export function deriveSelectedFunding({
+  selectedPlan,
+  rentByClass,
+  // Solana charges the base fee PER required signature, not per transaction.
+  feePerSignature,
+  retryReserveByIdentity = {},
+  safetyMarginByIdentity = {},
+}) {
+  if (
+    selectedPlan === null ||
+    typeof selectedPlan !== "object" ||
+    !Array.isArray(selectedPlan.events) ||
+    !Array.isArray(selectedPlan.sendEvents) ||
+    !Array.isArray(selectedPlan.simulationEvents) ||
+    !Array.isArray(selectedPlan.waitEvents)
+  ) {
+    throw new Error("selectedPlan must contain canonical event projections");
+  }
+  if (
+    rentByClass === null ||
+    typeof rentByClass !== "object" ||
+    Array.isArray(rentByClass)
+  ) {
+    throw new Error("rentByClass must be an object");
+  }
+  assertNonnegativeInteger(feePerSignature, "feePerSignature");
+  validatePerIdentityLamports(
+    retryReserveByIdentity,
+    "retryReserveByIdentity",
+  );
+  validatePerIdentityLamports(
+    safetyMarginByIdentity,
+    "safetyMarginByIdentity",
+  );
+
+  const byIdentity = Object.fromEntries(
+    FUNDING_IDENTITIES.map((identity) => [
+      identity,
+      {
+        // feeCount is the number of transactions this identity pays for;
+        // signatureCount is the total required signatures across them. Solana
+        // fees are per signature, so feeLamports tracks signatureCount.
+        feeCount: 0,
+        signatureCount: 0,
+        feeLamports: 0,
+        rentLamports: 0,
+        retryReserveLamports: retryReserveByIdentity[identity] ?? 0,
+        safetyMarginLamports: safetyMarginByIdentity[identity] ?? 0,
+        requiredLamports: 0,
+      },
+    ]),
+  );
+  const createdAccountsByClass = Object.fromEntries(
+    CREATED_ACCOUNT_CLASSES.map((accountClass) => [accountClass, 0]),
+  );
+
+  for (const event of selectedPlan.sendEvents) {
+    if (!FUNDING_IDENTITIES.includes(event?.feePayerRole)) {
+      throw new Error(`unknown fee payer "${event?.feePayerRole}"`);
+    }
+    // Required signatures = fee payer + distinct non-payer signer roles. This
+    // equals the compiled legacy message's numRequiredSignatures for the frozen
+    // canonical singleton, proven by the compiled-message equality oracle in
+    // tests. The preconditions below (canonical dense array, no duplicate role,
+    // no non-payer role aliasing the fee payer) are what make role count an
+    // exact — never undercounting — representation; distinct signer identities
+    // are enforced separately by assertDistinctBusinessIdentities. If two roles
+    // ever aliased the same pubkey, the compiled message would dedup them, so
+    // role count is a safe upper bound (over-funds) rather than an undercount.
+    const signerRoles = event.requiredNonPayerSignerRoles;
+    if (!Array.isArray(signerRoles)) {
+      throw new Error(`event "${event.id}" required signer roles are invalid`);
+    }
+    if (new Set(signerRoles).size !== signerRoles.length) {
+      throw new Error(`event "${event.id}" has duplicate required signer roles`);
+    }
+    if (signerRoles.includes(event.feePayerRole)) {
+      throw new Error(
+        `event "${event.id}" non-payer signer role must not equal the fee payer`,
+      );
+    }
+    const requiredSignatures = 1 + signerRoles.length;
+    const feePayer = byIdentity[event.feePayerRole];
+    feePayer.feeCount += 1;
+    feePayer.signatureCount += requiredSignatures;
+    feePayer.feeLamports += requiredSignatures * feePerSignature;
+
+    if (!Array.isArray(event.creates)) {
+      throw new Error(`event "${event.id}" created account classes are invalid`);
+    }
+    for (const accountClass of event.creates) {
+      if (!CREATED_ACCOUNT_CLASSES.includes(accountClass)) {
+        throw new Error(`unknown created account class "${accountClass}"`);
+      }
+      if (!FUNDING_IDENTITIES.includes(event.rentPayerRole)) {
+        throw new Error(`unknown rent payer "${event.rentPayerRole}"`);
+      }
+      if (event.rentPayerRole !== event.feePayerRole) {
+        throw new Error(
+          `event "${event.id}" rent payer must equal its fee payer`,
+        );
+      }
+      assertNonnegativeInteger(
+        rentByClass[accountClass],
+        `rentByClass.${accountClass}`,
+      );
+      createdAccountsByClass[accountClass] += 1;
+      byIdentity[event.rentPayerRole].rentLamports +=
+        rentByClass[accountClass];
+    }
+  }
+
+  for (const funding of Object.values(byIdentity)) {
+    funding.requiredLamports =
+      funding.feeLamports +
+      funding.rentLamports +
+      funding.retryReserveLamports +
+      funding.safetyMarginLamports;
+    assertNonnegativeInteger(
+      funding.requiredLamports,
+      "derived identity funding",
+    );
+    Object.freeze(funding);
+  }
+  const recoverableRentLamports = Object.values(byIdentity).reduce(
+    (sum, funding) => sum + funding.rentLamports,
+    0,
+  );
+  const transactionFeeLamports = Object.values(byIdentity).reduce(
+    (sum, funding) => sum + funding.feeLamports,
+    0,
+  );
+  const requiredBalanceLamports = Object.values(byIdentity).reduce(
+    (sum, funding) => sum + funding.requiredLamports,
+    0,
+  );
+  const safetyReserveLamports = Object.values(byIdentity).reduce(
+    (sum, funding) => sum + funding.safetyMarginLamports,
+    0,
+  );
+
   return Object.freeze({
-    recoverableRent,
-    permanentFees,
-    totalWrites,
+    selectedEventIds: Object.freeze(
+      selectedPlan.events.map((event) => event.id),
+    ),
+    sendCount: selectedPlan.sendEvents.length,
+    simulationCount: selectedPlan.simulationEvents.length,
+    waitCount: selectedPlan.waitEvents.length,
+    createdAccountsByClass: Object.freeze(createdAccountsByClass),
+    recoverableRentLamports,
+    transactionFeeLamports,
+    requiredBalanceLamports,
+    byIdentity: Object.freeze(byIdentity),
+    // Compatibility aliases derived from the canonical per-payer projection.
+    recoverableRent: recoverableRentLamports,
+    permanentFees: transactionFeeLamports,
+    totalWrites: selectedPlan.sendEvents.length,
     safetyReserveLamports,
-    requiredLamports,
+    requiredLamports: requiredBalanceLamports,
   });
+}
+
+function fundingManifestProjection(funding) {
+  if (
+    funding === null ||
+    typeof funding !== "object" ||
+    !Array.isArray(funding.selectedEventIds)
+  ) {
+    throw new Error("funding projection is invalid");
+  }
+  const selectedEventIds = funding.selectedEventIds.map((eventId) => {
+    if (typeof eventId !== "string" || eventId.length === 0) {
+      throw new Error("funding selected event ID is invalid");
+    }
+    return eventId;
+  });
+  const createdAccountsByClass = Object.fromEntries(
+    CREATED_ACCOUNT_CLASSES.map((accountClass) => [
+      accountClass,
+      assertNonnegativeInteger(
+        funding.createdAccountsByClass?.[accountClass],
+        `funding.createdAccountsByClass.${accountClass}`,
+      ),
+    ]),
+  );
+  const byIdentity = Object.fromEntries(
+    FUNDING_IDENTITIES.map((identity) => {
+      const allocation = funding.byIdentity?.[identity];
+      return [
+        identity,
+        Object.fromEntries(
+          [
+            "feeCount",
+            "signatureCount",
+            "feeLamports",
+            "rentLamports",
+            "retryReserveLamports",
+            "safetyMarginLamports",
+            "requiredLamports",
+          ].map((field) => [
+            field,
+            assertNonnegativeInteger(
+              allocation?.[field],
+              `funding.byIdentity.${identity}.${field}`,
+            ),
+          ]),
+        ),
+      ];
+    }),
+  );
+  return {
+    selectedEventIds,
+    sendCount: assertNonnegativeInteger(
+      funding.sendCount,
+      "funding.sendCount",
+    ),
+    simulationCount: assertNonnegativeInteger(
+      funding.simulationCount,
+      "funding.simulationCount",
+    ),
+    waitCount: assertNonnegativeInteger(
+      funding.waitCount,
+      "funding.waitCount",
+    ),
+    createdAccountsByClass,
+    recoverableRentLamports: assertNonnegativeInteger(
+      funding.recoverableRentLamports,
+      "funding.recoverableRentLamports",
+    ),
+    transactionFeeLamports: assertNonnegativeInteger(
+      funding.transactionFeeLamports,
+      "funding.transactionFeeLamports",
+    ),
+    requiredBalanceLamports: assertNonnegativeInteger(
+      funding.requiredBalanceLamports,
+      "funding.requiredBalanceLamports",
+    ),
+    byIdentity,
+  };
 }
 
 // --- Identity controls. ---
@@ -233,6 +477,21 @@ export function assertNotDeploymentAuthority(pubkey, upgradeAuthority, role) {
       `${role} must not be the deployment/upgrade authority (${upgradeAuthority})`,
     );
   }
+}
+
+export function assertDistinctBusinessIdentities(identities) {
+  const normalized = Object.fromEntries(
+    ["sponsor", "maintainer", "contributor"].map((role) => [
+      role,
+      assertPublicKey(identities?.[role], role).toBase58(),
+    ]),
+  );
+  if (new Set(Object.values(normalized)).size !== 3) {
+    throw new Error(
+      "sponsor, maintainer, and contributor must be mutually distinct",
+    );
+  }
+  return Object.freeze(normalized);
 }
 
 function parseUpgradeAuthorityFromProgramData(data) {
@@ -249,11 +508,10 @@ function parseUpgradeAuthorityFromProgramData(data) {
 // --- Transaction ceiling. ---
 
 export function computeTransactionCeiling(flows) {
-  return flows.reduce((sum, flow) => {
-    const def = FLOW_DEFINITIONS[flow];
-    if (!def) throw new Error(`unknown flow "${flow}"`);
-    return sum + def.liveWrites;
-  }, 0);
+  return selectExecutionEvents(
+    BUSINESS_FLOW_EXECUTION_SPEC,
+    flows,
+  ).sendEvents.length;
 }
 
 // --- Manifest. ---
@@ -275,8 +533,19 @@ export function buildManifest(fields) {
       escrow: i.escrow,
       vault: i.vault,
     })),
+    selectedEvents: {
+      schema: fields.selectedEvents.schema,
+      eventIds: [...fields.selectedEvents.eventIds],
+      sendCount: fields.selectedEvents.sendCount,
+      simulationCount: fields.selectedEvents.simulationCount,
+      waitCount: fields.selectedEvents.waitCount,
+    },
+    funding: fundingManifestProjection(fields.funding),
     transactionCeiling: fields.transactionCeiling,
-    negativeChecks: NEGATIVE_CHECKS.map((n) => ({ id: n.id, mode: n.mode })),
+    negativeChecks: fields.negativeChecks.map((n) => ({
+      id: n.id,
+      mode: n.mode,
+    })),
     amount: fields.amount,
     decimals: fields.decimals,
   };
@@ -311,7 +580,7 @@ export async function buildPlan(request, rpc) {
     amount = 1_000_000,
     decimals = 6,
     rentReads, // { mintRent, tokenAccountRent, escrowRent }
-    feePerTransaction = 5000,
+    feePerSignature = 5000,
     safetyReserveLamports = 20_000_000,
   } = request;
 
@@ -327,6 +596,19 @@ export async function buildPlan(request, rpc) {
   if (typeof uniquenessToken !== "string" || uniquenessToken.length === 0) {
     throw new Error("a uniqueness token is required");
   }
+  const selectedPlan = selectExecutionEvents(
+    BUSINESS_FLOW_EXECUTION_SPEC,
+    flows,
+  );
+  const selectedEvents = Object.freeze({
+    schema: selectedPlan.schema,
+    eventIds: Object.freeze(
+      selectedPlan.events.map((event) => event.id),
+    ),
+    sendCount: selectedPlan.sendEvents.length,
+    simulationCount: selectedPlan.simulationEvents.length,
+    waitCount: selectedPlan.waitEvents.length,
+  });
 
   const genesis = await rpc.getGenesisHash();
   assertDevnetGenesis(genesis);
@@ -353,13 +635,17 @@ export async function buildPlan(request, rpc) {
   const upgradeAuthority = parseUpgradeAuthorityFromProgramData(pdInfo.data);
   if (!upgradeAuthority) throw new Error("program is immutable; expected a retained authority");
 
+  const normalizedIdentities = assertDistinctBusinessIdentities(identities);
   // Business identities must be distinct from the deployment/upgrade authority.
   for (const role of ["sponsor", "maintainer", "contributor"]) {
-    const pk = assertPublicKey(identities[role], role).toBase58();
-    assertNotDeploymentAuthority(pk, upgradeAuthority, role);
+    assertNotDeploymentAuthority(
+      normalizedIdentities[role],
+      upgradeAuthority,
+      role,
+    );
   }
 
-  const sponsor = new PublicKey(identities.sponsor).toBase58();
+  const sponsor = normalizedIdentities.sponsor;
   const instances = deriveFlowInstances(flows, uniquenessToken, { programId, sponsor });
 
   const balances = {};
@@ -367,20 +653,40 @@ export async function buildPlan(request, rpc) {
     balances[role] = await rpc.getBalance(new PublicKey(identities[role]));
   }
 
-  const transactionCeiling = computeTransactionCeiling(flows);
-  // Setup writes bounded conservatively: 1 mint + 3 token accounts + 3 mintTo.
-  const funding = computeFundingPlan({
-    mintRent: rentReads.mintRent,
-    tokenAccountRent: rentReads.tokenAccountRent,
-    escrowRent: rentReads.escrowRent,
-    feePerTransaction,
-    setupWrites: 7,
-    flowLiveWrites: transactionCeiling,
-    tokenAccountCount: 3, // sponsor, contributor, vault
-    safetyReserveLamports,
+  const transactionCeiling = selectedPlan.sendEvents.length;
+  const funding = deriveSelectedFunding({
+    selectedPlan,
+    rentByClass: {
+      mint: rentReads?.mintRent,
+      ata: rentReads?.tokenAccountRent,
+      escrow: rentReads?.escrowRent,
+      vault: rentReads?.tokenAccountRent,
+    },
+    feePerSignature,
+    safetyMarginByIdentity: {
+      sponsor: safetyReserveLamports,
+    },
   });
 
-  const fundingSufficient = balances.sponsor >= funding.requiredLamports;
+  const fundingSufficientByIdentity = Object.freeze(
+    Object.fromEntries(
+      FUNDING_IDENTITIES.map((identity) => {
+        const required = funding.byIdentity[identity].requiredLamports;
+        const balance = balances[identity];
+        return [
+          identity,
+          required === 0 ||
+            (Number.isSafeInteger(balance) && balance >= required),
+        ];
+      }),
+    ),
+  );
+  const fundingSufficient = Object.values(
+    fundingSufficientByIdentity,
+  ).every(Boolean);
+  const selectedNegativeChecks = selectedPlan.simulationEvents.map((event) =>
+    NEGATIVE_CHECKS.find((check) => check.id === event.id),
+  );
 
   const manifest = buildManifest({
     cluster: "devnet",
@@ -391,19 +697,26 @@ export async function buildPlan(request, rpc) {
     flows,
     uniquenessToken,
     instances,
+    selectedEvents,
+    funding,
     transactionCeiling,
+    negativeChecks: selectedNegativeChecks,
     amount,
     decimals,
   });
 
-  const sanitizedTransactionPlan = flows.flatMap((flow) =>
-    FLOW_DEFINITIONS[flow].steps.map((step) => ({
-      flow,
-      instruction: step,
-      discriminator: instructionDiscriminator(step),
+  const sanitizedTransactionPlan = selectedPlan.sendEvents.map((event) => {
+    const instruction = event.id.includes(":")
+      ? event.id.slice(event.id.indexOf(":") + 1)
+      : event.id;
+    return {
+      eventId: event.id,
+      flow: event.flow,
+      instruction,
+      discriminator: instructionDiscriminator(instruction),
       kind: "live-write",
-    })),
-  );
+    };
+  });
 
   return sanitizePublicOutput({
     mode: "PLAN",
@@ -416,18 +729,24 @@ export async function buildPlan(request, rpc) {
     upgradeAuthority,
     identities: {
       sponsor,
-      maintainer: new PublicKey(identities.maintainer).toBase58(),
-      contributor: new PublicKey(identities.contributor).toBase58(),
+      maintainer: normalizedIdentities.maintainer,
+      contributor: normalizedIdentities.contributor,
     },
     balances,
     funding,
+    fundingSufficientByIdentity,
     fundingSufficient,
+    selectedEvents,
     transactionCeiling,
-    negativeChecks: NEGATIVE_CHECKS,
+    negativeChecks: selectedNegativeChecks,
     sanitizedTransactionPlan,
     notes: fundingSufficient
       ? []
-      : ["BLOCKED_FUNDING: sponsor balance is below the required lamports; do not airdrop automatically"],
+      : [
+          `BLOCKED_FUNDING: ${FUNDING_IDENTITIES.filter(
+            (identity) => !fundingSufficientByIdentity[identity],
+          ).join(", ")} balance is below the required lamports; do not airdrop automatically`,
+        ],
   });
 }
 
@@ -435,6 +754,15 @@ export async function buildPlan(request, rpc) {
 
 export function authorizeExecution(plan, authorization) {
   if (!plan || plan.mode !== "PLAN") throw new Error("a fresh plan is required");
+  if (manifestHash(plan.manifest) !== plan.manifestHash) {
+    throw new Error("plan manifest hash does not match manifest content");
+  }
+  if (
+    canonicalJson(fundingManifestProjection(plan.funding)) !==
+    canonicalJson(plan.manifest.funding)
+  ) {
+    throw new Error("plan funding projection does not match the manifest");
+  }
   const required = [
     "manifestHash",
     "expectedGenesisHash",
@@ -486,60 +814,4 @@ export function authorizeExecution(plan, authorization) {
     enabledFlows: Object.freeze(enabled),
     transactionCeiling: authorization.transactionCeiling,
   });
-}
-
-// Execute path. Requires authorization and injected signer/sender/reader. NEVER
-// invoked by this module or the CLI in the enablement phase. It performs no
-// blind retry and preserves partial-success evidence on any failure.
-export async function executeBusinessFlows(plan, authorization, deps) {
-  const grant = authorizeExecution(plan, authorization);
-  if (!deps || typeof deps.signAndSend !== "function" || typeof deps.readAccount !== "function") {
-    throw new Error("execute requires injected signAndSend and readAccount dependencies");
-  }
-  assertClassicTokenProgram(plan.manifest.tokenProgram);
-
-  const steps = [];
-  for (const flow of grant.enabledFlows) {
-    for (const step of FLOW_DEFINITIONS[flow].steps) {
-      steps.push({ flow, instruction: step });
-    }
-  }
-  if (steps.length > grant.transactionCeiling * 2) {
-    // Defensive: total sub-steps must never exceed a sane bound of the ceiling.
-    throw new Error("planned steps exceed the authorized ceiling");
-  }
-
-  const evidence = [];
-  let sent = 0;
-  for (const step of steps) {
-    if (sent >= grant.transactionCeiling) {
-      throw new Error("transaction ceiling reached");
-    }
-    let outcome;
-    try {
-      outcome = await deps.signAndSend(step);
-    } catch (error) {
-      // Preserve partial-success evidence; do not retry.
-      evidence.push({ ...step, status: "FAILED", error: String(error?.message ?? error) });
-      return Object.freeze({
-        status: "STOPPED",
-        reason: "STEP_FAILED",
-        sent,
-        evidence: Object.freeze(evidence),
-      });
-    }
-    sent += 1;
-    const post = await deps.readAccount(step);
-    if (post?.expectedStatus && post.observedStatus !== post.expectedStatus) {
-      evidence.push({ ...step, status: "UNEXPECTED_STATE", ...sanitizePublicOutput(post) });
-      return Object.freeze({
-        status: "STOPPED",
-        reason: "UNEXPECTED_STATE",
-        sent,
-        evidence: Object.freeze(evidence),
-      });
-    }
-    evidence.push({ ...step, status: "CONFIRMED", ...sanitizePublicOutput(outcome), ...sanitizePublicOutput(post) });
-  }
-  return Object.freeze({ status: "COMPLETE", sent, evidence: Object.freeze(evidence) });
 }

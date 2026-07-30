@@ -11,8 +11,6 @@ import { fileURLToPath } from "node:url";
 
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 
-import { Keypair as _Keypair } from "@solana/web3.js";
-
 import { DEVNET_RPC_URL } from "./safety.mjs";
 import { buildPlan } from "./business-flow-runner.mjs";
 import { createProductionAdapter, loadSigners } from "./business-flow-adapter.mjs";
@@ -74,8 +72,6 @@ export async function main(argv = process.argv.slice(2)) {
       },
       forbiddenAuthority,
     );
-    // Ephemeral mint keypair: transient signer, never persisted to tracked files.
-    signers.mint = _Keypair.generate();
     signers.feePayer = signers.sponsor;
     const adapter = createProductionAdapter({ connection, repoRoot, signers });
     // Top-level driver: self-orchestrates setup -> release/refund/cancel flows ->
