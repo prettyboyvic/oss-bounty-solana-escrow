@@ -49,4 +49,4 @@ This is an unaudited, devnet-only, test-token prototype. It is not production-re
 
 ## Publication provenance
 
-This snapshot is derived from reviewed source commit `5c8869f0c9901dc96b04a203a80398f159ed62d6` on top of public base `77d0994e1a101056fba75fecf1bc3ba0914d1c3d`. The [machine-readable publication provenance](submission/publication-provenance.json) records imported, sanitized, omitted, and newly created artifacts. Publication fields remain unresolved while the branch is local-only.
+This snapshot is derived from reviewed source commit `5c8869f0c9901dc96b04a203a80398f159ed62d6` on top of public base `77d0994e1a101056fba75fecf1bc3ba0914d1c3d`. The [machine-readable publication provenance](submission/publication-provenance.json) records imported, sanitized, omitted, and newly created artifacts. This curated publication snapshot is available on the submission/bring-web2-onchain branch.

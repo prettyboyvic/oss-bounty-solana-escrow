@@ -5,11 +5,11 @@
   "sourceBranch": "feat/phase4b-foundations",
   "publicBaseCommit": "77d0994e1a101056fba75fecf1bc3ba0914d1c3d",
   "publicationBranch": "submission/bring-web2-onchain",
-  "contentCommit": null,
+  "contentCommit": "39927b428e04a7ebeaf776eab70b40e14d9ca43d",
   "provenanceCommit": null,
   "submittedCommit": null,
-  "publicationDate": null,
-  "publicationUrl": null,
+  "publicationDate": "2026-07-30",
+  "publicationUrl": "https://github.com/prettyboyvic/oss-bounty-solana-escrow/blob/submission/bring-web2-onchain/SUBMISSION.md",
   "includedPaths": [
     {
       "path": ".gitattributes",
