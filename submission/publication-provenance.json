@@ -1,0 +1,460 @@
+{
+  "schema": "SUPERTEAM_SUBMISSION_PUBLICATION_PROVENANCE_V1",
+  "sourceRepository": "https://github.com/prettyboyvic/oss-bounty-solana-escrow",
+  "reviewedSourceCommit": "5c8869f0c9901dc96b04a203a80398f159ed62d6",
+  "sourceBranch": "feat/phase4b-foundations",
+  "publicBaseCommit": "77d0994e1a101056fba75fecf1bc3ba0914d1c3d",
+  "publicationBranch": "submission/bring-web2-onchain",
+  "contentCommit": null,
+  "provenanceCommit": null,
+  "submittedCommit": null,
+  "publicationDate": null,
+  "publicationUrl": null,
+  "includedPaths": [
+    {
+      "path": ".gitattributes",
+      "classification": "byte-identical",
+      "reason": "Canonical line-ending policy for generated evidence bytes."
+    },
+    {
+      "path": "docs/BUSINESS_FLOW_RUNNER.md",
+      "classification": "byte-identical",
+      "reason": "Reviewer documentation for the governed business-flow harness."
+    },
+    {
+      "path": "docs/evidence/CAPTURE_CHECKLIST.md",
+      "classification": "byte-identical",
+      "reason": "Required output of the deterministic evidence generator and evidence-package test."
+    },
+    {
+      "path": "docs/evidence/EXPLORER_INDEX.md",
+      "classification": "byte-identical",
+      "reason": "Reviewer-facing index of finalized devnet transactions."
+    },
+    {
+      "path": "docs/evidence/LIVE_VERIFICATION_REPORT.md",
+      "classification": "byte-identical",
+      "reason": "Detailed reviewed devnet verification evidence."
+    },
+    {
+      "path": "docs/evidence/SUBMISSION.md",
+      "classification": "byte-identical",
+      "reason": "Evidence-bound technical submission narrative."
+    },
+    {
+      "path": "docs/evidence/VIDEO_SCRIPT.md",
+      "classification": "byte-identical",
+      "reason": "Required output of the deterministic evidence generator and evidence-package test."
+    },
+    {
+      "path": "docs/evidence/assets/ASSET_INVENTORY.json",
+      "classification": "byte-identical",
+      "reason": "Generated submission-asset inventory verified by the evidence test."
+    },
+    {
+      "path": "docs/evidence/assets/screenshots/README.md",
+      "classification": "byte-identical",
+      "reason": "Required generated screenshot-slot documentation."
+    },
+    {
+      "path": "docs/evidence/build-evidence.mjs",
+      "classification": "byte-identical",
+      "reason": "Deterministic evidence generator used by the evidence-package test."
+    },
+    {
+      "path": "docs/evidence/evidence-manifest.json",
+      "classification": "byte-identical",
+      "reason": "Immutable sanitized evidence manifest at the reviewed SHA-256."
+    },
+    {
+      "path": "scripts/devnet/business-flow-cli.mjs",
+      "classification": "byte-identical",
+      "reason": "CLI composition root for the canonical business-flow implementation."
+    },
+    {
+      "path": "scripts/devnet/business-flow-errors.mjs",
+      "classification": "byte-identical",
+      "reason": "Closed attributed simulation-error decoder."
+    },
+    {
+      "path": "scripts/devnet/business-flow-execution.mjs",
+      "classification": "byte-identical",
+      "reason": "Canonical business-flow execution state machine."
+    },
+    {
+      "path": "scripts/devnet/business-flow-identity.mjs",
+      "classification": "byte-identical",
+      "reason": "Deterministic public identities and reference derivation."
+    },
+    {
+      "path": "scripts/devnet/business-flow-instructions.mjs",
+      "classification": "byte-identical",
+      "reason": "Instruction encoders and account schemas."
+    },
+    {
+      "path": "scripts/devnet/business-flow-runner.mjs",
+      "classification": "byte-identical",
+      "reason": "Read-only plan and authorization-gated execution coordinator."
+    },
+    {
+      "path": "scripts/devnet/business-flow-spec.mjs",
+      "classification": "byte-identical",
+      "reason": "Frozen canonical event specification."
+    },
+    {
+      "path": "scripts/devnet/business-flow-transaction-factory.mjs",
+      "classification": "byte-identical",
+      "reason": "Canonical transaction factory."
+    },
+    {
+      "path": "tests/devnet/business-flow-cli-safety.test.mjs",
+      "classification": "byte-identical",
+      "reason": "Selected CLI safety test."
+    },
+    {
+      "path": "tests/devnet/business-flow-errors.test.mjs",
+      "classification": "byte-identical",
+      "reason": "Selected simulation-error test."
+    },
+    {
+      "path": "tests/devnet/business-flow-execution.test.mjs",
+      "classification": "byte-identical",
+      "reason": "Selected execution test."
+    },
+    {
+      "path": "tests/devnet/business-flow-full-matrix.test.mjs",
+      "classification": "byte-identical",
+      "reason": "Selected full-matrix test."
+    },
+    {
+      "path": "tests/devnet/business-flow-funding-signatures.test.mjs",
+      "classification": "byte-identical",
+      "reason": "Selected funding-signature test."
+    },
+    {
+      "path": "tests/devnet/business-flow-identity.test.mjs",
+      "classification": "byte-identical",
+      "reason": "Selected identity test."
+    },
+    {
+      "path": "tests/devnet/business-flow-instructions.test.mjs",
+      "classification": "byte-identical",
+      "reason": "Selected instruction test."
+    },
+    {
+      "path": "tests/devnet/business-flow-public-api.test.mjs",
+      "classification": "byte-identical",
+      "reason": "Selected public-API test."
+    },
+    {
+      "path": "tests/devnet/business-flow-runner.test.mjs",
+      "classification": "byte-identical",
+      "reason": "Selected runner test."
+    },
+    {
+      "path": "tests/devnet/business-flow-spec.test.mjs",
+      "classification": "byte-identical",
+      "reason": "Selected canonical-spec test."
+    },
+    {
+      "path": "tests/devnet/business-flow-transaction-acceptance.test.mjs",
+      "classification": "byte-identical",
+      "reason": "Selected transaction-acceptance test."
+    },
+    {
+      "path": "tests/devnet/business-flow-transaction-factory.test.mjs",
+      "classification": "byte-identical",
+      "reason": "Selected transaction-factory test."
+    },
+    {
+      "path": "tests/devnet/evidence-package.test.mjs",
+      "classification": "sanitized",
+      "reason": "Selected evidence test with neutralized local-username canary only."
+    },
+    {
+      "path": "SUBMISSION.md",
+      "classification": "new-publication-artifact",
+      "reason": "Concise root reviewer entry point."
+    },
+    {
+      "path": "submission/dependency-closure.json",
+      "classification": "new-publication-artifact",
+      "reason": "Auditable dependency-closed import inventory."
+    },
+    {
+      "path": "submission/publication-provenance.json",
+      "classification": "new-publication-artifact",
+      "reason": "Machine-readable publication provenance."
+    },
+    {
+      "path": "submission/oss-bounty-escrow-pitch-deck.pptx",
+      "classification": "new-publication-artifact",
+      "reason": "Editable local source for the required two-page pitch deck."
+    },
+    {
+      "path": "submission/oss-bounty-escrow-pitch-deck.pdf",
+      "classification": "new-publication-artifact",
+      "reason": "Authoritative two-page reviewer pitch deck."
+    }
+  ],
+  "byteIdenticalFiles": [
+    {
+      "path": ".gitattributes",
+      "sha256": "09f5cb8a129739f971ff9f377074ef08833bfb8a8aded3556f71863509d0bf54",
+      "reason": "Canonical line-ending policy for generated evidence bytes."
+    },
+    {
+      "path": "docs/BUSINESS_FLOW_RUNNER.md",
+      "sha256": "147fde2d97dcf5b4c536ff772ce8feb6c5e710ef4fdb16f54c58cf10fdb0e478",
+      "reason": "Reviewer documentation for the governed business-flow harness."
+    },
+    {
+      "path": "docs/evidence/CAPTURE_CHECKLIST.md",
+      "sha256": "8ff78133e620e7b731c6bc6840a01db9cb7db4b6115b3d965aeeef9cea255a09",
+      "reason": "Required output of the deterministic evidence generator and evidence-package test."
+    },
+    {
+      "path": "docs/evidence/EXPLORER_INDEX.md",
+      "sha256": "978194dd8c666ca6ef533bbc30fadad340595bf0586a22d7a4ec3b89306b0be9",
+      "reason": "Reviewer-facing index of finalized devnet transactions."
+    },
+    {
+      "path": "docs/evidence/LIVE_VERIFICATION_REPORT.md",
+      "sha256": "4127168b6f056a156674dae9776df3928c6da0956b0642d3d839f77aa35149f6",
+      "reason": "Detailed reviewed devnet verification evidence."
+    },
+    {
+      "path": "docs/evidence/SUBMISSION.md",
+      "sha256": "28f76ea77e54a10f841fc2f530a0c735cecc7dd360a3d37fece4ab9e2bf27b63",
+      "reason": "Evidence-bound technical submission narrative."
+    },
+    {
+      "path": "docs/evidence/VIDEO_SCRIPT.md",
+      "sha256": "62c431c4a2bd8590fa4a02f2b872ac51d56793ec147825575b623a2920514cf0",
+      "reason": "Required output of the deterministic evidence generator and evidence-package test."
+    },
+    {
+      "path": "docs/evidence/assets/ASSET_INVENTORY.json",
+      "sha256": "1c9ee99e5792baaa44ef11bbd539c2cf79546a9ee1b89cbd31c460fc3cda3723",
+      "reason": "Generated submission-asset inventory verified by the evidence test."
+    },
+    {
+      "path": "docs/evidence/assets/screenshots/README.md",
+      "sha256": "9a3373d1b6586b94526fc35197b27651693d8eacf1bec4d6fe2032f0cc0d9cca",
+      "reason": "Required generated screenshot-slot documentation."
+    },
+    {
+      "path": "docs/evidence/build-evidence.mjs",
+      "sha256": "ab701f625b98581a42482240c51f74eec727b399247105c4a62669129cf4e6dc",
+      "reason": "Deterministic evidence generator used by the evidence-package test."
+    },
+    {
+      "path": "docs/evidence/evidence-manifest.json",
+      "sha256": "b4127b4257c84b9ca1ce19998a9166ae3e7570e12218364c0377fd4afdc982dc",
+      "reason": "Immutable sanitized evidence manifest at the reviewed SHA-256."
+    },
+    {
+      "path": "scripts/devnet/business-flow-cli.mjs",
+      "sha256": "f0e8789c062abbaf5f7515006e8869898ef466fe29e1a4aabd36d811142e532c",
+      "reason": "CLI composition root for the canonical business-flow implementation."
+    },
+    {
+      "path": "scripts/devnet/business-flow-errors.mjs",
+      "sha256": "484d2ad7454daa7f43ccf1be4bdafc074186fb37c536c3037add4a5012e35640",
+      "reason": "Closed attributed simulation-error decoder."
+    },
+    {
+      "path": "scripts/devnet/business-flow-execution.mjs",
+      "sha256": "c5431018f23bcd96a878abfbf3b680f48c5b55100230787c50f7d71fd8d6abce",
+      "reason": "Canonical business-flow execution state machine."
+    },
+    {
+      "path": "scripts/devnet/business-flow-identity.mjs",
+      "sha256": "063c28b5c831db06b6b6eb019fc7d42dbe2ba19cf78af7609b0d2ee661f78433",
+      "reason": "Deterministic public identities and reference derivation."
+    },
+    {
+      "path": "scripts/devnet/business-flow-instructions.mjs",
+      "sha256": "2a5ab2122ef3ee7b506c5ec7d2864e3c4a060dfdb0836bb13e0025cabc314deb",
+      "reason": "Instruction encoders and account schemas."
+    },
+    {
+      "path": "scripts/devnet/business-flow-runner.mjs",
+      "sha256": "0eeb5e698053b47d32487c8d129591bad6faf15bb2b5f3b065a0338116e51779",
+      "reason": "Read-only plan and authorization-gated execution coordinator."
+    },
+    {
+      "path": "scripts/devnet/business-flow-spec.mjs",
+      "sha256": "bb403e56747525421fe68ea3e7ee559aea58bc40c4e2c2c7bf6c8091a16afff9",
+      "reason": "Frozen canonical event specification."
+    },
+    {
+      "path": "scripts/devnet/business-flow-transaction-factory.mjs",
+      "sha256": "10ce5ab08b3bef8a9444d076ef582a7a2c6b87c97975e1afd47ae35a680e2eb2",
+      "reason": "Canonical transaction factory."
+    },
+    {
+      "path": "tests/devnet/business-flow-cli-safety.test.mjs",
+      "sha256": "d63711268eb19507a90ca164e0503679a3922ab765db85b36c93d8ea21fd2658",
+      "reason": "Selected CLI safety test."
+    },
+    {
+      "path": "tests/devnet/business-flow-errors.test.mjs",
+      "sha256": "2f4196140e1144e6fd93092ced57045dd85dd8e1aaf9d4ba8ce24d657df02a15",
+      "reason": "Selected simulation-error test."
+    },
+    {
+      "path": "tests/devnet/business-flow-execution.test.mjs",
+      "sha256": "739398c681fdf2818fd9a09404094156ef08eb2c9a11805f55cfbb8ead10e381",
+      "reason": "Selected execution test."
+    },
+    {
+      "path": "tests/devnet/business-flow-full-matrix.test.mjs",
+      "sha256": "428428b85e392209bd1af441f6dd6d0d78d9d096229b2f96d692679864fe522b",
+      "reason": "Selected full-matrix test."
+    },
+    {
+      "path": "tests/devnet/business-flow-funding-signatures.test.mjs",
+      "sha256": "af356c25fc9898e1db541ee3d139233802d51a9c7d9a9c6ecd9c4fb98f929644",
+      "reason": "Selected funding-signature test."
+    },
+    {
+      "path": "tests/devnet/business-flow-identity.test.mjs",
+      "sha256": "c0f51ba337c0e9965282275b7dbd40ae04abeb5235a5a91064a154315f1abb95",
+      "reason": "Selected identity test."
+    },
+    {
+      "path": "tests/devnet/business-flow-instructions.test.mjs",
+      "sha256": "49be04c60e33092f48e9ca31013f142824227f1a80f031bbcd443d927609713b",
+      "reason": "Selected instruction test."
+    },
+    {
+      "path": "tests/devnet/business-flow-public-api.test.mjs",
+      "sha256": "fc2b333d346394a3fcc324c16794c139417c2b4ef75e0c5f81e6416acaa1fff9",
+      "reason": "Selected public-API test."
+    },
+    {
+      "path": "tests/devnet/business-flow-runner.test.mjs",
+      "sha256": "7f1a5bb8c13d6834a88b4bbe038e1fda7e9459b746c26220ac71735e06e4c012",
+      "reason": "Selected runner test."
+    },
+    {
+      "path": "tests/devnet/business-flow-spec.test.mjs",
+      "sha256": "db6f26ff6b4c78e08a51dd992f87e75aced352adc448e4394c058ddd9433fc8b",
+      "reason": "Selected canonical-spec test."
+    },
+    {
+      "path": "tests/devnet/business-flow-transaction-acceptance.test.mjs",
+      "sha256": "507d219556e7493a06895172b1a8e7c421008331053447f3e23d1ce056a1bed5",
+      "reason": "Selected transaction-acceptance test."
+    },
+    {
+      "path": "tests/devnet/business-flow-transaction-factory.test.mjs",
+      "sha256": "b19ac6c3e757842ab10515928979f139e2d4acc6fc626085f8a0c7d9a7fb4079",
+      "reason": "Selected transaction-factory test."
+    }
+  ],
+  "sanitizedFiles": [
+    {
+      "path": "tests/devnet/evidence-package.test.mjs",
+      "reason": "Selected evidence test with neutralized local-username canary only.",
+      "change": "Replaced a literal local-username test canary with LOCAL_USERNAME_CANARY; production behavior and evidence values are unchanged."
+    }
+  ],
+  "omittedCategories": [
+    {
+      "category": "README.md",
+      "reason": "The public-base README is intentionally inherited unchanged; SUBMISSION.md is the reviewer entry point."
+    },
+    {
+      "category": "docs/superpowers/plans/2026-07-28-business-flow-canonical-live-stabilization-addendum.md",
+      "reason": "Internal implementation planning is not needed by bounty reviewers."
+    },
+    {
+      "category": "docs/superpowers/plans/2026-07-28-business-flow-canonical-live-stabilization.md",
+      "reason": "Internal implementation planning is not needed by bounty reviewers."
+    },
+    {
+      "category": "docs/superpowers/specs/2026-07-28-business-flow-canonical-live-stabilization-design.md",
+      "reason": "Internal design process is not needed by bounty reviewers."
+    },
+    {
+      "category": ".devnet/**",
+      "reason": "Retained receipts, keypairs, logs, ledgers, and temporary state remain local and unpublished."
+    },
+    {
+      "category": "video source and render workspace",
+      "reason": "Accepted video and subtitles remain unchanged outside the curated repository snapshot."
+    }
+  ],
+  "deck": {
+    "pptxPath": "submission/oss-bounty-escrow-pitch-deck.pptx",
+    "pptxPublicationDecision": "publish-with-pdf",
+    "pdfPath": "submission/oss-bounty-escrow-pitch-deck.pdf",
+    "pdfPageCount": 2,
+    "pptxSha256": "dd19c9589628b2f58bb7ed26c52acb188d49239fc4725089c26818410fb26abf",
+    "pdfSha256": "31cc881f584b8c3e4e1af81edaa76379d135c7ad31ef14d59120ced1d7c14d14"
+  },
+  "evidence": {
+    "manifestPath": "docs/evidence/evidence-manifest.json",
+    "manifestSha256": "b4127b4257c84b9ca1ce19998a9166ae3e7570e12218364c0377fd4afdc982dc",
+    "retainedReceiptPublished": false,
+    "retainedReceiptSha256": "f18b2daecd963cb3213693d11143d7e6c3e1c980e343058031fdb81dbf41fef1"
+  },
+  "validation": [
+    {
+      "command": "npm ci",
+      "verifiedAt": "2026-07-30T03:28:00Z",
+      "exitCode": 0,
+      "result": "Exact dependency installation completed; npm reported known audit warnings (1 low, 7 moderate, 8 high)."
+    },
+    {
+      "command": "npm run typecheck",
+      "verifiedAt": "2026-07-30T03:44:00Z",
+      "exitCode": 0,
+      "result": "TypeScript no-emit typecheck passed."
+    },
+    {
+      "command": "cargo test --workspace",
+      "verifiedAt": "2026-07-30T03:45:00Z",
+      "exitCode": 0,
+      "result": "11 Rust tests passed; 0 failed."
+    },
+    {
+      "command": "node --test tests/devnet/evidence-package.test.mjs",
+      "verifiedAt": "2026-07-30T03:25:00Z",
+      "exitCode": 0,
+      "result": "13 evidence-package tests passed using the hash-verified, ignored retained receipt; 0 failed."
+    },
+    {
+      "command": "npm run test:devnet:unit",
+      "verifiedAt": "2026-07-30T03:47:07Z",
+      "exitCode": 0,
+      "result": "542 devnet unit tests passed; 0 failed. An initial heavily contended run had one unchanged timing-bound test exceed its 4-second ceiling by 0.44 seconds; the test passed in isolation and the full quiet rerun passed."
+    },
+    {
+      "command": "slides_test.py submission/oss-bounty-escrow-pitch-deck.pptx",
+      "verifiedAt": "2026-07-30T03:43:22Z",
+      "exitCode": 0,
+      "result": "Exactly two slides rendered; no overflow detected; both pages inspected at full size."
+    },
+    {
+      "command": "PPTX/PDF package privacy and metadata inspection",
+      "verifiedAt": "2026-07-30T03:44:00Z",
+      "exitCode": 0,
+      "result": "PPTX has generic exporter metadata, safe source notes, no hidden slides, comments, embeddings, custom XML, or external relationships. PDF has exactly 2 pages and no attachments, actions, forms, hidden text layer, or private metadata."
+    },
+    {
+      "command": "SUBMISSION.md relative-link validation",
+      "verifiedAt": "2026-07-30T03:44:00Z",
+      "exitCode": 0,
+      "result": "All 10 local Markdown links resolve."
+    }
+  ],
+  "optionalVideo": {
+    "includedInSubmissionPage": false,
+    "hostedUrl": null,
+    "sourceMp4Sha256": "840990ef600f092e318b931713e1cec836044349a56420cd0b2ffea8ca675eff",
+    "sourceSrtSha256": "4d95fea2e6ca917813cbad16e5fae7778d720897566b76db69dbe768e693b79d"
+  }
+}
